@@ -23,7 +23,7 @@ FALLBACK_VERSION="5.0.1"  # 后备版本（无法获取最新版时使用）
 VERSION=""                # 运行时检测
 
 # 脚本更新源（请根据实际托管地址修改）
-SCRIPT_URL="https://sub.zuowo.de/AUZqCdPALIIowSPTYlxoTO/api/file/Snell.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/Snell.sh"
 
 # =====================================
 # 颜色和路径
@@ -398,7 +398,7 @@ generate_psk() {
 }
 
 write_snell_config() {
-  local port="$1" psk="$2"
+  local port="$1" psk="$2" node_name="$3"
   mkdir -p "$SNELL_DIR"
   cat > "$SNELL_CONF" <<EOF
 [snell-server]
@@ -410,12 +410,14 @@ EOF
 
   # 记录版本
   echo "v${VERSION}" > "$SNELL_VERSION_FILE"
+  
+  # 记录节点名称
+  echo "$node_name" > "${SNELL_DIR}/node_name.txt"
 
-  local ip hostname
+  local ip
   ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
-  hostname=$(uname -n)
   cat > "$SNELL_CFGTXT" <<EOF
-${hostname} = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true, reuse=true, ecn=true
+${node_name} = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
 }
 
@@ -473,30 +475,30 @@ firewalld_remove() {
 # =====================================
 show_port_psk() {
   if [ -f "$SNELL_CONF" ]; then
-    local port psk installed_ver
+    local port psk installed_ver node_name
     port=$(grep -E '^listen' "$SNELL_CONF" 2>/dev/null | head -n1 | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
     psk=$(grep -E '^psk' "$SNELL_CONF" 2>/dev/null | head -n1 | awk -F'=' '{print $2}' | xargs || echo "")
     installed_ver=$(get_installed_version)
+    if [ -f "${SNELL_DIR}/node_name.txt" ]; then
+      node_name=$(cat "${SNELL_DIR}/node_name.txt")
+    else
+      node_name=$(uname -n)
+    fi
     echo "=== Snell 当前配置 ==="
-    printf "版本: %s\n" "${installed_ver:-<未知>}"
-    printf "端口: %s\n" "${port:-<未检测到>}"
-    printf "PSK : %s\n" "${psk:-<未检测到>}"
+    printf "Snell: v%s\n" "${installed_ver:-未知}"
+    printf "名称 : %s\n" "${node_name}"
+    printf "端口 : %s\n" "${port:-<未检测到>}"
+    printf "PSK  : %s\n" "${psk:-<未检测到>}"
   else
     warn "未找到配置文件：${SNELL_CONF}"
   fi
 }
 
 show_config() {
-  if [ -f "$SNELL_CONF" ]; then
-    echo "=== $SNELL_CONF ==="
-    cat "$SNELL_CONF"
-  else
-    warn "找不到 $SNELL_CONF"
-  fi
-  echo ""
   if [ -f "$SNELL_CFGTXT" ]; then
-    echo "=== $SNELL_CFGTXT (Surge 配置) ==="
     cat "$SNELL_CFGTXT"
+  else
+    warn "找不到配置文件：$SNELL_CFGTXT"
   fi
 }
 
@@ -543,6 +545,17 @@ install_snell() {
   local arch; arch=$(map_arch)
   if [ "$arch" = "unsupported" ]; then err "不支持的架构: $(uname -m)"; return 1; fi
 
+  # 询问节点名称
+  local default_name; default_name=$(uname -n)
+  printf "${BLUE}请输入节点名称（回车使用 ${default_name}）:${RESET} "
+  read -r user_name || user_name=""
+  local node_name
+  if [ -z "${user_name:-}" ]; then
+    node_name="$default_name"
+  else
+    node_name="$user_name"
+  fi
+
   # 询问端口
   printf "${BLUE}请输入 Snell 端口（回车随机）:${RESET} "
   read -r user_port || user_port=""
@@ -554,7 +567,6 @@ install_snell() {
     if ! is_valid_port "$user_port"; then err "输入端口不合法（1-65535）"; return 1; fi
     if ! is_port_free "$user_port"; then err "端口 ${user_port} 已被占用"; return 1; fi
     port="$user_port"
-    log "使用用户端口：${port}"
   fi
 
   # 检查随机端口是否可用
@@ -598,7 +610,7 @@ install_snell() {
 
   local psk; psk=$(generate_psk)
   write_systemd
-  write_snell_config "$port" "$psk"
+  write_snell_config "$port" "$psk" "$node_name"
 
   # 启用 TCP Fast Open 和网络优化
   enable_tcp_fastopen
@@ -645,14 +657,14 @@ update_snell() {
   # 版本比较
   if [ "$installed_ver" != "未知" ] && [ "$installed_ver" = "$VERSION" ]; then
     log "当前已是最新版本 v${VERSION}"
-    printf "${BLUE}是否强制重新安装？(y/N): ${RESET}"
+    printf "${BLUE}是否强制重新安装？(y/n): ${RESET}"
     read -r force_reinstall || force_reinstall=""
     if [ "${force_reinstall:-}" != "y" ] && [ "${force_reinstall:-}" != "Y" ]; then
       return 0
     fi
   else
     log "发现新版本: v${installed_ver} -> v${VERSION}"
-    printf "${BLUE}是否更新？(Y/n): ${RESET}"
+    printf "${BLUE}是否更新？(y/n): ${RESET}"
     read -r confirm_update || confirm_update=""
     if [ "${confirm_update:-}" = "n" ] || [ "${confirm_update:-}" = "N" ]; then
       log "已取消更新"
@@ -699,7 +711,8 @@ update_snell() {
   sleep 2
   if systemctl is-active --quiet snell; then
     log "更新成功: v${installed_ver} -> v${VERSION}"
-    journalctl -u snell -n 8 --no-pager || true
+    echo ""
+    echo "=== Surge 配置 ==="
     [ -f "$SNELL_CFGTXT" ] && cat "$SNELL_CFGTXT"
   else
     err "更新后 Snell 无法启动，尝试回滚"
@@ -723,7 +736,7 @@ uninstall_snell() {
     return 1
   fi
   
-  printf "${YELLOW}确定要卸载 Snell 吗？(y/N): ${RESET}"
+  printf "${YELLOW}确定要卸载 Snell 吗？(y/n): ${RESET}"
   read -r confirm || confirm=""
   if [ "${confirm:-}" != "y" ] && [ "${confirm:-}" != "Y" ]; then
     log "已取消卸载"
@@ -787,11 +800,16 @@ modify_port() {
   fi
 
   # 更新人类可读配置
-  local ip hostname
+  local ip node_name
   ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
-  hostname=$(uname -n)
+  # 读取已保存的节点名称，如果不存在则使用主机名
+  if [ -f "${SNELL_DIR}/node_name.txt" ]; then
+    node_name=$(cat "${SNELL_DIR}/node_name.txt")
+  else
+    node_name=$(uname -n)
+  fi
   cat > "$SNELL_CFGTXT" <<EOF
-${hostname} = snell, ${ip}, ${new_port}, psk=${cur_psk}, version=5, tfo=true, reuse=true, ecn=true
+${node_name} = snell, ${ip}, ${new_port}, psk=${cur_psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
 
   # 防火墙调整
@@ -827,18 +845,151 @@ EOF
 }
 
 # =====================================
+# 核心操作：修改名称
+# =====================================
+modify_name() {
+  if [ ! -f "$SNELL_CONF" ]; then err "未检测到安装或配置文件，请先安装"; return 1; fi
+  
+  local cur_name
+  if [ -f "${SNELL_DIR}/node_name.txt" ]; then
+    cur_name=$(cat "${SNELL_DIR}/node_name.txt")
+  else
+    cur_name=$(uname -n)
+  fi
+  
+  printf "${BLUE}当前名称: ${cur_name}\n请输入新的名称: ${RESET}"
+  read -r new_name || true
+  
+  if [ -z "${new_name:-}" ]; then
+    warn "名称不能为空"
+    return 1
+  fi
+  
+  if [ "$new_name" = "$cur_name" ]; then
+    warn "新名称与当前名称一致"
+    return 0
+  fi
+  
+  # 保存新名称
+  echo "$new_name" > "${SNELL_DIR}/node_name.txt"
+  
+  # 更新 config.txt
+  local cur_port cur_psk ip
+  cur_port=$(grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
+  cur_psk=$(grep -E '^psk' "$SNELL_CONF" | awk -F'=' '{print $2}' | xargs || echo "")
+  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
+  
+  cat > "$SNELL_CFGTXT" <<EOF
+${new_name} = snell, ${ip}, ${cur_port}, psk=${cur_psk}, version=5, tfo=true, reuse=true, ecn=true
+EOF
+  
+  log "名称修改成功：${cur_name} -> ${new_name}"
+}
+
+# =====================================
+# 核心操作：修改 PSK
+# =====================================
+modify_psk() {
+  if [ ! -f "$SNELL_CONF" ]; then err "未检测到安装或配置文件，请先安装"; return 1; fi
+  
+  local cur_psk
+  cur_psk=$(grep -E '^psk' "$SNELL_CONF" | awk -F'=' '{print $2}' | xargs || echo "")
+  
+  printf "${BLUE}当前 PSK: ${cur_psk}\n请输入新的 PSK（回车随机生成）: ${RESET}"
+  read -r new_psk || true
+  
+  # 如果为空则随机生成
+  if [ -z "${new_psk:-}" ]; then
+    new_psk=$(generate_psk)
+    log "随机生成 PSK: ${new_psk}"
+  else
+    # 简单检查：长度至少 8 位，只允许字母数字
+    if [ ${#new_psk} -lt 8 ]; then
+      err "PSK 长度至少 8 位"
+      return 1
+    fi
+    if ! [[ "$new_psk" =~ ^[A-Za-z0-9]+$ ]]; then
+      err "PSK 只能包含字母和数字"
+      return 1
+    fi
+  fi
+  
+  if [ "$new_psk" = "$cur_psk" ]; then
+    warn "新 PSK 与当前 PSK 一致"
+    return 0
+  fi
+  
+  # 备份配置
+  cp -f "$SNELL_CONF" "${SNELL_CONF}.bak.$(date +%s)" || warn "配置备份失败（非致命）"
+  
+  # 替换 psk 行
+  sed -i "s@^psk = .*@psk = ${new_psk}@" "$SNELL_CONF"
+  
+  # 更新 config.txt
+  local cur_port node_name ip
+  cur_port=$(grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
+  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
+  if [ -f "${SNELL_DIR}/node_name.txt" ]; then
+    node_name=$(cat "${SNELL_DIR}/node_name.txt")
+  else
+    node_name=$(uname -n)
+  fi
+  
+  cat > "$SNELL_CFGTXT" <<EOF
+${node_name} = snell, ${ip}, ${cur_port}, psk=${new_psk}, version=5, tfo=true, reuse=true, ecn=true
+EOF
+  
+  # 重启服务
+  if restart_check; then
+    log "PSK 修改成功"
+  else
+    err "修改 PSK 后服务启动失败，正在回滚..."
+    local lastbak; lastbak=$(ls -1t ${SNELL_CONF}.bak.* 2>/dev/null | head -n1 || true)
+    if [ -n "$lastbak" ]; then
+      cp -f "$lastbak" "$SNELL_CONF"
+      systemctl restart snell || true
+      err "已回滚到备份：$lastbak"
+    fi
+    return 1
+  fi
+}
+
+# =====================================
+# 修改配置菜单
+# =====================================
+modify_config() {
+  if [ ! -f "$SNELL_CONF" ]; then err "未检测到安装或配置文件，请先安装"; return 1; fi
+  
+  echo ""
+  echo "1) 修改端口"
+  echo "2) 修改名称"
+  echo "3) 修改 PSK"
+  echo "0) 返回"
+  printf "${BLUE}请选择: ${RESET}"
+  read -r sub_opt || true
+  
+  case "$sub_opt" in
+    1) modify_port ;;
+    2) modify_name ;;
+    3) modify_psk ;;
+    0) return 0 ;;
+    *) warn "无效选项" ;;
+  esac
+}
+
+# =====================================
 # 网络优化开关
 # =====================================
 toggle_tcp_optimization() {
   if [ -f "$SYSCTL_CONF" ]; then
-    printf "${BLUE}TCP Fast Open 已启用，是否禁用？(y/N): ${RESET}"
+    printf "${BLUE}TCP Fast Open 已启用，是否禁用？(y/n): ${RESET}"
     read -r disable_tfo || disable_tfo=""
     if [ "${disable_tfo:-}" = "y" ] || [ "${disable_tfo:-}" = "Y" ]; then
       remove_tcp_optimization
       log "已禁用 TCP Fast Open"
     fi
   else
-    printf "${BLUE}TCP Fast Open 未启用，是否启用？(Y/n): ${RESET}"
+    printf "${BLUE}TCP Fast Open 未启用，是否启用？(y/n): ${RESET}"
     read -r enable_tfo || enable_tfo=""
     if [ "${enable_tfo:-}" != "n" ] && [ "${enable_tfo:-}" != "N" ]; then
       enable_tcp_fastopen
@@ -882,14 +1033,14 @@ update_script() {
   
   if [ $cmp -eq 1 ]; then
     warn "远程版本 (v${remote_version}) 比当前版本 (v${SCRIPT_VERSION}) 旧"
-    printf "${BLUE}是否仍要下载？(y/N): ${RESET}"
+    printf "${BLUE}是否仍要下载？(y/n): ${RESET}"
     read -r force_down || force_down=""
     if [ "${force_down:-}" != "y" ] && [ "${force_down:-}" != "Y" ]; then
       return 0
     fi
   else
     log "发现新版本: v${SCRIPT_VERSION} -> v${remote_version}"
-    printf "${BLUE}是否更新？(Y/n): ${RESET}"
+    printf "${BLUE}是否更新？(y/n): ${RESET}"
     read -r confirm || confirm=""
     if [ "${confirm:-}" = "n" ] || [ "${confirm:-}" = "N" ]; then
       log "已取消更新"
@@ -989,7 +1140,7 @@ menu() {
     echo "4) 停止 Snell"
     echo "5) 更新 Snell"
     echo "6) 查看配置"
-    echo "7) 修改端口"
+    echo "7) 修改配置"
     echo -e "${GREEN}--- 系统设置 ---${RESET}"
     echo "8) 网络优化开关 (TCP Fast Open + BBR)"
     echo "9) 更新脚本"
@@ -1015,7 +1166,7 @@ menu() {
         ;;
       5) update_snell ;;
       6) show_config ;;
-      7) modify_port ;;
+      7) modify_config ;;
       8) toggle_tcp_optimization ;;
       9) update_script ;;
       0) log "退出"; exit 0 ;;
