@@ -103,22 +103,37 @@ map_arch() {
 
 # 从官网获取最新版本
 get_latest_version_from_web() {
-  local release_page="https://dl.nssurge.com/snell/"
+  # 优先从 Knowledge Base 页面获取（结构更稳定）
+  local kb_page="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
   local page_content
   
-  page_content=$(curl -s -L --max-time 10 "$release_page" 2>/dev/null) || return 1
+  page_content=$(curl -s -L --max-time 10 "$kb_page" 2>/dev/null)
   
-  if [ -z "$page_content" ]; then
-    return 1
+  if [ -n "$page_content" ]; then
+    # KB 页面格式：snell-server-v5.0.1-linux-amd64.zip
+    local latest_version
+    latest_version=$(echo "$page_content" | grep -oE 'snell-server-v[0-9]+\.[0-9]+\.[0-9]+-linux' | \
+      sed 's/snell-server-v//g; s/-linux//g' | sort -V | tail -1)
+    
+    if [ -n "$latest_version" ]; then
+      echo "$latest_version"
+      return 0
+    fi
   fi
   
-  # 提取 v5 版本号
-  local latest_v5
-  latest_v5=$(echo "$page_content" | grep -oE 'snell-server-v5\.[0-9]+\.[0-9]+[a-z]*[0-9]*-linux' | head -1 | sed 's/snell-server-v//g' | sed 's/-linux//g')
+  # 备用：从下载目录页获取
+  local dl_page="https://dl.nssurge.com/snell/"
+  page_content=$(curl -s -L --max-time 10 "$dl_page" 2>/dev/null)
   
-  if [ -n "$latest_v5" ]; then
-    echo "$latest_v5"
-    return 0
+  if [ -n "$page_content" ]; then
+    local latest_version
+    latest_version=$(echo "$page_content" | grep -oE 'snell-server-v[0-9]+\.[0-9]+\.[0-9]+-linux' | \
+      sed 's/snell-server-v//g; s/-linux//g' | sort -V | tail -1)
+    
+    if [ -n "$latest_version" ]; then
+      echo "$latest_version"
+      return 0
+    fi
   fi
   
   return 1
@@ -602,8 +617,6 @@ install_snell() {
     echo ""
     echo "=== Surge 配置（可直接复制） ==="
     cat "$SNELL_CFGTXT"
-    echo ""
-    journalctl -u snell -n 5 --no-pager || true
   else
     err "服务未能启动，尝试回滚二进制并输出日志"
     journalctl -u snell -n 50 --no-pager || true
