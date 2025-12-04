@@ -968,7 +968,8 @@ setup_notify_cron() {
     fi
 
     local alert_enabled=$(jq_safe ".telegram.alert_enabled" "$CONFIG_FILE" "true")
-    [ "$alert_enabled" = "true" ] && echo "*/5 * * * * $SCRIPT_PATH --check-alert >/dev/null 2>&1  # 端口流量监控阈值检查" >> "$temp_cron"
+    local telegram_enabled=$(jq_safe ".telegram.enabled" "$CONFIG_FILE" "false")
+    [ "$alert_enabled" = "true" ] && [ "$telegram_enabled" = "true" ] && echo "*/5 * * * * $SCRIPT_PATH --check-alert >/dev/null 2>&1  # 端口流量监控阈值检查" >> "$temp_cron"
 
     local has_burst=false
     local port
@@ -1537,6 +1538,7 @@ configure_burst_protection() {
     
     local current_burst=$(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "500Mbps")
     read -p "突发阈值 (默认单位Mbps, 如 100, 默认 $current_burst): " burst_rate_input
+    local burst_rate
     if [ -z "$burst_rate_input" ]; then
         burst_rate="$current_burst"
     else
@@ -1555,6 +1557,7 @@ configure_burst_protection() {
     
     local current_throttle=$(jq_safe ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE" "20Mbps")
     read -p "限速至 (默认单位Mbps, 如 20, 默认 $current_throttle): " throttle_rate_input
+    local throttle_rate
     if [ -z "$throttle_rate_input" ]; then
         throttle_rate="$current_throttle"
     else
@@ -1680,6 +1683,73 @@ setup_telegram() {
             ;;
     esac
     sleep 1
+}
+
+# ============================================================================
+# 主菜单
+# ============================================================================
+
+show_status() {
+    clear
+    local ports=($(get_active_ports))
+    local total=0
+
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}             ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}               ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
+
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                            ${BLUE}║${NC}"
+    else
+        local port
+        for port in "${ports[@]}"; do
+            local traffic=($(get_port_traffic "$port"))
+            local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
+            local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
+            total=$((total + used))
+
+            local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
+            local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
+            local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
+
+            local percent_display=""
+            if [ "$limit" != "unlimited" ]; then
+                local limit_bytes=$(parse_size_to_bytes "$limit")
+                if [ "$limit_bytes" -gt 0 ]; then
+                    local percent=$((used * 100 / limit_bytes))
+                    if [ $percent -ge 100 ]; then percent_display=" ${RED}[${percent}%]${NC}"
+                    elif [ $percent -ge 80 ]; then percent_display=" ${YELLOW}[${percent}%]${NC}"
+                    else percent_display=" ${GREEN}[${percent}%]${NC}"; fi
+                fi
+            fi
+            
+            local burst_display=""
+            local burst_status=$(get_burst_status "$port")
+            case "$burst_status" in
+                throttled:*) 
+                    local remaining=$(echo "$burst_status" | cut -d: -f2)
+                    burst_display=" ${RED}🔽${remaining}${NC}"
+                    ;;
+                normal) burst_display=" ${GREEN}⚡${NC}" ;;
+            esac
+
+            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b${BLUE}║${NC}\n" \
+                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display"
+            
+            local tags=""
+            [ -n "$remark" ] && tags+="[$remark] "
+            [ "$limit" != "unlimited" ] && tags+="配额:$limit "
+            [ "$rate" != "unlimited" ] && tags+="限速:$rate"
+            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-56s${NC}${BLUE}║${NC}\n" "$tags"
+        done
+    fi
+
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
+    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}     ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    echo -e "  ${YELLOW}⚡=突发保护  🔽=限速中${NC}"
+    echo
 }
 
 show_menu() {
