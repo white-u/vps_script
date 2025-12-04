@@ -1,16 +1,26 @@
 #!/bin/bash
 
-set -euo pipefail
+# 错误处理：显示错误信息而不是静默退出
+set -o pipefail
+trap 'echo -e "\033[0;31m错误: 脚本在第 $LINENO 行执行失败\033[0m" >&2' ERR
 
 # ============================================================================
-# 端口流量监控脚本 v2.3.1
+# 端口流量监控脚本 v2.3.2
 # 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知、突发速率保护
-# 修复: 突发检测算法优化、并发锁、健壮性增强
+# 修复: 启动错误处理、兼容性增强
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.3.1"
+readonly SCRIPT_VERSION="2.3.2"
 readonly SCRIPT_NAME="端口流量监控"
-readonly SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+
+# 处理通过 bash <(curl ...) 执行的情况
+if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]]; then
+    # 从网络执行，需要下载到本地
+    SCRIPT_PATH="/usr/local/bin/port-traffic-monitor.sh"
+else
+    SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+fi
+readonly SCRIPT_PATH
 readonly CONFIG_DIR="/etc/port-traffic-monitor"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
@@ -1686,12 +1696,37 @@ uninstall() {
 }
 
 create_shortcut() {
-    [ -f "/usr/local/bin/$SHORTCUT_COMMAND" ] && return
-    cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
+    # 如果是通过网络执行，先保存脚本到本地
+    if [[ ! -f "$SCRIPT_PATH" ]]; then
+        echo -e "${YELLOW}首次运行，正在安装脚本...${NC}"
+        # 从 stdin 或当前脚本内容保存
+        if [ -t 0 ]; then
+            # 不是从管道执行，尝试下载
+            local download_url="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/port-manage.sh"
+            if curl -fsSL "$download_url" -o "$SCRIPT_PATH" 2>/dev/null; then
+                chmod +x "$SCRIPT_PATH"
+                echo -e "${GREEN}✓ 脚本已安装到 $SCRIPT_PATH${NC}"
+            else
+                echo -e "${RED}无法下载脚本，请手动安装${NC}"
+                return 1
+            fi
+        else
+            # 从管道执行，保存当前脚本
+            cat > "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            echo -e "${GREEN}✓ 脚本已安装到 $SCRIPT_PATH${NC}"
+        fi
+    fi
+    
+    # 创建快捷命令
+    if [ ! -f "/usr/local/bin/$SHORTCUT_COMMAND" ]; then
+        cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
 #!/bin/bash
 exec bash "$SCRIPT_PATH" "\$@"
 EOF
-    chmod +x "/usr/local/bin/$SHORTCUT_COMMAND"
+        chmod +x "/usr/local/bin/$SHORTCUT_COMMAND"
+        echo -e "${GREEN}✓ 快捷命令 '$SHORTCUT_COMMAND' 已创建${NC}"
+    fi
 }
 
 # ============================================================================
