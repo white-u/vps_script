@@ -3,18 +3,19 @@
 set -euo pipefail
 
 # ============================================================================
-# 端口流量监控脚本 v2.2.0
-# 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知
-# 优化: 配置缓存、入站限速、小数配额支持、备注修改
+# 端口流量监控脚本 v2.3.0
+# 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知、突发速率保护
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="端口流量监控"
 readonly SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 readonly CONFIG_DIR="/etc/port-traffic-monitor"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
 readonly ALERT_STATE_FILE="$CONFIG_DIR/alert_state.json"
+readonly BURST_STATE_FILE="$CONFIG_DIR/burst_state.json"      # 突发速率状态
+readonly TRAFFIC_HISTORY_DIR="$CONFIG_DIR/traffic_history"    # 流量历史记录
 
 readonly RED='\033[0;31m'
 readonly YELLOW='\033[0;33m'
@@ -136,6 +137,7 @@ load_nft_config() {
 
 init_config() {
     mkdir -p "$CONFIG_DIR"
+    mkdir -p "$TRAFFIC_HISTORY_DIR"
 
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" << 'EOF'
@@ -148,6 +150,7 @@ EOF
     fi
 
     [ ! -f "$ALERT_STATE_FILE" ] && echo '{}' > "$ALERT_STATE_FILE"
+    [ ! -f "$BURST_STATE_FILE" ] && echo '{}' > "$BURST_STATE_FILE"
 
     load_nft_config
     init_nftables
@@ -170,7 +173,6 @@ get_default_interface() {
     ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
 }
 
-# 格式化字节 (支持更高精度)
 format_bytes() {
     local bytes=${1:-0}
     [[ ! "$bytes" =~ ^[0-9]+$ ]] && bytes=0
@@ -188,7 +190,18 @@ format_bytes() {
     fi
 }
 
-# 解析大小到字节 (支持小数如 1.5GB)
+# 格式化速率显示
+format_rate() {
+    local kbps=${1:-0}
+    if [ $kbps -ge 1000000 ]; then
+        printf "%.2fGbps" "$(echo "scale=2; $kbps / 1000000" | bc)"
+    elif [ $kbps -ge 1000 ]; then
+        printf "%.2fMbps" "$(echo "scale=2; $kbps / 1000" | bc)"
+    else
+        echo "${kbps}Kbps"
+    fi
+}
+
 parse_size_to_bytes() {
     local size_str=$1
     local number=$(echo "$size_str" | grep -oE '^[0-9]+\.?[0-9]*')
@@ -205,7 +218,6 @@ parse_size_to_bytes() {
         *) echo "0" && return 1 ;;
     esac
     
-    # 使用 bc 处理小数
     echo "scale=0; $number * $multiplier / 1" | bc
 }
 
@@ -220,7 +232,26 @@ parse_rate_to_kbps() {
     else echo "0"; fi
 }
 
+# 解析时间到分钟
+parse_time_to_minutes() {
+    local time_str=$1
+    local time_lower=$(echo "$time_str" | tr '[:upper:]' '[:lower:]')
+    local number=$(echo "$time_lower" | grep -oE '^[0-9]+')
+    
+    [ -z "$number" ] && echo "0" && return 1
+    
+    if [[ "$time_lower" =~ m$ ]] || [[ "$time_lower" =~ min ]]; then
+        echo "$number"
+    elif [[ "$time_lower" =~ h$ ]] || [[ "$time_lower" =~ hour ]]; then
+        echo $((number * 60))
+    else
+        echo "$number"  # 默认分钟
+    fi
+}
+
 get_beijing_time() { TZ='Asia/Shanghai' date "$@"; }
+
+get_timestamp() { date +%s; }
 
 update_config() {
     local tmp="${CONFIG_FILE}.tmp.$$"
@@ -232,7 +263,6 @@ update_config() {
     fi
 }
 
-# 获取活动端口 (正确排序端口段)
 get_active_ports() {
     jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | while read -r port; do
         if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
@@ -246,7 +276,6 @@ get_active_ports() {
 
 is_port_range() { [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; }
 
-# 验证端口段合法性
 validate_port_range() {
     local port=$1
     if is_port_range "$port"; then
@@ -258,7 +287,6 @@ validate_port_range() {
     fi
 }
 
-# 转义 JSON 字符串
 escape_json() {
     local str=$1
     str="${str//\\/\\\\}"
@@ -288,7 +316,6 @@ calculate_total_traffic() {
     [ "$mode" = "double" ] && echo $((input + output)) || echo $output
 }
 
-# 优化: 批量保存流量数据
 save_traffic_data() {
     local active_ports=($(get_active_ports 2>/dev/null || true))
     [ ${#active_ports[@]} -eq 0 ] && return 0
@@ -345,10 +372,136 @@ restore_all_rules() {
         add_nftables_rules "$port"
         local quota=$(jq -r ".ports.\"$port\".quota.limit // \"unlimited\"" "$CONFIG_FILE")
         [ "$quota" != "unlimited" ] && [ "$quota" != "null" ] && apply_quota "$port" "$quota"
-        local rate=$(jq -r ".ports.\"$port\".bandwidth.rate // \"unlimited\"" "$CONFIG_FILE")
-        [ "$rate" != "unlimited" ] && [ "$rate" != "null" ] && apply_tc_limit "$port" "$rate"
+        
+        # 检查是否处于突发限速状态
+        local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+        if [ "$throttled" = "true" ]; then
+            local throttle_rate=$(jq -r ".\"$port\".throttle_rate // \"\"" "$BURST_STATE_FILE")
+            [ -n "$throttle_rate" ] && apply_tc_limit "$port" "$throttle_rate"
+        else
+            local rate=$(jq -r ".ports.\"$port\".bandwidth.rate // \"unlimited\"" "$CONFIG_FILE")
+            [ "$rate" != "unlimited" ] && [ "$rate" != "null" ] && apply_tc_limit "$port" "$rate"
+        fi
+        
         setup_reset_cron "$port"
     done
+}
+
+# ============================================================================
+# 流量历史记录 (用于突发速率检测)
+# ============================================================================
+
+# 记录当前流量快照
+record_traffic_snapshot() {
+    local port=$1
+    local port_safe=$(get_port_safe "$port")
+    local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
+    
+    local traffic=($(get_port_traffic "$port"))
+    local timestamp=$(get_timestamp)
+    local total=$((${traffic[0]} + ${traffic[1]}))
+    
+    # 追加记录: timestamp total_bytes
+    echo "$timestamp $total" >> "$history_file"
+    
+    # 只保留最近 120 条记录 (2小时，每分钟1条)
+    if [ -f "$history_file" ]; then
+        tail -n 120 "$history_file" > "${history_file}.tmp"
+        mv "${history_file}.tmp" "$history_file"
+    fi
+}
+
+# 计算指定时间窗口内的平均速率 (Kbps)
+calculate_avg_rate() {
+    local port=$1
+    local window_minutes=$2
+    local port_safe=$(get_port_safe "$port")
+    local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
+    
+    [ ! -f "$history_file" ] && echo "0" && return
+    
+    local now=$(get_timestamp)
+    local window_start=$((now - window_minutes * 60))
+    
+    # 获取窗口内的第一条和最后一条记录
+    local first_record=""
+    local last_record=""
+    
+    while read -r ts bytes; do
+        [ "$ts" -ge "$window_start" ] || continue
+        [ -z "$first_record" ] && first_record="$ts $bytes"
+        last_record="$ts $bytes"
+    done < "$history_file"
+    
+    [ -z "$first_record" ] || [ -z "$last_record" ] && echo "0" && return
+    
+    local first_ts=$(echo "$first_record" | awk '{print $1}')
+    local first_bytes=$(echo "$first_record" | awk '{print $2}')
+    local last_ts=$(echo "$last_record" | awk '{print $1}')
+    local last_bytes=$(echo "$last_record" | awk '{print $2}')
+    
+    local time_diff=$((last_ts - first_ts))
+    [ "$time_diff" -le 0 ] && echo "0" && return
+    
+    local bytes_diff=$((last_bytes - first_bytes))
+    [ "$bytes_diff" -lt 0 ] && bytes_diff=0  # 流量重置后可能为负
+    
+    # 计算 Kbps: (bytes * 8) / (seconds * 1000)
+    local kbps=$(echo "scale=0; $bytes_diff * 8 / $time_diff / 1000" | bc)
+    echo "${kbps:-0}"
+}
+
+# 获取最近 N 分钟内持续高速率的时长
+get_high_rate_duration() {
+    local port=$1
+    local threshold_kbps=$2
+    local port_safe=$(get_port_safe "$port")
+    local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
+    
+    [ ! -f "$history_file" ] && echo "0" && return
+    
+    local records=()
+    while read -r ts bytes; do
+        records+=("$ts:$bytes")
+    done < "$history_file"
+    
+    local count=${#records[@]}
+    [ "$count" -lt 2 ] && echo "0" && return
+    
+    # 从最新记录向前检查，找到连续高速率的起始点
+    local high_rate_start=0
+    local i=$((count - 1))
+    
+    while [ $i -gt 0 ]; do
+        local curr_ts=$(echo "${records[$i]}" | cut -d: -f1)
+        local curr_bytes=$(echo "${records[$i]}" | cut -d: -f2)
+        local prev_ts=$(echo "${records[$((i-1))]}" | cut -d: -f1)
+        local prev_bytes=$(echo "${records[$((i-1))]}" | cut -d: -f2)
+        
+        local time_diff=$((curr_ts - prev_ts))
+        [ "$time_diff" -le 0 ] && break
+        
+        local bytes_diff=$((curr_bytes - prev_bytes))
+        [ "$bytes_diff" -lt 0 ] && break
+        
+        local rate_kbps=$(echo "scale=0; $bytes_diff * 8 / $time_diff / 1000" | bc)
+        
+        if [ "$rate_kbps" -ge "$threshold_kbps" ]; then
+            high_rate_start=$prev_ts
+        else
+            break
+        fi
+        
+        i=$((i - 1))
+    done
+    
+    if [ "$high_rate_start" -gt 0 ]; then
+        local now=$(get_timestamp)
+        local duration=$(( (now - high_rate_start) / 60 ))
+        echo "$duration"
+    else
+        echo "0"
+    fi
 }
 
 # ============================================================================
@@ -359,13 +512,11 @@ add_nftables_rules() {
     local port=$1
     local port_safe=$(get_port_safe "$port")
 
-    # 创建计数器
     nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" >/dev/null 2>&1 || \
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null || true
     nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" >/dev/null 2>&1 || \
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 
-    # 添加规则
     for proto in tcp udp; do
         nft add rule $NFT_FAMILY $NFT_TABLE input $proto dport $port counter name "port_${port_safe}_in" 2>/dev/null || true
         nft add rule $NFT_FAMILY $NFT_TABLE forward $proto dport $port counter name "port_${port_safe}_in" 2>/dev/null || true
@@ -378,7 +529,6 @@ remove_nftables_rules() {
     local port=$1
     local port_safe=$(get_port_safe "$port")
 
-    # 删除规则 (按 handle)
     local deleted=0
     while [ $deleted -lt 50 ]; do
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
@@ -390,7 +540,6 @@ remove_nftables_rules() {
         deleted=$((deleted + 1))
     done
 
-    # 删除计数器
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null || true
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 }
@@ -411,10 +560,8 @@ apply_quota() {
     local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
     local quota_name="port_${port_safe}_quota"
 
-    # 创建配额
     nft add quota $NFT_FAMILY $NFT_TABLE $quota_name "{ over $quota_bytes bytes used $used bytes }" 2>/dev/null || true
 
-    # 插入 drop 规则
     if [ "$billing" = "double" ]; then
         for proto in tcp udp; do
             nft insert rule $NFT_FAMILY $NFT_TABLE input $proto dport $port quota name "$quota_name" drop 2>/dev/null || true
@@ -435,7 +582,6 @@ remove_quota() {
     local port_safe=$(get_port_safe "$port")
     local quota_name="port_${port_safe}_quota"
 
-    # 删除配额规则
     local deleted=0
     while [ $deleted -lt 50 ]; do
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
@@ -453,7 +599,6 @@ remove_quota() {
 # TC 带宽限制 (含突发速率处理 + 入站限速)
 # ============================================================================
 
-# 计算 burst: burst = rate * 50ms, 最小 3000 bytes (2*MTU)
 calculate_burst() {
     local rate_kbps=$1
     local burst_bytes=$(( rate_kbps * 1000 / 8 / 20 ))
@@ -464,7 +609,6 @@ calculate_burst() {
     else echo "$burst_bytes"; fi
 }
 
-# 计算稳定的 class_id (避免冲突)
 get_tc_class_id() {
     local port=$1
     local hash
@@ -480,23 +624,13 @@ get_tc_class_id() {
     printf "1:%x" $hash
 }
 
-# 设置 IFB 用于入站限速
 setup_ifb() {
     local interface=$1
     
-    # 加载 ifb 模块
     modprobe ifb numifbs=1 2>/dev/null || true
-    
-    # 启用 ifb0
     ip link set ifb0 up 2>/dev/null || true
-    
-    # 在物理接口上设置 ingress qdisc
     tc qdisc add dev $interface handle ffff: ingress 2>/dev/null || true
-    
-    # 将入站流量重定向到 ifb0
     tc filter add dev $interface parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
-    
-    # 在 ifb0 上设置 htb
     tc qdisc add dev ifb0 root handle 1: htb default 30 2>/dev/null || true
     tc class add dev ifb0 parent 1: classid 1:1 htb rate 10gbit 2>/dev/null || true
 }
@@ -506,7 +640,6 @@ apply_tc_limit() {
     local interface=$(get_default_interface)
     [ -z "$interface" ] && interface="eth0"
 
-    # 转换速率格式
     local tc_rate rate_lower=$(echo "$rate" | tr '[:upper:]' '[:lower:]')
     if [[ "$rate_lower" =~ kbps$ ]]; then tc_rate=$(echo "$rate_lower" | sed 's/kbps$/kbit/')
     elif [[ "$rate_lower" =~ mbps$ ]]; then tc_rate=$(echo "$rate_lower" | sed 's/mbps$/mbit/')
@@ -517,14 +650,13 @@ apply_tc_limit() {
     local burst=$(calculate_burst $rate_kbps)
     local class_id=$(get_tc_class_id "$port")
 
-    # === 出站限速 ===
+    # 出站限速
     tc qdisc add dev $interface root handle 1: htb default 30 2>/dev/null || true
     tc class add dev $interface parent 1: classid 1:1 htb rate 10gbit 2>/dev/null || true
     
     tc class del dev $interface classid $class_id 2>/dev/null || true
     tc class add dev $interface parent 1:1 classid $class_id htb rate $tc_rate ceil $tc_rate burst $burst cburst $burst
 
-    # 出站过滤器 (使用端口号作为 prio 的一部分)
     local base_prio
     if is_port_range "$port"; then
         local start=$(echo "$port" | cut -d'-' -f1)
@@ -538,11 +670,10 @@ apply_tc_limit() {
             match ip protocol $proto_num 0xff match ip sport $port 0xffff flowid $class_id 2>/dev/null || true
     done
 
-    # === 入站限速 (使用 IFB) ===
+    # 入站限速 (IFB)
     setup_ifb "$interface"
     
-    local ifb_class_id=$(echo "$class_id" | sed 's/1:/2:/')
-    ifb_class_id="1:$(printf '%x' $(( 0x${ifb_class_id#2:} + 0x1000 )))"
+    local ifb_class_id="1:$(printf '%x' $(( 0x${class_id#1:} + 0x1000 )))"
     
     tc class del dev ifb0 classid $ifb_class_id 2>/dev/null || true
     tc class add dev ifb0 parent 1:1 classid $ifb_class_id htb rate $tc_rate ceil $tc_rate burst $burst cburst $burst 2>/dev/null || true
@@ -568,14 +699,12 @@ remove_tc_limit() {
         base_prio=$((port % 1000 + 100))
     fi
 
-    # 删除出站过滤器和 class
     for proto_num in 6 17; do
         tc filter del dev $interface protocol ip parent 1:0 prio $base_prio u32 \
             match ip protocol $proto_num 0xff match ip sport $port 0xffff 2>/dev/null || true
     done
     tc class del dev $interface classid $class_id 2>/dev/null || true
 
-    # 删除入站过滤器和 class
     local ifb_class_id="1:$(printf '%x' $(( 0x${class_id#1:} + 0x1000 )))"
     
     for proto_num in 6 17; do
@@ -583,6 +712,161 @@ remove_tc_limit() {
             match ip protocol $proto_num 0xff match ip dport $port 0xffff 2>/dev/null || true
     done
     tc class del dev ifb0 classid $ifb_class_id 2>/dev/null || true
+}
+
+# ============================================================================
+# 突发速率保护
+# ============================================================================
+
+# 检查并执行突发速率保护
+check_burst_protection() {
+    local ports=($(get_active_ports))
+    
+    for port in "${ports[@]}"; do
+        # 检查是否启用了突发保护
+        local burst_enabled=$(jq -r ".ports.\"$port\".burst_protection.enabled // false" "$CONFIG_FILE")
+        [ "$burst_enabled" != "true" ] && continue
+        
+        # 获取配置
+        local burst_rate=$(jq -r ".ports.\"$port\".burst_protection.burst_rate // \"\"" "$CONFIG_FILE")
+        local burst_window=$(jq -r ".ports.\"$port\".burst_protection.burst_window // 30" "$CONFIG_FILE")
+        local throttle_rate=$(jq -r ".ports.\"$port\".burst_protection.throttle_rate // \"\"" "$CONFIG_FILE")
+        local throttle_duration=$(jq -r ".ports.\"$port\".burst_protection.throttle_duration // 60" "$CONFIG_FILE")
+        
+        [ -z "$burst_rate" ] || [ -z "$throttle_rate" ] && continue
+        
+        local burst_rate_kbps=$(parse_rate_to_kbps "$burst_rate")
+        
+        # 记录流量快照
+        record_traffic_snapshot "$port"
+        
+        # 检查当前状态
+        local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+        local throttle_start=$(jq -r ".\"$port\".throttle_start // 0" "$BURST_STATE_FILE" 2>/dev/null)
+        
+        if [ "$throttled" = "true" ]; then
+            # 已经在限速状态，检查是否该解除
+            local now=$(get_timestamp)
+            local elapsed=$(( (now - throttle_start) / 60 ))
+            
+            if [ "$elapsed" -ge "$throttle_duration" ]; then
+                # 解除限速
+                release_burst_throttle "$port"
+            fi
+        else
+            # 正常状态，检查是否需要触发限速
+            local high_duration=$(get_high_rate_duration "$port" "$burst_rate_kbps")
+            
+            if [ "$high_duration" -ge "$burst_window" ]; then
+                # 触发限速
+                apply_burst_throttle "$port" "$throttle_rate"
+            fi
+        fi
+    done
+}
+
+# 应用突发限速
+apply_burst_throttle() {
+    local port=$1
+    local throttle_rate=$2
+    
+    # 移除现有限速并应用新限速
+    remove_tc_limit "$port"
+    apply_tc_limit "$port" "$throttle_rate"
+    
+    # 更新状态
+    local now=$(get_timestamp)
+    local tmp="${BURST_STATE_FILE}.tmp.$$"
+    jq ".\"$port\" = {\"throttled\": true, \"throttle_start\": $now, \"throttle_rate\": \"$throttle_rate\"}" \
+        "$BURST_STATE_FILE" > "$tmp" && mv "$tmp" "$BURST_STATE_FILE"
+    
+    # 发送通知
+    send_burst_throttle_alert "$port" "$throttle_rate" "triggered"
+}
+
+# 解除突发限速
+release_burst_throttle() {
+    local port=$1
+    
+    # 恢复原始限速
+    remove_tc_limit "$port"
+    local original_rate=$(jq -r ".ports.\"$port\".bandwidth.rate // \"unlimited\"" "$CONFIG_FILE")
+    [ "$original_rate" != "unlimited" ] && [ "$original_rate" != "null" ] && apply_tc_limit "$port" "$original_rate"
+    
+    # 更新状态
+    local tmp="${BURST_STATE_FILE}.tmp.$$"
+    jq "del(.\"$port\")" "$BURST_STATE_FILE" > "$tmp" && mv "$tmp" "$BURST_STATE_FILE"
+    
+    # 清除历史记录
+    local port_safe=$(get_port_safe "$port")
+    rm -f "$TRAFFIC_HISTORY_DIR/${port_safe}.log"
+    
+    # 发送通知
+    send_burst_throttle_alert "$port" "" "released"
+}
+
+# 发送突发限速通知
+send_burst_throttle_alert() {
+    local port=$1
+    local throttle_rate=$2
+    local action=$3  # triggered 或 released
+    
+    local telegram_enabled=$(jq -r '.telegram.enabled' "$CONFIG_FILE")
+    [ "$telegram_enabled" != "true" ] && return
+    
+    local server_name=$(jq -r '.telegram.server_name // ""' "$CONFIG_FILE")
+    [ -z "$server_name" ] || [ "$server_name" = "null" ] && server_name=$(hostname)
+    
+    local remark=$(jq -r ".ports.\"$port\".remark // \"\"" "$CONFIG_FILE")
+    local remark_display=""
+    [ -n "$remark" ] && [ "$remark" != "null" ] && [ "$remark" != "" ] && remark_display=" ($remark)"
+    
+    local message
+    if [ "$action" = "triggered" ]; then
+        local burst_rate=$(jq -r ".ports.\"$port\".burst_protection.burst_rate // \"\"" "$CONFIG_FILE")
+        local burst_window=$(jq -r ".ports.\"$port\".burst_protection.burst_window // 30" "$CONFIG_FILE")
+        local throttle_duration=$(jq -r ".ports.\"$port\".burst_protection.throttle_duration // 60" "$CONFIG_FILE")
+        
+        message="🚨 <b>突发速率保护触发</b>
+━━━━━━━━━━━━━━━━
+🖥 服务器: ${server_name}
+📌 端口: ${port}${remark_display}
+⚡ 触发条件: 持续 ${burst_window} 分钟超过 ${burst_rate}
+🔽 已限速至: <b>${throttle_rate}</b>
+⏱ 限速时长: ${throttle_duration} 分钟
+⏰ $(get_beijing_time '+%Y-%m-%d %H:%M:%S')"
+    else
+        message="✅ <b>突发速率保护解除</b>
+━━━━━━━━━━━━━━━━
+🖥 服务器: ${server_name}
+📌 端口: ${port}${remark_display}
+📊 已恢复正常速率
+⏰ $(get_beijing_time '+%Y-%m-%d %H:%M:%S')"
+    fi
+    
+    telegram_send "$message"
+}
+
+# 获取端口突发保护状态
+get_burst_status() {
+    local port=$1
+    
+    local enabled=$(jq -r ".ports.\"$port\".burst_protection.enabled // false" "$CONFIG_FILE")
+    [ "$enabled" != "true" ] && echo "disabled" && return
+    
+    local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+    
+    if [ "$throttled" = "true" ]; then
+        local throttle_start=$(jq -r ".\"$port\".throttle_start // 0" "$BURST_STATE_FILE")
+        local throttle_duration=$(jq -r ".ports.\"$port\".burst_protection.throttle_duration // 60" "$CONFIG_FILE")
+        local now=$(get_timestamp)
+        local elapsed=$(( (now - throttle_start) / 60 ))
+        local remaining=$((throttle_duration - elapsed))
+        [ $remaining -lt 0 ] && remaining=0
+        echo "throttled:${remaining}m"
+    else
+        echo "normal"
+    fi
 }
 
 # ============================================================================
@@ -615,8 +899,9 @@ remove_reset_cron() {
 setup_notify_cron() {
     local interval=$1
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控状态通知" | grep -v "端口流量监控阈值检查" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控状态通知" | grep -v "端口流量监控阈值检查" | grep -v "端口流量监控突发检测" > "$temp_cron" || true
 
+    # 状态通知
     if [ -n "$interval" ] && [ "$interval" != "0" ] && [ "$interval" != "" ]; then
         case "$interval" in
             "1m")  echo "* * * * * $SCRIPT_PATH --notify >/dev/null 2>&1  # 端口流量监控状态通知" >> "$temp_cron" ;;
@@ -631,8 +916,17 @@ setup_notify_cron() {
         esac
     fi
 
+    # 阈值检查
     local alert_enabled=$(jq -r '.telegram.alert_enabled // true' "$CONFIG_FILE")
     [ "$alert_enabled" = "true" ] && echo "*/5 * * * * $SCRIPT_PATH --check-alert >/dev/null 2>&1  # 端口流量监控阈值检查" >> "$temp_cron"
+
+    # 突发速率检测 (每分钟)
+    local has_burst=false
+    for port in $(get_active_ports); do
+        local burst_enabled=$(jq -r ".ports.\"$port\".burst_protection.enabled // false" "$CONFIG_FILE")
+        [ "$burst_enabled" = "true" ] && has_burst=true && break
+    done
+    [ "$has_burst" = "true" ] && echo "* * * * * $SCRIPT_PATH --check-burst >/dev/null 2>&1  # 端口流量监控突发检测" >> "$temp_cron"
 
     crontab "$temp_cron" 2>/dev/null
     rm -f "$temp_cron"
@@ -640,7 +934,7 @@ setup_notify_cron() {
 
 remove_notify_cron() {
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控状态通知" | grep -v "端口流量监控阈值检查" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控状态通知" | grep -v "端口流量监控阈值检查" | grep -v "端口流量监控突发检测" > "$temp_cron" || true
     crontab "$temp_cron" 2>/dev/null
     rm -f "$temp_cron"
 }
@@ -653,9 +947,11 @@ reset_port_traffic() {
     nft reset counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" >/dev/null 2>&1 || true
     nft reset quota $NFT_FAMILY $NFT_TABLE "port_${port_safe}_quota" >/dev/null 2>&1 || true
 
-    # 清除告警状态
     local tmp="${ALERT_STATE_FILE}.tmp.$$"
     jq "del(.\"$port\")" "$ALERT_STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$ALERT_STATE_FILE" || rm -f "$tmp"
+    
+    # 清除流量历史
+    rm -f "$TRAFFIC_HISTORY_DIR/${port_safe}.log"
 }
 
 # ============================================================================
@@ -700,16 +996,23 @@ format_status_message() {
         local remark=$(jq -r ".ports.\"$port\".remark // \"\"" "$CONFIG_FILE")
         local limit=$(jq -r ".ports.\"$port\".quota.limit // \"unlimited\"" "$CONFIG_FILE")
         
-        local remark_display="" percent_display=""
+        local remark_display="" percent_display="" burst_display=""
         [ -n "$remark" ] && [ "$remark" != "null" ] && [ "$remark" != "" ] && remark_display=" ($remark)"
 
         if [ "$limit" != "unlimited" ] && [ "$limit" != "null" ]; then
             local limit_bytes=$(parse_size_to_bytes "$limit")
             [ "$limit_bytes" -gt 0 ] && percent_display=" [$(( used * 100 / limit_bytes ))%]"
         fi
+        
+        # 突发保护状态
+        local burst_status=$(get_burst_status "$port")
+        case "$burst_status" in
+            throttled:*) burst_display=" 🔽限速中" ;;
+            normal) burst_display=" ⚡保护中" ;;
+        esac
 
         port_info+="
-📌 端口 ${port}${remark_display}${percent_display}
+📌 端口 ${port}${remark_display}${percent_display}${burst_display}
    ├ 入站: $(format_bytes ${traffic[0]})
    ├ 出站: $(format_bytes ${traffic[1]})
    └ 总计: $(format_bytes $used)"
@@ -831,7 +1134,6 @@ add_port() {
     read -p "流量配额 (如 100GB, 1.5TB, 留空无限制): " quota_input
     local quota="unlimited" reset_day="null"
     if [ -n "$quota_input" ]; then
-        # 验证配额格式
         if parse_size_to_bytes "$quota_input" >/dev/null 2>&1; then
             quota="$quota_input"
             read -p "每月重置日 (1-31, 留空默认1日, 0=不重置): " reset_input
@@ -905,8 +1207,13 @@ remove_port() {
 
         local tmp="${ALERT_STATE_FILE}.tmp.$$"
         jq "del(.\"$port\")" "$ALERT_STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$ALERT_STATE_FILE" || rm -f "$tmp"
+        
+        tmp="${BURST_STATE_FILE}.tmp.$$"
+        jq "del(.\"$port\")" "$BURST_STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$BURST_STATE_FILE" || rm -f "$tmp"
+        
+        local port_safe=$(get_port_safe "$port")
+        rm -f "$TRAFFIC_HISTORY_DIR/${port_safe}.log"
 
-        # 清除连接跟踪
         if command -v conntrack >/dev/null 2>&1; then
             conntrack -D -p tcp --dport $port 2>/dev/null || true
             conntrack -D -p udp --dport $port 2>/dev/null || true
@@ -914,6 +1221,9 @@ remove_port() {
 
         echo -e "${GREEN}✓ 端口 $port 已删除${NC}"
     done
+    
+    # 更新 cron (可能需要移除突发检测)
+    setup_notify_cron "$(jq -r '.telegram.notify_interval // ""' "$CONFIG_FILE")"
     sleep 1
 }
 
@@ -925,7 +1235,10 @@ set_bandwidth() {
     for i in "${!ports[@]}"; do
         local port=${ports[$i]}
         local rate=$(jq -r ".ports.\"$port\".bandwidth.rate // \"unlimited\"" "$CONFIG_FILE")
-        echo "  $((i+1)). 端口 $port [当前: $rate]"
+        local burst_status=$(get_burst_status "$port")
+        local status_display=""
+        [ "$burst_status" != "disabled" ] && status_display=" [突发保护]"
+        echo "  $((i+1)). 端口 $port [当前: $rate]$status_display"
     done
     echo
 
@@ -941,13 +1254,21 @@ set_bandwidth() {
         update_config ".ports.\"$port\".bandwidth.rate = \"unlimited\""
         echo -e "${GREEN}✓ 已取消带宽限制${NC}"
     else
-        remove_tc_limit "$port"
-        if apply_tc_limit "$port" "$rate"; then
-            update_config ".ports.\"$port\".bandwidth.rate = \"$rate\""
-            echo -e "${GREEN}✓ 带宽限制设置为 $rate (入站+出站)${NC}"
+        # 检查是否在突发限速状态
+        local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+        if [ "$throttled" = "true" ]; then
+            echo -e "${YELLOW}注意: 端口当前处于突发限速状态，新限速将在限速解除后生效${NC}"
         else
-            echo -e "${RED}✗ 无效的速率格式${NC}"
+            remove_tc_limit "$port"
+            if apply_tc_limit "$port" "$rate"; then
+                echo -e "${GREEN}✓ 带宽限制设置为 $rate${NC}"
+            else
+                echo -e "${RED}✗ 无效的速率格式${NC}"
+                sleep 1
+                return
+            fi
         fi
+        update_config ".ports.\"$port\".bandwidth.rate = \"$rate\""
     fi
     sleep 1
 }
@@ -982,7 +1303,6 @@ set_quota() {
         jq "del(.\"$port\")" "$ALERT_STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$ALERT_STATE_FILE" || rm -f "$tmp"
         echo -e "${GREEN}✓ 已取消流量配额${NC}"
     else
-        # 验证配额格式
         if ! parse_size_to_bytes "$limit" >/dev/null 2>&1 || [ "$(parse_size_to_bytes "$limit")" -eq 0 ]; then
             echo -e "${RED}✗ 无效的配额格式${NC}"
             sleep 1
@@ -1043,7 +1363,6 @@ reset_traffic() {
     sleep 1
 }
 
-# 新增: 修改备注
 set_remark() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
@@ -1071,6 +1390,142 @@ set_remark() {
 }
 
 # ============================================================================
+# 突发速率保护设置
+# ============================================================================
+
+setup_burst_protection() {
+    local ports=($(get_active_ports))
+    [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
+
+    echo -e "${CYAN}=== 突发速率保护设置 ===${NC}\n"
+    echo -e "${YELLOW}功能说明: 当端口持续高速率超过指定时间后，自动限速${NC}"
+    echo
+    
+    for i in "${!ports[@]}"; do
+        local port=${ports[$i]}
+        local enabled=$(jq -r ".ports.\"$port\".burst_protection.enabled // false" "$CONFIG_FILE")
+        local status_display="未启用"
+        
+        if [ "$enabled" = "true" ]; then
+            local burst_rate=$(jq -r ".ports.\"$port\".burst_protection.burst_rate // \"\"" "$CONFIG_FILE")
+            local burst_window=$(jq -r ".ports.\"$port\".burst_protection.burst_window // 30" "$CONFIG_FILE")
+            local throttle_rate=$(jq -r ".ports.\"$port\".burst_protection.throttle_rate // \"\"" "$CONFIG_FILE")
+            local burst_status=$(get_burst_status "$port")
+            
+            status_display="${GREEN}已启用${NC} (>${burst_rate}持续${burst_window}分钟→${throttle_rate})"
+            [ "$burst_status" != "normal" ] && [ "$burst_status" != "disabled" ] && status_display+=" ${RED}[限速中]${NC}"
+        fi
+        
+        echo -e "  $((i+1)). 端口 $port [$status_display]"
+    done
+    echo
+
+    read -p "选择端口: " sel
+    [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
+
+    local port=${ports[$((sel-1))]}
+    local enabled=$(jq -r ".ports.\"$port\".burst_protection.enabled // false" "$CONFIG_FILE")
+    
+    echo
+    if [ "$enabled" = "true" ]; then
+        echo "当前配置:"
+        echo "  突发阈值: $(jq -r ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE")"
+        echo "  持续时间: $(jq -r ".ports.\"$port\".burst_protection.burst_window" "$CONFIG_FILE") 分钟"
+        echo "  限速至: $(jq -r ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE")"
+        echo "  限速时长: $(jq -r ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE") 分钟"
+        echo
+        echo "1. 修改配置"
+        echo "2. 禁用保护"
+        echo "3. 手动解除当前限速"
+        echo "0. 返回"
+        read -p "选择: " action
+        
+        case $action in
+            1) configure_burst_protection "$port" ;;
+            2)
+                update_config ".ports.\"$port\".burst_protection.enabled = false"
+                # 解除限速
+                local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+                if [ "$throttled" = "true" ]; then
+                    release_burst_throttle "$port"
+                fi
+                setup_notify_cron "$(jq -r '.telegram.notify_interval // ""' "$CONFIG_FILE")"
+                echo -e "${GREEN}✓ 已禁用突发保护${NC}"
+                ;;
+            3)
+                local throttled=$(jq -r ".\"$port\".throttled // false" "$BURST_STATE_FILE" 2>/dev/null)
+                if [ "$throttled" = "true" ]; then
+                    release_burst_throttle "$port"
+                    echo -e "${GREEN}✓ 已解除限速${NC}"
+                else
+                    echo -e "${YELLOW}端口未处于限速状态${NC}"
+                fi
+                ;;
+        esac
+    else
+        echo "1. 启用突发保护"
+        echo "0. 返回"
+        read -p "选择: " action
+        
+        [ "$action" = "1" ] && configure_burst_protection "$port"
+    fi
+    sleep 1
+}
+
+configure_burst_protection() {
+    local port=$1
+    
+    echo
+    echo -e "${CYAN}配置突发速率保护${NC}"
+    echo -e "${YELLOW}示例: 当速率持续30分钟超过100Mbps时，自动限速到10Mbps，持续60分钟${NC}"
+    echo
+    
+    # 突发阈值
+    local current_burst=$(jq -r ".ports.\"$port\".burst_protection.burst_rate // \"100Mbps\"" "$CONFIG_FILE")
+    read -p "突发阈值 (如 100Mbps, 默认 $current_burst): " burst_rate
+    [ -z "$burst_rate" ] && burst_rate="$current_burst"
+    
+    if [ "$(parse_rate_to_kbps "$burst_rate")" -eq 0 ]; then
+        echo -e "${RED}无效的速率格式${NC}"
+        return
+    fi
+    
+    # 持续时间
+    local current_window=$(jq -r ".ports.\"$port\".burst_protection.burst_window // 30" "$CONFIG_FILE")
+    read -p "持续时间 (分钟, 默认 $current_window): " burst_window
+    [ -z "$burst_window" ] && burst_window="$current_window"
+    [[ ! "$burst_window" =~ ^[0-9]+$ ]] && burst_window=30
+    
+    # 限速值
+    local current_throttle=$(jq -r ".ports.\"$port\".burst_protection.throttle_rate // \"10Mbps\"" "$CONFIG_FILE")
+    read -p "限速至 (如 10Mbps, 默认 $current_throttle): " throttle_rate
+    [ -z "$throttle_rate" ] && throttle_rate="$current_throttle"
+    
+    if [ "$(parse_rate_to_kbps "$throttle_rate")" -eq 0 ]; then
+        echo -e "${RED}无效的速率格式${NC}"
+        return
+    fi
+    
+    # 限速时长
+    local current_duration=$(jq -r ".ports.\"$port\".burst_protection.throttle_duration // 60" "$CONFIG_FILE")
+    read -p "限速时长 (分钟, 默认 $current_duration): " throttle_duration
+    [ -z "$throttle_duration" ] && throttle_duration="$current_duration"
+    [[ ! "$throttle_duration" =~ ^[0-9]+$ ]] && throttle_duration=60
+    
+    # 保存配置
+    local burst_config="{\"enabled\": true, \"burst_rate\": \"$burst_rate\", \"burst_window\": $burst_window, \"throttle_rate\": \"$throttle_rate\", \"throttle_duration\": $throttle_duration}"
+    update_config ".ports.\"$port\".burst_protection = $burst_config"
+    
+    # 更新 cron
+    setup_notify_cron "$(jq -r '.telegram.notify_interval // ""' "$CONFIG_FILE")"
+    
+    echo
+    echo -e "${GREEN}✓ 突发保护已启用${NC}"
+    echo "  当速率持续 $burst_window 分钟超过 $burst_rate 时"
+    echo "  自动限速到 $throttle_rate，持续 $throttle_duration 分钟"
+}
+
+# ============================================================================
 # Telegram 设置
 # ============================================================================
 
@@ -1089,7 +1544,7 @@ setup_telegram() {
     [ -n "$chat" ] && [ "$chat" != "null" ] && [ "$chat" != "" ] && echo "Chat ID: $chat"
     [ -n "$server" ] && [ "$server" != "null" ] && [ "$server" != "" ] && echo "服务器: $server"
     echo "定时推送: $([ -n "$interval" ] && [ "$interval" != "null" ] && [ "$interval" != "" ] && echo "$interval" || echo "未设置")"
-    echo "阈值告警: $([ "$alert" = "true" ] && echo -e "${GREEN}已启用${NC} (30%/50%/80%/100%)" || echo -e "${YELLOW}未启用${NC}")"
+    echo "阈值告警: $([ "$alert" = "true" ] && echo -e "${GREEN}已启用${NC}" || echo -e "${YELLOW}未启用${NC}")"
     echo
     echo "1. 配置 Bot Token 和 Chat ID"
     echo "2. 发送测试消息"
@@ -1163,7 +1618,7 @@ setup_telegram() {
             else
                 update_config ".telegram.alert_enabled = true"
                 setup_notify_cron "$(jq -r '.telegram.notify_interval // ""' "$CONFIG_FILE")"
-                echo -e "${GREEN}已启用阈值告警 (30%/50%/80%/100%)${NC}"
+                echo -e "${GREEN}已启用阈值告警${NC}"
             fi
             ;;
     esac
@@ -1179,12 +1634,12 @@ show_status() {
     local ports=($(get_active_ports))
     local total=0
 
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}           ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}             ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}             ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}               ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
 
     if [ ${#ports[@]} -eq 0 ]; then
-        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                            ${BLUE}║${NC}"
     else
         for port in "${ports[@]}"; do
             local traffic=($(get_port_traffic "$port"))
@@ -1206,21 +1661,34 @@ show_status() {
                     else percent_display=" ${GREEN}[${percent}%]${NC}"; fi
                 fi
             fi
+            
+            # 突发保护状态
+            local burst_display=""
+            local burst_status=$(get_burst_status "$port")
+            case "$burst_status" in
+                throttled:*) 
+                    local remaining=$(echo "$burst_status" | cut -d: -f2)
+                    burst_display=" ${RED}🔽${remaining}${NC}"
+                    ;;
+                normal) burst_display=" ${GREEN}⚡${NC}" ;;
+            esac
 
-            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b${BLUE}║${NC}\n" \
-                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display"
+            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b${BLUE}║${NC}\n" \
+                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display"
             
             local tags=""
             [ -n "$remark" ] && [ "$remark" != "null" ] && [ "$remark" != "" ] && tags+="[$remark] "
             [ "$limit" != "unlimited" ] && [ "$limit" != "null" ] && tags+="配额:$limit "
             [ "$rate" != "unlimited" ] && [ "$rate" != "null" ] && tags+="限速:$rate"
-            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-52s${NC}${BLUE}║${NC}\n" "$tags"
+            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-56s${NC}${BLUE}║${NC}\n" "$tags"
         done
     fi
 
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════╣${NC}"
-    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%s${NC}   ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
+    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}     ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    echo -e "  ${YELLOW}⚡=突发保护  🔽=限速中${NC}"
     echo
 }
 
@@ -1229,10 +1697,12 @@ show_menu() {
     echo "  1. 添加端口    2. 删除端口    3. 修改备注"
     echo -e "${CYAN}── 流量设置 ──${NC}"
     echo "  4. 带宽限制    5. 流量配额    6. 重置流量"
+    echo -e "${CYAN}── 保护设置 ──${NC}"
+    echo "  7. 突发保护"
     echo -e "${CYAN}── 通知设置 ──${NC}"
-    echo "  7. Telegram    8. 立即推送"
+    echo "  8. Telegram    9. 立即推送"
     echo -e "${CYAN}── 系统 ──${NC}"
-    echo "  9. 卸载        0. 退出"
+    echo "  10. 卸载       0. 退出"
     echo
 }
 
@@ -1253,7 +1723,6 @@ uninstall() {
     remove_notify_cron
     nft delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
 
-    # 清理 IFB
     local interface=$(get_default_interface)
     [ -n "$interface" ] && tc qdisc del dev $interface handle ffff: ingress 2>/dev/null || true
     tc qdisc del dev ifb0 root 2>/dev/null || true
@@ -1297,15 +1766,19 @@ main() {
             --check-alert)
                 check_and_send_alerts
                 exit 0 ;;
+            --check-burst)
+                check_burst_protection
+                exit 0 ;;
             --version|-v)
                 echo "$SCRIPT_NAME v$SCRIPT_VERSION"
                 exit 0 ;;
             --help|-h)
                 echo "用法: $0 [选项]"
-                echo "  --reset <port>  重置端口流量"
-                echo "  --notify        发送状态通知"
-                echo "  --check-alert   检查阈值告警"
-                echo "  --version       显示版本"
+                echo "  --reset <port>   重置端口流量"
+                echo "  --notify         发送状态通知"
+                echo "  --check-alert    检查阈值告警"
+                echo "  --check-burst    检查突发速率保护"
+                echo "  --version        显示版本"
                 exit 0 ;;
             *)
                 echo "未知参数，使用 --help 查看帮助"
@@ -1316,7 +1789,7 @@ main() {
     while true; do
         show_status
         show_menu
-        read -p "选择 [0-9]: " choice
+        read -p "选择 [0-10]: " choice
         case $choice in
             1) add_port ;;
             2) remove_port ;;
@@ -1324,15 +1797,16 @@ main() {
             4) set_bandwidth ;;
             5) set_quota ;;
             6) reset_traffic ;;
-            7) setup_telegram ;;
-            8)
+            7) setup_burst_protection ;;
+            8) setup_telegram ;;
+            9)
                 if [ "$(jq -r '.telegram.enabled' "$CONFIG_FILE")" = "true" ]; then
                     telegram_send "$(format_status_message)" && echo -e "${GREEN}✓ 已发送${NC}" || echo -e "${RED}✗ 发送失败${NC}"
                 else
                     echo -e "${YELLOW}请先启用 Telegram 通知${NC}"
                 fi
                 sleep 1 ;;
-            9) uninstall ;;
+            10) uninstall ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
         esac
