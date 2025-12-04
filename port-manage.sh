@@ -1,26 +1,25 @@
 #!/bin/bash
 
-# 错误处理：显示错误信息而不是静默退出
-set -o pipefail
-trap 'echo -e "\033[0;31m错误: 脚本在第 $LINENO 行执行失败\033[0m" >&2' ERR
-
 # ============================================================================
 # 端口流量监控脚本 v2.3.2
 # 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知、突发速率保护
-# 修复: 启动错误处理、兼容性增强
 # ============================================================================
+
+# 错误处理 - 移除 set -e，改用显式错误检查
+set -o pipefail
 
 readonly SCRIPT_VERSION="2.3.2"
 readonly SCRIPT_NAME="端口流量监控"
 
 # 处理通过 bash <(curl ...) 执行的情况
-if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]]; then
-    # 从网络执行，需要下载到本地
+if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]] || [[ "$0" == "bash" ]]; then
     SCRIPT_PATH="/usr/local/bin/port-traffic-monitor.sh"
+    REMOTE_INSTALL=true
 else
-    SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+    SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+    REMOTE_INSTALL=false
 fi
-readonly SCRIPT_PATH
+
 readonly CONFIG_DIR="/etc/port-traffic-monitor"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly TRAFFIC_DATA_FILE="$CONFIG_DIR/traffic_data.json"
@@ -45,14 +44,15 @@ NFT_TABLE=""
 NFT_FAMILY=""
 
 # ============================================================================
-# 锁机制 (防止并发)
+# 锁机制
 # ============================================================================
 
 acquire_lock() {
     local timeout=${1:-5}
     local count=0
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
     while [ -f "$LOCK_FILE" ]; do
-        local pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        local pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             count=$((count + 1))
             [ $count -ge $timeout ] && return 1
@@ -67,7 +67,7 @@ acquire_lock() {
 }
 
 release_lock() {
-    [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ] && rm -f "$LOCK_FILE"
+    [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null || echo "")" = "$$" ] && rm -f "$LOCK_FILE"
 }
 
 # ============================================================================
@@ -81,6 +81,7 @@ detect_system() {
             ubuntu|debian|linuxmint) echo "debian" ;;
             centos|rhel|fedora|rocky|almalinux) echo "centos" ;;
             arch|manjaro) echo "arch" ;;
+            alpine) echo "alpine" ;;
             *) echo "unknown" ;;
         esac
     elif [ -f /etc/debian_version ]; then
@@ -101,39 +102,46 @@ install_missing_tools() {
 
     case $system_type in
         "debian")
-            apt-get update -qq
+            apt-get update -qq 2>/dev/null
             for tool in "${missing_tools[@]}"; do
                 case $tool in
-                    "nft") apt-get install -y nftables ;;
-                    "tc"|"ss") apt-get install -y iproute2 ;;
-                    "jq") apt-get install -y jq ;;
-                    "bc") apt-get install -y bc ;;
-                    "conntrack") apt-get install -y conntrack ;;
-                    "curl") apt-get install -y curl ;;
-                    *) apt-get install -y "$tool" ;;
+                    "nft") apt-get install -y nftables >/dev/null 2>&1 ;;
+                    "tc"|"ss") apt-get install -y iproute2 >/dev/null 2>&1 ;;
+                    "jq") apt-get install -y jq >/dev/null 2>&1 ;;
+                    "bc") apt-get install -y bc >/dev/null 2>&1 ;;
+                    "curl") apt-get install -y curl >/dev/null 2>&1 ;;
+                    *) apt-get install -y "$tool" >/dev/null 2>&1 ;;
                 esac
             done
             ;;
         "centos")
-            yum install -y epel-release 2>/dev/null || true
+            yum install -y epel-release >/dev/null 2>&1 || true
             for tool in "${missing_tools[@]}"; do
                 case $tool in
-                    "nft") yum install -y nftables ;;
-                    "tc"|"ss") yum install -y iproute ;;
-                    "jq") yum install -y jq ;;
-                    "bc") yum install -y bc ;;
-                    "conntrack") yum install -y conntrack-tools ;;
-                    "curl") yum install -y curl ;;
-                    *) yum install -y "$tool" ;;
+                    "nft") yum install -y nftables >/dev/null 2>&1 ;;
+                    "tc"|"ss") yum install -y iproute >/dev/null 2>&1 ;;
+                    "jq") yum install -y jq >/dev/null 2>&1 ;;
+                    "bc") yum install -y bc >/dev/null 2>&1 ;;
+                    "curl") yum install -y curl >/dev/null 2>&1 ;;
+                    *) yum install -y "$tool" >/dev/null 2>&1 ;;
                 esac
             done
             ;;
         "arch")
             for tool in "${missing_tools[@]}"; do
                 case $tool in
-                    "nft") pacman -S --noconfirm nftables ;;
-                    "tc"|"ss") pacman -S --noconfirm iproute2 ;;
-                    *) pacman -S --noconfirm "$tool" ;;
+                    "nft") pacman -S --noconfirm nftables >/dev/null 2>&1 ;;
+                    "tc"|"ss") pacman -S --noconfirm iproute2 >/dev/null 2>&1 ;;
+                    *) pacman -S --noconfirm "$tool" >/dev/null 2>&1 ;;
+                esac
+            done
+            ;;
+        "alpine")
+            for tool in "${missing_tools[@]}"; do
+                case $tool in
+                    "nft") apk add nftables >/dev/null 2>&1 ;;
+                    "tc"|"ss") apk add iproute2 >/dev/null 2>&1 ;;
+                    *) apk add "$tool" >/dev/null 2>&1 ;;
                 esac
             done
             ;;
@@ -150,7 +158,9 @@ check_dependencies() {
     local required_tools=("nft" "tc" "ss" "jq" "bc" "curl")
 
     for tool in "${required_tools[@]}"; do
-        command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
     done
 
     if [ ${#missing_tools[@]} -gt 0 ]; then
@@ -159,7 +169,11 @@ check_dependencies() {
 }
 
 check_root() {
-    [ "$EUID" -ne 0 ] && echo -e "${RED}错误：需要 root 权限${NC}" && exit 1
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}错误：需要 root 权限${NC}"
+        echo "请使用: sudo bash <(curl -fsSL URL)"
+        exit 1
+    fi
 }
 
 # ============================================================================
@@ -168,13 +182,18 @@ check_root() {
 
 load_nft_config() {
     [ -n "$NFT_TABLE" ] && return
-    NFT_TABLE=$(jq -r '.nftables.table_name // "port_monitor"' "$CONFIG_FILE" 2>/dev/null || echo "port_monitor")
-    NFT_FAMILY=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE" 2>/dev/null || echo "inet")
+    if [ -f "$CONFIG_FILE" ]; then
+        NFT_TABLE=$(jq -r '.nftables.table_name // "port_monitor"' "$CONFIG_FILE" 2>/dev/null) || NFT_TABLE="port_monitor"
+        NFT_FAMILY=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE" 2>/dev/null) || NFT_FAMILY="inet"
+    else
+        NFT_TABLE="port_monitor"
+        NFT_FAMILY="inet"
+    fi
 }
 
 init_config() {
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$TRAFFIC_HISTORY_DIR"
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    mkdir -p "$TRAFFIC_HISTORY_DIR" 2>/dev/null || true
 
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" << 'EOF'
@@ -240,6 +259,58 @@ format_rate() {
     fi
 }
 
+# 自动补全速率单位 (默认 Mbps)
+normalize_rate() {
+    local input=$1
+    [ -z "$input" ] && echo "" && return
+    
+    local input_lower=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    
+    # 已有单位，直接返回
+    if [[ "$input_lower" =~ (kbps|mbps|gbps)$ ]]; then
+        echo "$input"
+    # 只有 k/m/g 后缀
+    elif [[ "$input_lower" =~ ^([0-9]+\.?[0-9]*)k$ ]]; then
+        echo "${BASH_REMATCH[1]}Kbps"
+    elif [[ "$input_lower" =~ ^([0-9]+\.?[0-9]*)m$ ]]; then
+        echo "${BASH_REMATCH[1]}Mbps"
+    elif [[ "$input_lower" =~ ^([0-9]+\.?[0-9]*)g$ ]]; then
+        echo "${BASH_REMATCH[1]}Gbps"
+    # 纯数字，默认 Mbps
+    elif [[ "$input" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "${input}Mbps"
+    else
+        echo "$input"
+    fi
+}
+
+# 自动补全流量单位 (默认 GB)
+normalize_size() {
+    local input=$1
+    [ -z "$input" ] && echo "" && return
+    
+    local input_upper=$(echo "$input" | tr '[:lower:]' '[:upper:]')
+    
+    # 已有完整单位
+    if [[ "$input_upper" =~ (KB|MB|GB|TB)$ ]]; then
+        echo "$input"
+    # 只有 k/m/g/t 后缀
+    elif [[ "$input_upper" =~ ^([0-9]+\.?[0-9]*)K$ ]]; then
+        echo "${BASH_REMATCH[1]}KB"
+    elif [[ "$input_upper" =~ ^([0-9]+\.?[0-9]*)M$ ]]; then
+        echo "${BASH_REMATCH[1]}MB"
+    elif [[ "$input_upper" =~ ^([0-9]+\.?[0-9]*)G$ ]]; then
+        echo "${BASH_REMATCH[1]}GB"
+    elif [[ "$input_upper" =~ ^([0-9]+\.?[0-9]*)T$ ]]; then
+        echo "${BASH_REMATCH[1]}TB"
+    # 纯数字，默认 GB
+    elif [[ "$input" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "${input}GB"
+    else
+        echo "$input"
+    fi
+}
+
 parse_size_to_bytes() {
     local size_str=$1
     local number=$(echo "$size_str" | grep -oE '^[0-9]+\.?[0-9]*')
@@ -264,7 +335,6 @@ parse_rate_to_kbps() {
     local rate_lower=$(echo "$rate" | tr '[:upper:]' '[:lower:]')
     local number=$(echo "$rate_lower" | grep -oE '^[0-9]+')
     
-    # 修复: 检查 number 是否为空
     [ -z "$number" ] && echo "0" && return
     
     if [[ "$rate_lower" =~ kbps$ ]]; then echo "$number"
@@ -276,9 +346,9 @@ parse_rate_to_kbps() {
 get_beijing_time() { TZ='Asia/Shanghai' date "$@"; }
 get_timestamp() { date +%s; }
 
-# 安全读取 jq 值，处理 null 和空
 jq_safe() {
-    local result=$(jq -r "$1" "$2" 2>/dev/null)
+    local result
+    result=$(jq -r "$1" "$2" 2>/dev/null) || result=""
     [ -z "$result" ] || [ "$result" = "null" ] && echo "${3:-}" || echo "$result"
 }
 
@@ -305,6 +375,7 @@ update_json_file() {
 }
 
 get_active_ports() {
+    [ ! -f "$CONFIG_FILE" ] && return
     jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | while read -r port; do
         if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
             local start=$(echo "$port" | cut -d'-' -f1)
@@ -358,7 +429,8 @@ calculate_total_traffic() {
 }
 
 save_traffic_data() {
-    local active_ports=($(get_active_ports 2>/dev/null || true))
+    local active_ports
+    active_ports=($(get_active_ports 2>/dev/null)) || return 0
     [ ${#active_ports[@]} -eq 0 ] && return 0
 
     local json_data="{"
@@ -382,7 +454,8 @@ setup_exit_hooks() {
 }
 
 restore_monitoring_if_needed() {
-    local active_ports=($(get_active_ports 2>/dev/null || true))
+    local active_ports
+    active_ports=($(get_active_ports 2>/dev/null)) || return 0
     [ ${#active_ports[@]} -eq 0 ] && return 0
 
     for port in "${active_ports[@]}"; do
@@ -398,6 +471,7 @@ restore_monitoring_if_needed() {
 restore_traffic_from_backup() {
     [ ! -f "$TRAFFIC_DATA_FILE" ] && return 0
 
+    local port
     for port in $(jq -r 'keys[]' "$TRAFFIC_DATA_FILE" 2>/dev/null); do
         local input=$(jq -r ".\"$port\".input // 0" "$TRAFFIC_DATA_FILE")
         local output=$(jq -r ".\"$port\".output // 0" "$TRAFFIC_DATA_FILE")
@@ -409,6 +483,7 @@ restore_traffic_from_backup() {
 }
 
 restore_all_rules() {
+    local port
     for port in $(get_active_ports); do
         add_nftables_rules "$port"
         local quota=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
@@ -428,7 +503,7 @@ restore_all_rules() {
 }
 
 # ============================================================================
-# 流量历史记录 (用于突发速率检测) - 优化版
+# 流量历史记录
 # ============================================================================
 
 record_traffic_snapshot() {
@@ -442,14 +517,14 @@ record_traffic_snapshot() {
     
     echo "$timestamp $total" >> "$history_file"
     
-    # 只保留最近 120 条记录
-    if [ -f "$history_file" ] && [ $(wc -l < "$history_file") -gt 150 ]; then
-        tail -n 120 "$history_file" > "${history_file}.tmp"
-        mv "${history_file}.tmp" "$history_file"
+    if [ -f "$history_file" ]; then
+        local lines=$(wc -l < "$history_file" 2>/dev/null || echo "0")
+        if [ "$lines" -gt 150 ]; then
+            tail -n 120 "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
+        fi
     fi
 }
 
-# 优化: 使用滑动窗口算法计算高速率持续时间
 get_high_rate_duration() {
     local port=$1
     local threshold_kbps=$2
@@ -458,10 +533,9 @@ get_high_rate_duration() {
     
     [ ! -f "$history_file" ] && echo "0" && return
     
-    local line_count=$(wc -l < "$history_file")
+    local line_count=$(wc -l < "$history_file" 2>/dev/null || echo "0")
     [ "$line_count" -lt 2 ] && echo "0" && return
     
-    # 读取最近的记录 (最多 120 条)
     local prev_ts=0 prev_bytes=0
     local high_rate_start=0
     local now=$(get_timestamp)
@@ -471,20 +545,15 @@ get_high_rate_duration() {
             local time_diff=$((ts - prev_ts))
             local bytes_diff=$((bytes - prev_bytes))
             
-            # 跳过异常数据
             if [ $time_diff -gt 0 ] && [ $bytes_diff -ge 0 ]; then
-                # 计算速率 (Kbps)
                 local rate_kbps=$((bytes_diff * 8 / time_diff / 1000))
                 
                 if [ $rate_kbps -ge $threshold_kbps ]; then
-                    # 高速率，记录起始点
                     [ $high_rate_start -eq 0 ] && high_rate_start=$prev_ts
                 else
-                    # 速率降低，重置起始点
                     high_rate_start=0
                 fi
             else
-                # 异常数据（流量重置等），重置
                 high_rate_start=0
             fi
         fi
@@ -512,6 +581,7 @@ add_nftables_rules() {
     nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" >/dev/null 2>&1 || \
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 
+    local proto
     for proto in tcp udp; do
         nft add rule $NFT_FAMILY $NFT_TABLE input $proto dport $port counter name "port_${port_safe}_in" 2>/dev/null || true
         nft add rule $NFT_FAMILY $NFT_TABLE forward $proto dport $port counter name "port_${port_safe}_in" 2>/dev/null || true
@@ -529,6 +599,7 @@ remove_nftables_rules() {
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
             grep -E "port_${port_safe}_" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
         [ -z "$handle" ] && break
+        local chain
         for chain in input output forward; do
             nft delete rule $NFT_FAMILY $NFT_TABLE $chain handle $handle 2>/dev/null && break
         done
@@ -557,6 +628,7 @@ apply_quota() {
 
     nft add quota $NFT_FAMILY $NFT_TABLE $quota_name "{ over $quota_bytes bytes used $used bytes }" 2>/dev/null || true
 
+    local proto
     if [ "$billing" = "double" ]; then
         for proto in tcp udp; do
             nft insert rule $NFT_FAMILY $NFT_TABLE input $proto dport $port quota name "$quota_name" drop 2>/dev/null || true
@@ -582,6 +654,7 @@ remove_quota() {
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
             grep "quota name \"$quota_name\"" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
         [ -z "$handle" ] && break
+        local chain
         for chain in input output forward; do
             nft delete rule $NFT_FAMILY $NFT_TABLE $chain handle $handle 2>/dev/null && break
         done
@@ -661,6 +734,7 @@ apply_tc_limit() {
         base_prio=$((port % 1000 + 100))
     fi
 
+    local proto_num
     for proto_num in 6 17; do
         tc filter add dev $interface protocol ip parent 1:0 prio $base_prio u32 \
             match ip protocol $proto_num 0xff match ip sport $port 0xffff flowid $class_id 2>/dev/null || true
@@ -694,6 +768,7 @@ remove_tc_limit() {
         base_prio=$((port % 1000 + 100))
     fi
 
+    local proto_num
     for proto_num in 6 17; do
         tc filter del dev $interface protocol ip parent 1:0 prio $base_prio u32 \
             match ip protocol $proto_num 0xff match ip sport $port 0xffff 2>/dev/null || true
@@ -710,14 +785,14 @@ remove_tc_limit() {
 }
 
 # ============================================================================
-# 突发速率保护 - 修复版
+# 突发速率保护
 # ============================================================================
 
 check_burst_protection() {
-    # 获取锁，防止并发
     acquire_lock 3 || return 0
     
     local ports=($(get_active_ports))
+    local port
     
     for port in "${ports[@]}"; do
         local burst_enabled=$(jq_safe ".ports.\"$port\".burst_protection.enabled" "$CONFIG_FILE" "false")
@@ -726,14 +801,13 @@ check_burst_protection() {
         local burst_rate=$(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "")
         local burst_window=$(jq_safe ".ports.\"$port\".burst_protection.burst_window" "$CONFIG_FILE" "30")
         local throttle_rate=$(jq_safe ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE" "")
-        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "60")
+        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "10")
         
         [ -z "$burst_rate" ] || [ -z "$throttle_rate" ] && continue
         
         local burst_rate_kbps=$(parse_rate_to_kbps "$burst_rate")
         [ "$burst_rate_kbps" -eq 0 ] && continue
         
-        # 记录流量快照
         record_traffic_snapshot "$port"
         
         local throttled=$(jq_safe ".\"$port\".throttled" "$BURST_STATE_FILE" "false")
@@ -780,11 +854,8 @@ release_burst_throttle() {
     
     update_json_file "$BURST_STATE_FILE" "del(.\"$port\")"
     
-    # 注意: 不清除历史记录，以便继续监控
-    # 只重置连续高速率的计数
     local port_safe=$(get_port_safe "$port")
     local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
-    # 保留最后一条记录作为新的起点
     [ -f "$history_file" ] && tail -n 1 "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
     
     send_burst_throttle_alert "$port" "" "released"
@@ -807,7 +878,7 @@ send_burst_throttle_alert() {
     if [ "$action" = "triggered" ]; then
         local burst_rate=$(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "")
         local burst_window=$(jq_safe ".ports.\"$port\".burst_protection.burst_window" "$CONFIG_FILE" "30")
-        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "60")
+        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "10")
         
         message="🚨 <b>突发速率保护触发</b>
 ━━━━━━━━━━━━━━━━
@@ -839,7 +910,7 @@ get_burst_status() {
     
     if [ "$throttled" = "true" ]; then
         local throttle_start=$(jq_safe ".\"$port\".throttle_start" "$BURST_STATE_FILE" "0")
-        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "60")
+        local throttle_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "10")
         local now=$(get_timestamp)
         local elapsed=$(( (now - throttle_start) / 60 ))
         local remaining=$((throttle_duration - elapsed))
@@ -865,7 +936,7 @@ setup_reset_cron() {
     if [ -n "$reset_day" ] && [ "$limit" != "unlimited" ]; then
         echo "5 0 $reset_day * * $SCRIPT_PATH --reset $port >/dev/null 2>&1  # 端口流量监控重置$port" >> "$temp_cron"
     fi
-    crontab "$temp_cron" 2>/dev/null
+    crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
 
@@ -873,7 +944,7 @@ remove_reset_cron() {
     local port=$1
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "端口流量监控重置$port\$" > "$temp_cron" || true
-    crontab "$temp_cron" 2>/dev/null
+    crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
 
@@ -900,20 +971,21 @@ setup_notify_cron() {
     [ "$alert_enabled" = "true" ] && echo "*/5 * * * * $SCRIPT_PATH --check-alert >/dev/null 2>&1  # 端口流量监控阈值检查" >> "$temp_cron"
 
     local has_burst=false
+    local port
     for port in $(get_active_ports); do
         local burst_enabled=$(jq_safe ".ports.\"$port\".burst_protection.enabled" "$CONFIG_FILE" "false")
         [ "$burst_enabled" = "true" ] && has_burst=true && break
     done
     [ "$has_burst" = "true" ] && echo "* * * * * $SCRIPT_PATH --check-burst >/dev/null 2>&1  # 端口流量监控突发检测" >> "$temp_cron"
 
-    crontab "$temp_cron" 2>/dev/null
+    crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
 
 remove_notify_cron() {
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "端口流量监控状态通知" | grep -v "端口流量监控阈值检查" | grep -v "端口流量监控突发检测" > "$temp_cron" || true
-    crontab "$temp_cron" 2>/dev/null
+    crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
 
@@ -959,6 +1031,7 @@ format_status_message() {
     local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
     local ports=($(get_active_ports))
     local total=0 port_info=""
+    local port
 
     for port in "${ports[@]}"; do
         local traffic=($(get_port_traffic "$port"))
@@ -1010,6 +1083,7 @@ check_and_send_alerts() {
     [ "$telegram_enabled" != "true" ] || [ "$alert_enabled" != "true" ] && return 0
 
     local ports=($(get_active_ports))
+    local port
     
     for port in "${ports[@]}"; do
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
@@ -1026,6 +1100,7 @@ check_and_send_alerts() {
         local sent_threshold=$(jq_safe ".\"$port\"" "$ALERT_STATE_FILE" "0")
         [[ ! "$sent_threshold" =~ ^[0-9]+$ ]] && sent_threshold=0
 
+        local threshold
         for threshold in "${ALERT_THRESHOLDS[@]}"; do
             if [ $percent -ge $threshold ] && [ $sent_threshold -lt $threshold ]; then
                 send_threshold_alert "$port" "$percent" "$threshold" "$used" "$limit"
@@ -1083,6 +1158,7 @@ add_port() {
     [ -z "$port_input" ] && return
 
     local ports=()
+    local part
     IFS=',' read -ra parts <<< "$port_input"
     for part in "${parts[@]}"; do
         part=$(echo "$part" | tr -d ' ')
@@ -1100,12 +1176,13 @@ add_port() {
     [ "$billing_choice" = "2" ] && billing="double"
 
     echo
-    read -p "流量配额 (如 100GB, 1.5TB, 留空无限制): " quota_input
+    read -p "流量配额 (默认单位GB, 如 100 或 1.5T, 留空无限制): " quota_input
     local quota="unlimited" reset_day=""
     if [ -n "$quota_input" ]; then
-        local quota_bytes=$(parse_size_to_bytes "$quota_input")
+        local normalized_quota=$(normalize_size "$quota_input")
+        local quota_bytes=$(parse_size_to_bytes "$normalized_quota")
         if [ "$quota_bytes" -gt 0 ]; then
-            quota="$quota_input"
+            quota="$normalized_quota"
             read -p "每月重置日 (1-31, 留空默认1日, 0=不重置): " reset_input
             if [ -z "$reset_input" ]; then
                 reset_day="1"
@@ -1117,13 +1194,16 @@ add_port() {
         fi
     fi
 
-    read -p "带宽限制 (如 100Mbps, 留空无限制): " rate_input
+    read -p "带宽限制 (默认单位Mbps, 如 100 或 1G, 留空无限制): " rate_input
     local rate="unlimited"
-    [ -n "$rate_input" ] && rate="$rate_input"
+    if [ -n "$rate_input" ]; then
+        rate=$(normalize_rate "$rate_input")
+    fi
 
     read -p "备注 (可选): " remark
     remark=$(escape_json "$remark")
 
+    local port
     for port in "${ports[@]}"; do
         if jq -e ".ports.\"$port\"" "$CONFIG_FILE" >/dev/null 2>&1; then
             echo -e "${YELLOW}端口 $port 已存在，跳过${NC}"
@@ -1151,8 +1231,9 @@ remove_port() {
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
     echo -e "${CYAN}=== 删除端口监控 ===${NC}\n"
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
         local remark_display=""
         [ -n "$remark" ] && remark_display=" ($remark)"
@@ -1163,12 +1244,13 @@ remove_port() {
     read -p "选择要删除的端口 (多个用逗号分隔): " choice
     [ -z "$choice" ] && return
 
+    local sel
     IFS=',' read -ra selections <<< "$choice"
     for sel in "${selections[@]}"; do
         sel=$(echo "$sel" | tr -d ' ')
         [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && continue
 
-        local port=${ports[$((sel-1))]}
+        port=${ports[$((sel-1))]}
         read -p "确认删除端口 $port? [y/N]: " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && continue
 
@@ -1201,8 +1283,9 @@ set_bandwidth() {
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
     echo -e "${CYAN}=== 设置带宽限制 ===${NC}\n"
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
         local burst_status=$(get_burst_status "$port")
         local status_display=""
@@ -1214,15 +1297,16 @@ set_bandwidth() {
     read -p "选择端口: " sel
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
-    local port=${ports[$((sel-1))]}
-    echo -e "\n示例: 100Mbps, 1Gbps, 500Kbps (同时限制入站和出站)"
-    read -p "带宽限制 (0=取消): " rate
+    port=${ports[$((sel-1))]}
+    echo -e "\n默认单位 Mbps (如 100 表示 100Mbps, 1G 表示 1Gbps)"
+    read -p "带宽限制 (0=取消): " rate_input
 
-    if [ "$rate" = "0" ] || [ -z "$rate" ]; then
+    if [ "$rate_input" = "0" ] || [ -z "$rate_input" ]; then
         remove_tc_limit "$port"
         update_config ".ports.\"$port\".bandwidth.rate = \"unlimited\""
         echo -e "${GREEN}✓ 已取消带宽限制${NC}"
     else
+        local rate=$(normalize_rate "$rate_input")
         local throttled=$(jq_safe ".\"$port\".throttled" "$BURST_STATE_FILE" "false")
         if [ "$throttled" = "true" ]; then
             echo -e "${YELLOW}注意: 端口当前处于突发限速状态，新限速将在限速解除后生效${NC}"
@@ -1246,8 +1330,9 @@ set_quota() {
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
     echo -e "${CYAN}=== 设置流量配额 ===${NC}\n"
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
         local traffic=($(get_port_traffic "$port"))
         local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
@@ -1259,17 +1344,18 @@ set_quota() {
     read -p "选择端口: " sel
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
-    local port=${ports[$((sel-1))]}
-    echo -e "\n示例: 100GB, 1.5TB, 500MB"
-    read -p "流量配额 (0=取消): " limit
+    port=${ports[$((sel-1))]}
+    echo -e "\n默认单位 GB (如 100 表示 100GB, 1.5T 表示 1.5TB)"
+    read -p "流量配额 (0=取消): " limit_input
 
-    if [ "$limit" = "0" ] || [ -z "$limit" ]; then
+    if [ "$limit_input" = "0" ] || [ -z "$limit_input" ]; then
         remove_quota "$port"
         remove_reset_cron "$port"
         update_config ".ports.\"$port\".quota.limit = \"unlimited\" | .ports.\"$port\".quota.reset_day = null"
         update_json_file "$ALERT_STATE_FILE" "del(.\"$port\")" 2>/dev/null || true
         echo -e "${GREEN}✓ 已取消流量配额${NC}"
     else
+        local limit=$(normalize_size "$limit_input")
         local limit_bytes=$(parse_size_to_bytes "$limit")
         if [ "$limit_bytes" -eq 0 ]; then
             echo -e "${RED}✗ 无效的配额格式${NC}"
@@ -1303,8 +1389,9 @@ reset_traffic() {
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
     echo -e "${CYAN}=== 重置流量统计 ===${NC}\n"
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local traffic=($(get_port_traffic "$port"))
         local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
         local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
@@ -1321,7 +1408,7 @@ reset_traffic() {
         for port in "${ports[@]}"; do reset_port_traffic "$port"; done
         echo -e "${GREEN}✓ 已重置所有端口${NC}"
     elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le ${#ports[@]} ]; then
-        local port=${ports[$((sel-1))]}
+        port=${ports[$((sel-1))]}
         read -p "确认重置端口 $port? [y/N]: " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && return
         reset_port_traffic "$port"
@@ -1335,8 +1422,9 @@ set_remark() {
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
     echo -e "${CYAN}=== 修改端口备注 ===${NC}\n"
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
         local remark_display="(无)"
         [ -n "$remark" ] && remark_display="$remark"
@@ -1347,7 +1435,7 @@ set_remark() {
     read -p "选择端口: " sel
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
-    local port=${ports[$((sel-1))]}
+    port=${ports[$((sel-1))]}
     read -p "新备注 (留空清除): " new_remark
     new_remark=$(escape_json "$new_remark")
 
@@ -1368,8 +1456,9 @@ setup_burst_protection() {
     echo -e "${YELLOW}功能说明: 当端口持续高速率超过指定时间后，自动限速${NC}"
     echo
     
+    local i port
     for i in "${!ports[@]}"; do
-        local port=${ports[$i]}
+        port=${ports[$i]}
         local enabled=$(jq_safe ".ports.\"$port\".burst_protection.enabled" "$CONFIG_FILE" "false")
         local status_display="未启用"
         
@@ -1390,7 +1479,7 @@ setup_burst_protection() {
     read -p "选择端口: " sel
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
-    local port=${ports[$((sel-1))]}
+    port=${ports[$((sel-1))]}
     local enabled=$(jq_safe ".ports.\"$port\".burst_protection.enabled" "$CONFIG_FILE" "false")
     
     echo
@@ -1399,7 +1488,7 @@ setup_burst_protection() {
         echo "  突发阈值: $(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "")"
         echo "  持续时间: $(jq_safe ".ports.\"$port\".burst_protection.burst_window" "$CONFIG_FILE" "30") 分钟"
         echo "  限速至: $(jq_safe ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE" "")"
-        echo "  限速时长: $(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "60") 分钟"
+        echo "  限速时长: $(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "10") 分钟"
         echo
         echo "1. 修改配置"
         echo "2. 禁用保护"
@@ -1443,12 +1532,16 @@ configure_burst_protection() {
     
     echo
     echo -e "${CYAN}配置突发速率保护${NC}"
-    echo -e "${YELLOW}示例: 当速率持续30分钟超过100Mbps时，自动限速到10Mbps，持续60分钟${NC}"
+    echo -e "${YELLOW}示例: 当速率持续30分钟超过500Mbps时，自动限速到20Mbps，持续10分钟${NC}"
     echo
     
-    local current_burst=$(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "100Mbps")
-    read -p "突发阈值 (如 100Mbps, 默认 $current_burst): " burst_rate
-    [ -z "$burst_rate" ] && burst_rate="$current_burst"
+    local current_burst=$(jq_safe ".ports.\"$port\".burst_protection.burst_rate" "$CONFIG_FILE" "500Mbps")
+    read -p "突发阈值 (默认单位Mbps, 如 100, 默认 $current_burst): " burst_rate_input
+    if [ -z "$burst_rate_input" ]; then
+        burst_rate="$current_burst"
+    else
+        burst_rate=$(normalize_rate "$burst_rate_input")
+    fi
     
     if [ "$(parse_rate_to_kbps "$burst_rate")" -eq 0 ]; then
         echo -e "${RED}无效的速率格式${NC}"
@@ -1460,19 +1553,23 @@ configure_burst_protection() {
     [ -z "$burst_window" ] && burst_window="$current_window"
     [[ ! "$burst_window" =~ ^[0-9]+$ ]] && burst_window=30
     
-    local current_throttle=$(jq_safe ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE" "10Mbps")
-    read -p "限速至 (如 10Mbps, 默认 $current_throttle): " throttle_rate
-    [ -z "$throttle_rate" ] && throttle_rate="$current_throttle"
+    local current_throttle=$(jq_safe ".ports.\"$port\".burst_protection.throttle_rate" "$CONFIG_FILE" "20Mbps")
+    read -p "限速至 (默认单位Mbps, 如 20, 默认 $current_throttle): " throttle_rate_input
+    if [ -z "$throttle_rate_input" ]; then
+        throttle_rate="$current_throttle"
+    else
+        throttle_rate=$(normalize_rate "$throttle_rate_input")
+    fi
     
     if [ "$(parse_rate_to_kbps "$throttle_rate")" -eq 0 ]; then
         echo -e "${RED}无效的速率格式${NC}"
         return
     fi
     
-    local current_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "60")
+    local current_duration=$(jq_safe ".ports.\"$port\".burst_protection.throttle_duration" "$CONFIG_FILE" "10")
     read -p "限速时长 (分钟, 默认 $current_duration): " throttle_duration
     [ -z "$throttle_duration" ] && throttle_duration="$current_duration"
-    [[ ! "$throttle_duration" =~ ^[0-9]+$ ]] && throttle_duration=60
+    [[ ! "$throttle_duration" =~ ^[0-9]+$ ]] && throttle_duration=10
     
     local burst_config="{\"enabled\": true, \"burst_rate\": \"$burst_rate\", \"burst_window\": $burst_window, \"throttle_rate\": \"$throttle_rate\", \"throttle_duration\": $throttle_duration}"
     update_config ".ports.\"$port\".burst_protection = $burst_config"
@@ -1585,72 +1682,6 @@ setup_telegram() {
     sleep 1
 }
 
-# ============================================================================
-# 主菜单
-# ============================================================================
-
-show_status() {
-    clear
-    local ports=($(get_active_ports))
-    local total=0
-
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}             ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}               ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
-
-    if [ ${#ports[@]} -eq 0 ]; then
-        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                            ${BLUE}║${NC}"
-    else
-        for port in "${ports[@]}"; do
-            local traffic=($(get_port_traffic "$port"))
-            local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
-            local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
-            total=$((total + used))
-
-            local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
-            local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
-            local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
-
-            local percent_display=""
-            if [ "$limit" != "unlimited" ]; then
-                local limit_bytes=$(parse_size_to_bytes "$limit")
-                if [ "$limit_bytes" -gt 0 ]; then
-                    local percent=$((used * 100 / limit_bytes))
-                    if [ $percent -ge 100 ]; then percent_display=" ${RED}[${percent}%]${NC}"
-                    elif [ $percent -ge 80 ]; then percent_display=" ${YELLOW}[${percent}%]${NC}"
-                    else percent_display=" ${GREEN}[${percent}%]${NC}"; fi
-                fi
-            fi
-            
-            local burst_display=""
-            local burst_status=$(get_burst_status "$port")
-            case "$burst_status" in
-                throttled:*) 
-                    local remaining=$(echo "$burst_status" | cut -d: -f2)
-                    burst_display=" ${RED}🔽${remaining}${NC}"
-                    ;;
-                normal) burst_display=" ${GREEN}⚡${NC}" ;;
-            esac
-
-            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b${BLUE}║${NC}\n" \
-                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display"
-            
-            local tags=""
-            [ -n "$remark" ] && tags+="[$remark] "
-            [ "$limit" != "unlimited" ] && tags+="配额:$limit "
-            [ "$rate" != "unlimited" ] && tags+="限速:$rate"
-            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-56s${NC}${BLUE}║${NC}\n" "$tags"
-        done
-    fi
-
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
-    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}     ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo
-    echo -e "  ${YELLOW}⚡=突发保护  🔽=限速中${NC}"
-    echo
-}
-
 show_menu() {
     echo -e "${CYAN}── 端口管理 ──${NC}"
     echo "  1. 添加端口    2. 删除端口    3. 修改备注"
@@ -1672,6 +1703,7 @@ uninstall() {
     read -p "确认卸载? [y/N]: " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return
 
+    local port
     for port in $(get_active_ports); do
         remove_nftables_rules "$port"
         remove_quota "$port"
@@ -1696,30 +1728,34 @@ uninstall() {
 }
 
 create_shortcut() {
-    # 如果是通过网络执行，先保存脚本到本地
-    if [[ ! -f "$SCRIPT_PATH" ]]; then
+    # 如果是远程安装，先保存脚本
+    if [ "$REMOTE_INSTALL" = "true" ] && [ ! -f "$SCRIPT_PATH" ]; then
         echo -e "${YELLOW}首次运行，正在安装脚本...${NC}"
-        # 从 stdin 或当前脚本内容保存
-        if [ -t 0 ]; then
-            # 不是从管道执行，尝试下载
-            local download_url="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/port-manage.sh"
+        
+        # 从当前进程读取脚本内容
+        local script_content
+        script_content=$(cat "$0" 2>/dev/null) || script_content=""
+        
+        if [ -z "$script_content" ]; then
+            # 尝试从网络下载
+            local download_url="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
+            echo "正在从 GitHub 下载..."
             if curl -fsSL "$download_url" -o "$SCRIPT_PATH" 2>/dev/null; then
                 chmod +x "$SCRIPT_PATH"
                 echo -e "${GREEN}✓ 脚本已安装到 $SCRIPT_PATH${NC}"
             else
-                echo -e "${RED}无法下载脚本，请手动安装${NC}"
-                return 1
+                echo -e "${RED}下载失败，脚本将在内存中运行${NC}"
+                echo -e "${YELLOW}建议手动下载脚本到 $SCRIPT_PATH${NC}"
             fi
         else
-            # 从管道执行，保存当前脚本
-            cat > "$SCRIPT_PATH"
+            echo "$script_content" > "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
             echo -e "${GREEN}✓ 脚本已安装到 $SCRIPT_PATH${NC}"
         fi
     fi
     
     # 创建快捷命令
-    if [ ! -f "/usr/local/bin/$SHORTCUT_COMMAND" ]; then
+    if [ ! -f "/usr/local/bin/$SHORTCUT_COMMAND" ] && [ -f "$SCRIPT_PATH" ]; then
         cat > "/usr/local/bin/$SHORTCUT_COMMAND" << EOF
 #!/bin/bash
 exec bash "$SCRIPT_PATH" "\$@"
