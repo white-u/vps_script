@@ -259,7 +259,7 @@ add_vless_reality() {
         }
     }],
     "outbounds": [
-        {"type": "direct", "tag": "direct"},
+        {"type": "direct"},
         {"type": "direct", "tag": "public_key_$is_public_key"}
     ]
 }
@@ -294,7 +294,7 @@ EOF
         }
     }],
     "outbounds": [
-        {"type": "direct", "tag": "direct"},
+        {"type": "direct"},
         {"type": "direct", "tag": "public_key_$is_public_key"}
     ]
 }
