@@ -581,7 +581,7 @@ gen_link() {
     local conf_path="$is_conf_dir/$is_conf_file"
     local proto=$(jq -r '.inbounds[0].type' "$conf_path")
     local port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
-    local remark="${is_remark:-${is_addr}}"
+    local remark="${is_remark:-$(hostname)}"
     
     case $proto in
         vless)
