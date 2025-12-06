@@ -561,7 +561,10 @@ save_conf() {
     [[ $? -ne 0 ]] && err "配置保存失败，JSON 格式错误"
     
     # 验证配置
-    if ! $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
+    local check_result
+    check_result=$($is_core_bin check -c "$is_config_json" -C "$is_conf_dir" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "验证错误: $check_result"
         rm -f "$tmp_file"
         err "配置验证失败，请检查参数"
     fi
