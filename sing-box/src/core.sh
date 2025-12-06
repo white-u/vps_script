@@ -131,8 +131,17 @@ input_pass() {
 
 # 输入 SNI
 input_sni() {
-    read -p "SNI [www.apple.com]: " is_sni
-    is_sni=${is_sni:-www.apple.com}
+    local default_sni="www.time.is"
+    echo -ne "请输入 SNI (默认: ${default_sni}): "
+    read is_sni
+    [[ -z $is_sni ]] && is_sni="$default_sni"
+}
+
+# 输入 备注
+input_remark() {
+    echo -ne "请输入备注名称 (默认: ${is_addr}): "
+    read is_remark
+    [[ -z $is_remark ]] && is_remark="$is_addr"
 }
 
 # 添加配置主函数
@@ -228,6 +237,7 @@ add_vless_reality() {
     local transport=$1
     input_uuid
     input_sni
+    input_remark
     gen_reality_keys
     is_short_id=$(gen_short_id)
     is_conf_name="vless-reality-${transport}-${is_port}"
@@ -898,24 +908,25 @@ gen_link() {
             
             if [[ $reality == "true" ]]; then
                 local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
-                # 从 outbounds tag 中提取 public_key
                 local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
                 local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
-                # fingerprint 固定为 chrome
                 local fp="chrome"
-                # 检测传输类型
                 local type_param="tcp"
                 [[ $transport == "http" ]] && type_param="h2"
+                
+                # 备注：默认使用服务器地址，可通过 is_remark 自定义
+                local remark="${is_remark:-${is_addr}}"
                 
                 if [[ -z $pbk ]]; then
                     echo "错误: 未找到 PublicKey，请重新创建配置"
                 elif [[ $flow ]]; then
-                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#VLESS-Reality"
+                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#${remark}"
                 else
-                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#VLESS-Reality-H2"
+                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#${remark}"
                 fi
             else
-                echo "vless://${uuid}@${is_addr}:${port}?encryption=none&type=tcp#VLESS"
+                local remark="${is_remark:-${is_addr}}"
+                echo "vless://${uuid}@${is_addr}:${port}?encryption=none&type=tcp#${remark}"
             fi
             ;;
         vmess)
