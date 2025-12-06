@@ -233,7 +233,7 @@ input_sni() {
 }
 
 input_remark() {
-    local default_remark="$is_addr"
+    local default_remark=$(hostname)  # 主机名
     read -rp "备注 [$default_remark]: " is_remark
     is_remark=${is_remark:-$default_remark}
 }
