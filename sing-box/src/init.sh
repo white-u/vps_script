@@ -71,9 +71,10 @@ fi
 
 # 服务器 IP
 get_ip() {
-    is_ipv4=$(curl -s4m3 ip.sb 2>/dev/null || curl -s4m3 api.ipify.org 2>/dev/null)
-    is_ipv6=$(curl -s6m3 ip.sb 2>/dev/null)
+    is_ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null)
+    is_ipv6=$(curl -s6m5 ip.sb 2>/dev/null)
     is_addr=${is_ipv4:-$is_ipv6}
+    [[ -z $is_addr ]] && is_addr="<未知IP>"
 }
 get_ip
 

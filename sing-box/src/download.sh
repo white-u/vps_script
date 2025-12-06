@@ -2,11 +2,14 @@
 
 # 更新模块
 
+# 代理设置（可通过环境变量 PROXY 设置）
+is_proxy=${PROXY:-}
+
 # 获取最新版本号
 get_latest_version() {
     local repo=$1
     local api="https://api.github.com/repos/$repo/releases/latest"
-    local ver=$(curl -s "$api" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    local ver=$(curl -sfm10 "$api" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
     echo $ver
 }
 
@@ -38,9 +41,9 @@ update_core() {
     
     echo "下载中..."
     if [[ $is_proxy ]]; then
-        curl -x "$is_proxy" -L -o "$tmp_file" "$url"
+        curl -x "$is_proxy" -fLm120 -o "$tmp_file" "$url"
     else
-        curl -L -o "$tmp_file" "$url"
+        curl -fLm120 -o "$tmp_file" "$url"
     fi
     
     [[ $? -ne 0 ]] && err "下载失败"
@@ -75,15 +78,15 @@ update_sh() {
     
     for f in "${files[@]}"; do
         if [[ $is_proxy ]]; then
-            curl -x "$is_proxy" -sL -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
+            curl -x "$is_proxy" -sfLm30 -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
         else
-            curl -sL -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
+            curl -sfLm30 -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
         fi
     done
     
     # 复制到目标目录
     cp -r "$tmp_dir"/* "$is_sh_dir/"
-    chmod +x "$is_sh_dir/sing-box.sh"
+    chmod +x "$is_sh_dir/sing-box.sh" "$is_sh_dir/src/"*.sh
     
     # 清理
     rm -rf "$tmp_dir"

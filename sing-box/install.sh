@@ -75,7 +75,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ============ 检查已安装 ============
-[[ -f $is_sh_bin && -d $is_core_dir ]] && err "已安装，如需重装请使用: $is_core reinstall"
+[[ -f $is_sh_bin && -d $is_core_dir ]] && err "已安装，如需重装请先卸载: $is_core uninstall"
 
 # ============ 开始安装 ============
 echo
@@ -127,7 +127,7 @@ rm -rf "$tmp_dir"
 # ============ 创建命令链接 ============
 ln -sf $is_sh_dir/$is_core.sh $is_sh_bin
 ln -sf $is_sh_dir/$is_core.sh /usr/local/bin/sb
-chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb $is_sh_dir/*.sh
+chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb $is_sh_dir/*.sh $is_sh_dir/src/*.sh
 
 # ============ 创建 systemd 服务 ============
 echo ">>> 创建服务..."

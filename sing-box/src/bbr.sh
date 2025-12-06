@@ -35,6 +35,10 @@ enable_bbr() {
         return
     fi
     
+    # 先删除旧配置，避免重复
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    
     # 启用 BBR
     cat >> /etc/sysctl.conf <<EOF
 

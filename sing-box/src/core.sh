@@ -254,11 +254,14 @@ add_vless_reality() {
                     "server_port": 443
                 },
                 "private_key": "$is_private_key",
-                "public_key": "$is_public_key",
                 "short_id": ["$is_short_id"]
             }
         }
-    }]
+    }],
+    "outbounds": [
+        {"type": "direct", "tag": "direct"},
+        {"type": "direct", "tag": "public_key_$is_public_key"}
+    ]
 }
 EOF
 )
@@ -283,14 +286,17 @@ EOF
                     "server_port": 443
                 },
                 "private_key": "$is_private_key",
-                "public_key": "$is_public_key",
                 "short_id": ["$is_short_id"]
             }
         },
         "transport": {
             "type": "http"
         }
-    }]
+    }],
+    "outbounds": [
+        {"type": "direct", "tag": "direct"},
+        {"type": "direct", "tag": "public_key_$is_public_key"}
+    ]
 }
 EOF
 )
@@ -314,7 +320,8 @@ add_vmess() {
             transport_conf='"transport": {"type": "http"}'
             ;;
         quic)
-            transport_conf='"transport": {"type": "quic"}'
+            gen_self_cert
+            transport_conf='"transport": {"type": "quic"}, "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "'$is_cert_file'", "key_path": "'$is_key_file'"}'
             ;;
     esac
     
@@ -399,6 +406,7 @@ add_hysteria2() {
         }],
         "tls": {
             "enabled": true,
+            "alpn": ["h3"],
             "certificate_path": "$is_cert_file",
             "key_path": "$is_key_file"
         }
@@ -631,10 +639,16 @@ change_port() {
     [[ $new_port -lt 1 || $new_port -gt 65535 ]] && err "端口范围: 1-65535"
     [[ $(ss -tuln | awk '{print $5}' | grep -E ":${new_port}$") ]] && err "端口 $new_port 已被占用"
     
-    jq ".inbounds[0].listen_port = $new_port" "$conf_path" > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
-    
-    _green "端口已修改: $old_port -> $new_port"
-    systemctl restart $is_core &>/dev/null
+    # 修改并验证
+    jq ".inbounds[0].listen_port = $new_port" "$conf_path" > "${conf_path}.tmp"
+    if $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
+        mv "${conf_path}.tmp" "$conf_path"
+        _green "端口已修改: $old_port -> $new_port"
+        systemctl restart $is_core &>/dev/null
+    else
+        rm -f "${conf_path}.tmp"
+        err "配置验证失败"
+    fi
 }
 
 # 修改凭证
@@ -798,18 +812,21 @@ info() {
             [[ $flow ]] && echo "Flow: $flow"
             if [[ $reality == "true" ]]; then
                 local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
-                local pbk=$(jq -r '.inbounds[0].tls.reality.public_key' "$conf_path")
+                # 从 outbounds tag 中提取 public_key
+                local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
                 local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
                 echo "SNI: $sni"
-                echo "PublicKey: $pbk"
+                [[ $pbk ]] && echo "PublicKey: $pbk"
                 echo "ShortID: $sid"
             fi
             ;;
         vmess)
             local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
             local transport=$(jq -r '.inbounds[0].transport.type // "tcp"' "$conf_path")
+            local tls_enabled=$(jq -r '.inbounds[0].tls.enabled // false' "$conf_path")
             echo "UUID: $uuid"
             echo "传输: $transport"
+            [[ $tls_enabled == "true" ]] && echo "TLS: 已启用"
             if [[ $transport == "ws" ]]; then
                 local path=$(jq -r '.inbounds[0].transport.path // "/"' "$conf_path")
                 echo "Path: $path"
@@ -837,7 +854,20 @@ info() {
             ;;
         socks)
             local user=$(jq -r '.inbounds[0].users[0].username // empty' "$conf_path")
-            [[ $user ]] && echo "用户名: $user"
+            local pass=$(jq -r '.inbounds[0].users[0].password // empty' "$conf_path")
+            if [[ $user ]]; then
+                echo "用户名: $user"
+                echo "密码: $pass"
+            else
+                echo "认证: 无"
+            fi
+            ;;
+        direct)
+            local override_addr=$(jq -r '.inbounds[0].override_address // empty' "$conf_path")
+            local override_port=$(jq -r '.inbounds[0].override_port // empty' "$conf_path")
+            [[ $override_addr ]] && echo "覆盖地址: $override_addr"
+            [[ $override_port ]] && echo "覆盖端口: $override_port"
+            [[ -z $override_addr && -z $override_port ]] && echo "无覆盖设置"
             ;;
     esac
     
@@ -865,7 +895,8 @@ gen_link() {
             
             if [[ $reality == "true" ]]; then
                 local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
-                local pbk=$(jq -r '.inbounds[0].tls.reality.public_key' "$conf_path")
+                # 从 outbounds tag 中提取 public_key
+                local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
                 local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
                 # fingerprint 固定为 chrome
                 local fp="chrome"
@@ -873,7 +904,9 @@ gen_link() {
                 local type_param="tcp"
                 [[ $transport == "http" ]] && type_param="h2"
                 
-                if [[ $flow ]]; then
+                if [[ -z $pbk ]]; then
+                    echo "错误: 未找到 PublicKey，请重新创建配置"
+                elif [[ $flow ]]; then
                     echo "vless://${uuid}@${is_addr}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#VLESS-Reality"
                 else
                     echo "vless://${uuid}@${is_addr}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=${type_param}#VLESS-Reality-H2"
@@ -885,9 +918,12 @@ gen_link() {
         vmess)
             local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
             local transport=$(jq -r '.inbounds[0].transport.type // "tcp"' "$conf_path")
+            local tls_enabled=$(jq -r '.inbounds[0].tls.enabled // false' "$conf_path")
+            local tls_val=""
+            [[ $tls_enabled == "true" ]] && tls_val="tls"
             # http transport 在 vmess 中也叫 h2
             [[ $transport == "http" ]] && transport="h2"
-            local json="{\"v\":\"2\",\"ps\":\"VMess\",\"add\":\"$is_addr\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"net\":\"$transport\",\"type\":\"none\",\"tls\":\"\"}"
+            local json="{\"v\":\"2\",\"ps\":\"VMess\",\"add\":\"$is_addr\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"net\":\"$transport\",\"type\":\"none\",\"tls\":\"$tls_val\"}"
             echo "vmess://$(echo -n "$json" | base64 -w 0)"
             ;;
         trojan)
@@ -908,6 +944,22 @@ gen_link() {
             local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
             local password=$(jq -r '.inbounds[0].users[0].password' "$conf_path")
             echo "tuic://${uuid}:${password}@${is_addr}:${port}?alpn=h3&allow_insecure=1#TUIC"
+            ;;
+        socks)
+            local user=$(jq -r '.inbounds[0].users[0].username // empty' "$conf_path")
+            local pass=$(jq -r '.inbounds[0].users[0].password // empty' "$conf_path")
+            if [[ $user && $pass ]]; then
+                echo "socks://$(echo -n "${user}:${pass}" | base64 -w 0)@${is_addr}:${port}#Socks"
+            else
+                echo "socks://${is_addr}:${port}#Socks"
+            fi
+            ;;
+        direct)
+            local override_addr=$(jq -r '.inbounds[0].override_address // empty' "$conf_path")
+            local override_port=$(jq -r '.inbounds[0].override_port // empty' "$conf_path")
+            echo "Direct 协议无标准分享链接格式"
+            [[ $override_addr ]] && echo "  覆盖地址: $override_addr"
+            [[ $override_port ]] && echo "  覆盖端口: $override_port"
             ;;
         *)
             echo "暂不支持生成 $proto 的分享链接"
