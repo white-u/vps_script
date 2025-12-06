@@ -99,21 +99,53 @@ uninstall() {
     echo
     _yellow "警告: 即将卸载 sing-box"
     echo
+    echo "将删除以下内容:"
+    echo "  - $is_core_dir (配置、脚本、核心)"
+    echo "  - $is_log_dir (日志)"
+    echo "  - /etc/systemd/system/${is_core}.service"
+    echo "  - /usr/local/bin/sb, /usr/local/bin/$is_core"
+    echo
+    
     read -rp "确认卸载? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
+    
+    # 询问是否清理 BBR 设置
+    if grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
+        echo
+        read -rp "是否清理 BBR 设置? [y/N]: " bbr_confirm
+        if [[ $bbr_confirm =~ ^[Yy]$ ]]; then
+            sed -i '/# BBR/d' /etc/sysctl.conf
+            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+            sysctl -p &>/dev/null
+            _green "BBR 设置已清理"
+        fi
+    fi
+    
+    echo
+    echo "正在卸载..."
     
     # 停止服务
     systemctl stop $is_core &>/dev/null
     systemctl disable $is_core &>/dev/null
     
-    # 删除文件
+    # 删除主目录
     rm -rf "$is_core_dir"
+    
+    # 删除日志
     rm -rf "$is_log_dir"
+    
+    # 删除 systemd 服务
     rm -f /etc/systemd/system/${is_core}.service
+    systemctl daemon-reload
+    
+    # 删除命令链接
     rm -f /usr/local/bin/sb
     rm -f /usr/local/bin/$is_core
     
-    systemctl daemon-reload
+    # 删除 DNS 备份 (如果存在)
+    rm -f /etc/resolv.conf.bak
     
-    _green "sing-box 已卸载"
+    echo
+    _green "sing-box 已完全卸载"
 }
