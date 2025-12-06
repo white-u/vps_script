@@ -553,17 +553,21 @@ manage() {
     case $1 in
         start)
             systemctl start $is_core
-            [[ $? -eq 0 ]] && _green "$is_core 已启动" || _red "启动失败"
+            refresh_status
+            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已启动" || _red "启动失败"
             ;;
         stop)
             systemctl stop $is_core
-            [[ $? -eq 0 ]] && _green "$is_core 已停止" || _red "停止失败"
+            refresh_status
+            [[ $is_core_stop -eq 1 ]] && _green "$is_core 已停止" || _red "停止失败"
             ;;
         restart)
             systemctl restart $is_core
-            [[ $? -eq 0 ]] && _green "$is_core 已重启" || _red "重启失败"
+            refresh_status
+            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已重启" || _red "重启失败"
             ;;
         status)
+            refresh_status
             echo
             echo "$is_core 状态: $is_core_status"
             [[ $is_core_ver ]] && echo "版本: $is_core_ver"
@@ -714,6 +718,7 @@ pause_return() {
 # 交互式菜单 (循环模式)
 show_menu() {
     while true; do
+        refresh_status  # 每次循环刷新状态
         clear
         echo
         echo "============================================"

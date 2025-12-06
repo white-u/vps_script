@@ -58,24 +58,31 @@ is_sh_bin=/usr/local/bin/$is_core
 is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box"
 
 # ============ 状态检测 ============
-# 核心版本
-[[ -f $is_core_bin ]] && is_core_ver=$($is_core_bin version 2>/dev/null | head -n1 | cut -d' ' -f3)
+# 刷新状态 (可多次调用)
+refresh_status() {
+    # 核心版本
+    [[ -f $is_core_bin ]] && is_core_ver=$($is_core_bin version 2>/dev/null | head -n1 | cut -d' ' -f3)
+    
+    # 运行状态
+    if systemctl is-active --quiet $is_core 2>/dev/null; then
+        is_core_status=$(_green "运行中")
+        is_core_stop=0
+    else
+        is_core_status=$(_red "未运行")
+        is_core_stop=1
+    fi
+}
 
-# 运行状态
-if systemctl is-active --quiet $is_core 2>/dev/null; then
-    is_core_status=$(_green "运行中")
-else
-    is_core_status=$(_red "未运行")
-    is_core_stop=1
-fi
-
-# 服务器 IP
+# 服务器 IP (只获取一次)
 get_ip() {
     is_ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null)
     is_ipv6=$(curl -s6m5 ip.sb 2>/dev/null)
     is_addr=${is_ipv4:-$is_ipv6}
     [[ -z $is_addr ]] && is_addr="<未知IP>"
 }
+
+# 初始化
+refresh_status
 get_ip
 
 # ============ 入口 ============
