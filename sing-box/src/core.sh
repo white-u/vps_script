@@ -572,16 +572,14 @@ list() {
     fi
     
     echo
-    echo "---------- 配置列表 ----------"
-    echo
-    printf "%-4s %-30s %-12s %-8s\n" "序号" "名称" "协议" "端口"
-    echo "----------------------------------------------------"
+    printf "%-3s %-28s %-10s %-6s\n" "#" "名称" "协议" "端口"
+    echo "------------------------------------------------"
     
     for i in "${!files[@]}"; do
         local f=${files[$i]}
         local proto=$(jq -r '.inbounds[0].type' "$is_conf_dir/$f")
         local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$f")
-        printf "%-4s %-30s %-12s %-8s\n" "$((i+1))" "$f" "$proto" "$port"
+        printf "%-3s %-28s %-10s %-6s\n" "$((i+1))" "$f" "$proto" "$port"
     done
     echo
 }
@@ -785,11 +783,8 @@ info() {
     local tag=$(jq -r '.inbounds[0].tag' "$conf_path")
     
     echo
-    echo "---------- 配置信息 ----------"
-    echo
-    echo "配置文件: $is_conf_file"
-    echo "协议类型: $proto"
-    echo "监听端口: $port"
+    echo "--- 配置: $is_conf_file ---"
+    echo "协议: $proto | 端口: $port"
     [[ $tag != "null" ]] && echo "标签: $tag"
     echo
     
@@ -849,7 +844,7 @@ info() {
     echo
     echo "服务器: $is_addr"
     echo
-    echo "---------- 分享链接 ----------"
+    echo "--- 分享链接 ---"
     echo
     gen_link
     echo
@@ -1080,33 +1075,18 @@ show_help() {
 show_menu() {
     clear
     echo
-    echo "============ Sing-Box 管理 ============"
+    echo "=== Sing-Box 管理 ==="
     echo
-    echo " 状态: $is_core_status"
-    [[ $is_core_ver ]] && echo " 版本: $is_core_ver"
-    [[ $is_addr ]] && echo " 地址: $is_addr"
+    echo "状态: $is_core_status  版本: ${is_core_ver:-未安装}"
+    [[ $is_addr ]] && echo "地址: $is_addr"
     echo
-    echo "---------------------------------------"
+    echo " 1. 添加    2. 修改    3. 删除"
+    echo " 4. 查看    5. 列表"
+    echo " 6. 启动    7. 停止    8. 重启"
+    echo " 9. 日志   10. 更新   11. 卸载"
+    echo " 0. 退出"
     echo
-    echo "  1. 添加配置"
-    echo "  2. 修改配置"
-    echo "  3. 删除配置"
-    echo "  4. 查看配置"
-    echo "  5. 列出配置"
-    echo
-    echo "  6. 启动服务"
-    echo "  7. 停止服务"
-    echo "  8. 重启服务"
-    echo
-    echo "  9. 查看日志"
-    echo " 10. 更新核心"
-    echo " 11. 卸载"
-    echo
-    echo "  0. 退出"
-    echo
-    echo "======================================="
-    echo
-    read -p "请选择: " menu_pick
+    read -p "选择: " menu_pick
     
     case $menu_pick in
         1) add ;;

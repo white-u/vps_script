@@ -55,7 +55,7 @@ is_config_json=$is_core_dir/config.json
 is_log_dir=/var/log/$is_core
 is_sh_dir=$is_core_dir/sh
 is_sh_bin=/usr/local/bin/$is_core
-is_sh_repo=white-u/sing-box
+is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box"
 
 # ============ 状态检测 ============
 # 核心版本

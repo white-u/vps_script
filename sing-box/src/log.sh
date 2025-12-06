@@ -12,8 +12,7 @@ show_log() {
     fi
     
     echo
-    echo "---------- 最近 $lines 行日志 ----------"
-    echo
+    echo "--- 最近 $lines 行 ---"
     tail -n $lines "$log_file"
     echo
 }

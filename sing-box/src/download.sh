@@ -65,25 +65,19 @@ update_core() {
 # 更新脚本
 update_sh() {
     echo
-    echo "检查脚本更新..."
+    echo "更新脚本..."
     
-    local url="https://raw.githubusercontent.com/$is_sh_repo/main"
     local tmp_dir="/tmp/sing-box-sh"
+    mkdir -p "$tmp_dir/src"
     
-    mkdir -p "$tmp_dir"
-    
-    echo "下载中..."
-    
-    # 下载脚本文件
+    # 脚本文件列表
     local files=("sing-box.sh" "src/init.sh" "src/core.sh" "src/dns.sh" "src/bbr.sh" "src/log.sh" "src/download.sh")
     
     for f in "${files[@]}"; do
-        local dir=$(dirname "$tmp_dir/$f")
-        mkdir -p "$dir"
         if [[ $is_proxy ]]; then
-            curl -x "$is_proxy" -sL -o "$tmp_dir/$f" "$url/$f"
+            curl -x "$is_proxy" -sL -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
         else
-            curl -sL -o "$tmp_dir/$f" "$url/$f"
+            curl -sL -o "$tmp_dir/$f" "$is_sh_url/$f" || { _red "下载失败: $f"; return 1; }
         fi
     done
     

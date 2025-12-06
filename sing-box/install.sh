@@ -38,7 +38,8 @@ is_config_json=$is_core_dir/config.json
 is_log_dir=/var/log/$is_core
 is_sh_dir=$is_core_dir/sh
 is_sh_bin=/usr/local/bin/$is_core
-is_sh_repo=white-u/sing-box
+# 脚本下载基础 URL
+is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box"
 
 # ============ 显示帮助 ============
 show_help() {
@@ -78,8 +79,7 @@ done
 
 # ============ 开始安装 ============
 echo
-echo "========== $is_core 安装脚本 =========="
-echo
+echo ">>> 安装 $is_core..."
 
 # ============ 安装依赖 ============
 echo ">>> 安装依赖..."
@@ -107,23 +107,27 @@ download "$core_tar" "$core_url"
 
 # ============ 下载脚本 ============
 echo ">>> 下载管理脚本..."
-sh_tar="$tmp_dir/sh.tar.gz"
-sh_url="https://github.com/$is_sh_repo/archive/refs/heads/main.tar.gz"
-download "$sh_tar" "$sh_url"
 
 # ============ 创建目录 ============
-echo ">>> 创建目录..."
-mkdir -p $is_core_dir/bin $is_conf_dir $is_sh_dir $is_log_dir
+mkdir -p $is_core_dir/bin $is_conf_dir $is_sh_dir/src $is_log_dir
 
-# ============ 解压文件 ============
-echo ">>> 解压文件..."
+# 解压核心
 tar -xzf "$core_tar" -C $is_core_dir/bin --strip-components=1
-tar -xzf "$sh_tar" -C $is_sh_dir --strip-components=1
+
+# 脚本文件列表
+sh_files=("sing-box.sh" "src/init.sh" "src/core.sh" "src/dns.sh" "src/bbr.sh" "src/log.sh" "src/download.sh")
+
+for f in "${sh_files[@]}"; do
+    download "$is_sh_dir/$f" "$is_sh_url/$f"
+done
+
+# 清理临时文件
+rm -rf "$tmp_dir"
 
 # ============ 创建命令链接 ============
 ln -sf $is_sh_dir/$is_core.sh $is_sh_bin
 ln -sf $is_sh_dir/$is_core.sh /usr/local/bin/sb
-chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb
+chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb $is_sh_dir/*.sh
 
 # ============ 创建 systemd 服务 ============
 echo ">>> 创建服务..."
@@ -164,17 +168,11 @@ cat > $is_config_json <<EOF
 }
 EOF
 
-# ============ 清理临时文件 ============
-rm -rf "$tmp_dir"
-
 # ============ 完成 ============
 echo
-echo "========== 安装完成 =========="
+_green "安装完成!"
+echo "版本: $is_core_ver"
+echo "命令: sb 或 $is_core"
 echo
-echo "版本: $(_green $is_core_ver)"
-echo "命令: $(_green sb) 或 $(_green $is_core)"
-echo
-echo "快速开始:"
-echo "  $(_yellow "sb add reality")  添加 VLESS-Reality 配置"
-echo "  $(_yellow "sb help")         查看帮助"
+echo "快速开始: sb add"
 echo
