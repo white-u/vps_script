@@ -1148,7 +1148,7 @@ add_port() {
     echo -e "${CYAN}=== 添加端口监控 ===${NC}"
     echo
 
-    local system_ports="20|21|22|23|25|53|67|68|80|110|143|443|465|587|993|995|3306|5432|6379"
+    local system_ports="20|21|22|23|25|53|67|68|80|110|143|443|465|546|587|993|995|3306|5432|6379"
     echo -e "${GREEN}当前系统监听端口 (已过滤常用端口):${NC}"
     local ports_list=$(ss -tulnp 2>/dev/null | grep -E "LISTEN|UNCONN" | awk '{print $5}' | \
         grep -oE '[0-9]+$' | sort -nu | grep -vE "^($system_ports)$" | head -20 | tr '\n' ' ')
