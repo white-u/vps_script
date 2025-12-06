@@ -12,29 +12,29 @@ set_dns() {
     echo "  4. 自定义"
     echo "  0. 取消"
     echo
-    read -p "请选择: " dns_pick
+    read -rp "请选择: " dns_pick
     
     case $dns_pick in
         1) dns1="1.1.1.1"; dns2="1.0.0.1" ;;
         2) dns1="8.8.8.8"; dns2="8.8.4.4" ;;
         3) dns1="223.5.5.5"; dns2="223.6.6.6" ;;
         4)
-            read -p "主 DNS: " dns1
-            read -p "备 DNS: " dns2
-            [[ -z $dns1 ]] && err "DNS 不能为空"
+            read -rp "主 DNS: " dns1
+            read -rp "备 DNS: " dns2
+            [[ -z $dns1 ]] && { _yellow "DNS 不能为空"; return; }
             ;;
         0) echo "已取消"; return ;;
-        *) err "无效选择" ;;
+        *) _yellow "无效选择"; return ;;
     esac
     
     # 备份原配置
     [[ -f /etc/resolv.conf ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
     
     # 写入新配置
-    cat > /etc/resolv.conf <<EOF
+    cat > /etc/resolv.conf <<EOFDNS
 nameserver $dns1
 nameserver $dns2
-EOF
+EOFDNS
     
     _green "DNS 已设置: $dns1, $dns2"
 }

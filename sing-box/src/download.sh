@@ -19,7 +19,7 @@ update_core() {
     echo "检查 sing-box 更新..."
     
     local latest=$(get_latest_version $is_core_repo)
-    [[ -z $latest ]] && err "无法获取最新版本"
+    [[ -z $latest ]] && { _red "无法获取最新版本"; return 1; }
     
     local current=${is_core_ver:-未安装}
     
@@ -28,12 +28,12 @@ update_core() {
     
     if [[ $current == $latest ]]; then
         _green "已是最新版本"
-        return
+        return 0
     fi
     
     echo
-    read -p "是否更新? [Y/n]: " confirm
-    [[ $confirm =~ ^[Nn]$ ]] && { echo "已取消"; return; }
+    read -rp "是否更新? [Y/n]: " confirm
+    [[ $confirm =~ ^[Nn]$ ]] && { echo "已取消"; return 0; }
     
     # 下载新版本
     local url="https://github.com/$is_core_repo/releases/download/v${latest}/sing-box-${latest}-linux-${is_arch}.tar.gz"
@@ -46,7 +46,7 @@ update_core() {
         curl -fLm120 -o "$tmp_file" "$url"
     fi
     
-    [[ $? -ne 0 ]] && err "下载失败"
+    [[ $? -ne 0 ]] && { _red "下载失败"; return 1; }
     
     # 停止服务
     systemctl stop $is_core
@@ -99,8 +99,8 @@ uninstall() {
     echo
     _yellow "警告: 即将卸载 sing-box"
     echo
-    read -p "确认卸载? [y/N]: " confirm
-    [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return; }
+    read -rp "确认卸载? [y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
     
     # 停止服务
     systemctl stop $is_core &>/dev/null

@@ -131,7 +131,7 @@ chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb $is_sh_dir/*.sh $is_sh_dir/sr
 
 # ============ 创建 systemd 服务 ============
 echo ">>> 创建服务..."
-cat > /etc/systemd/system/$is_core.service <<EOF
+cat > /etc/systemd/system/$is_core.service <<EOFSERVICE
 [Unit]
 Description=$is_core Service
 After=network.target
@@ -144,14 +144,14 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOFSERVICE
 
 systemctl daemon-reload
 systemctl enable $is_core &>/dev/null
 
 # ============ 创建默认配置 ============
 echo ">>> 创建配置..."
-cat > $is_config_json <<EOF
+cat > $is_config_json <<EOFCONFIG
 {
     "log": {
         "level": "info",
@@ -166,7 +166,7 @@ cat > $is_config_json <<EOF
         }
     ]
 }
-EOF
+EOFCONFIG
 
 # ============ 完成 ============
 echo

@@ -25,14 +25,15 @@ enable_bbr() {
     # 检查内核版本
     local kernel_ver=$(uname -r | cut -d. -f1)
     if [[ $kernel_ver -lt 4 ]]; then
-        err "BBR 需要 Linux 4.9+ 内核，当前: $(uname -r)"
+        _red "BBR 需要 Linux 4.9+ 内核，当前: $(uname -r)"
+        return 1
     fi
     
     # 检查是否已启用
     local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     if [[ $current == "bbr" ]]; then
         _green "BBR 已经启用"
-        return
+        return 0
     fi
     
     # 先删除旧配置，避免重复
@@ -40,12 +41,12 @@ enable_bbr() {
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
     
     # 启用 BBR
-    cat >> /etc/sysctl.conf <<EOF
+    cat >> /etc/sysctl.conf <<EOFBBR
 
 # BBR
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-EOF
+EOFBBR
     
     sysctl -p &>/dev/null
     
@@ -54,6 +55,6 @@ EOF
     if [[ $current == "bbr" ]]; then
         _green "BBR 启用成功"
     else
-        err "BBR 启用失败"
+        _red "BBR 启用失败"
     fi
 }

@@ -33,7 +33,7 @@ follow_log() {
 clear_log() {
     local log_file="$is_log_dir/sing-box.log"
     
-    read -p "确认清空日志? [y/N]: " confirm
+    read -rp "确认清空日志? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return; }
     
     > "$log_file"
