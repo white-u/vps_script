@@ -78,12 +78,13 @@ singbox_install() {
     # 下载
     local url tmp_file tmp_dir
     url="https://github.com/$SINGBOX_REPO/releases/download/v${version}/sing-box-${version}-linux-${ARCH:-amd64}.tar.gz"
-    tmp_file="/tmp/sing-box-$$.tar.gz"
-    tmp_dir="/tmp/sing-box-$$"
-    
+    tmp_file=$(mktemp --suffix=.tar.gz) || { log_error "无法创建临时文件"; return 1; }
+    tmp_dir=$(mktemp -d) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
+
     log_info "下载: $url"
     if ! download_file "$url" "$tmp_file"; then
         rm -f "$tmp_file"
+        rm -rf "$tmp_dir"
         return 1
     fi
     
@@ -205,7 +206,11 @@ singbox_add_reality() {
     
     # UUID
     local uuid
-    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(uuidgen 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")")
+    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
+    if [[ -z "$uuid" ]]; then
+        log_error "UUID 生成失败，请检查系统环境"
+        return 1
+    fi
     read -rp "UUID [$uuid]: " input_uuid || input_uuid=""
     uuid="${input_uuid:-$uuid}"
     
@@ -224,7 +229,12 @@ singbox_add_reality() {
     keys=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null)
     private_key=$(echo "$keys" | grep PrivateKey | awk '{print $2}')
     public_key=$(echo "$keys" | grep PublicKey | awk '{print $2}')
-    short_id=$(openssl rand -hex 8 2>/dev/null || echo "0123456789abcdef")
+    short_id=$(openssl rand -hex 8 2>/dev/null)
+
+    if [[ -z "$private_key" || -z "$public_key" || -z "$short_id" ]]; then
+        log_error "密钥生成失败，请检查 sing-box 和 openssl"
+        return 1
+    fi
     
     # 创建配置
     local conf_name="vless-reality-${port}"
@@ -323,10 +333,15 @@ singbox_add_shadowsocks() {
     
     local method password
     case "${method_pick:-1}" in
-        2) method="2022-blake3-aes-256-gcm"; password=$(openssl rand -base64 32 2>/dev/null || echo "defaultpassword32chars!!") ;;
-        3) method="2022-blake3-chacha20-poly1305"; password=$(openssl rand -base64 32 2>/dev/null || echo "defaultpassword32chars!!") ;;
-        *) method="2022-blake3-aes-128-gcm"; password=$(openssl rand -base64 16 2>/dev/null || echo "defaultpass16ch") ;;
+        2) method="2022-blake3-aes-256-gcm"; password=$(openssl rand -base64 32 2>/dev/null) ;;
+        3) method="2022-blake3-chacha20-poly1305"; password=$(openssl rand -base64 32 2>/dev/null) ;;
+        *) method="2022-blake3-aes-128-gcm"; password=$(openssl rand -base64 16 2>/dev/null) ;;
     esac
+
+    if [[ -z "$password" ]]; then
+        log_error "密码生成失败，请检查 openssl"
+        return 1
+    fi
     
     # 备注
     local default_remark
@@ -381,7 +396,7 @@ EOF
     echo
     echo "=== 分享链接 ==="
     local encoded
-    encoded=$(echo -n "${method}:${password}" | base64 -w 0 2>/dev/null || echo -n "${method}:${password}" | base64)
+    encoded=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
     echo "ss://${encoded}@${SERVER_IP:-IP}:${port}#${remark}"
     echo
 }
@@ -515,7 +530,7 @@ singbox_info() {
             echo
             echo "=== 分享链接 ==="
             local encoded
-            encoded=$(echo -n "${method}:${password}" | base64 -w 0 2>/dev/null || echo -n "${method}:${password}" | base64)
+            encoded=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
             echo "ss://${encoded}@${SERVER_IP:-IP}:${port}#$(hostname)"
             ;;
     esac
@@ -584,14 +599,15 @@ singbox_update() {
     
     local url tmp_file tmp_dir
     url="https://github.com/$SINGBOX_REPO/releases/download/v${latest}/sing-box-${latest}-linux-${ARCH:-amd64}.tar.gz"
-    tmp_file="/tmp/sing-box-$$.tar.gz"
-    tmp_dir="/tmp/sing-box-$$"
-    
+    tmp_file=$(mktemp --suffix=.tar.gz) || { log_error "无法创建临时文件"; return 1; }
+    tmp_dir=$(mktemp -d) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
+
     backup_binary "$SINGBOX_BIN" "sing-box"
-    
+
     log_info "下载中..."
     if ! download_file "$url" "$tmp_file"; then
         rm -f "$tmp_file"
+        rm -rf "$tmp_dir"
         return 1
     fi
     

@@ -216,6 +216,17 @@ restore_binary() {
 # ============================================================================
 # 配置管理
 # ============================================================================
+json_escape() {
+    local str="$1"
+    # 转义 JSON 特殊字符: \, ", /, 控制字符
+    str="${str//\\/\\\\}"  # 反斜杠
+    str="${str//\"/\\\"}"  # 双引号
+    str="${str//$'\n'/\\n}" # 换行
+    str="${str//$'\r'/\\r}" # 回车
+    str="${str//$'\t'/\\t}" # 制表符
+    echo "$str"
+}
+
 init_config() {
     mkdir -p "$VPS_DIR" "$VPS_BACKUP_DIR"
     
@@ -253,13 +264,14 @@ config_get() {
 
 config_set() {
     local expr="$1"
-    local tmp="${VPS_CONFIG}.tmp.$$"
-    
+    local tmp
+    tmp=$(mktemp) || return 1
+
     if jq "$expr" "$VPS_CONFIG" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$VPS_CONFIG"
         return 0
     fi
-    
+
     rm -f "$tmp"
     return 1
 }
@@ -581,11 +593,13 @@ self_update() {
         _yellow "发现新版本: $VPS_VERSION -> $remote_version"
         if confirm "是否更新?"; then
             log_info "下载更新..."
-            local tmp_script="/tmp/vps-install-$$.sh"
+            local tmp_script
+            tmp_script=$(mktemp --suffix=.sh) || { _red "无法创建临时文件"; return 1; }
             if download_file "https://raw.githubusercontent.com/$VPS_REPO/$VPS_BRANCH/vps-manager/install.sh" "$tmp_script"; then
                 chmod +x "$tmp_script"
                 exec bash "$tmp_script"
             else
+                rm -f "$tmp_script"
                 _red "下载失败"
             fi
         fi

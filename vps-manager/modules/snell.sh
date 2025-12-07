@@ -172,13 +172,17 @@ snell_install() {
     
     # 生成 PSK
     local psk
-    psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20 || echo "defaultpsk12345")
+    psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20)
+    if [[ -z "$psk" || ${#psk} -lt 16 ]]; then
+        log_error "随机密钥生成失败，请检查系统熵源"
+        return 1
+    fi
     
     # 下载
     local url tmp_zip
     url=$(snell_get_download_url)
-    tmp_zip="/tmp/snell-server-$$.zip"
-    
+    tmp_zip=$(mktemp --suffix=.zip) || { log_error "无法创建临时文件"; return 1; }
+
     log_info "下载: $url"
     if ! download_file "$url" "$tmp_zip"; then
         rm -f "$tmp_zip"
@@ -314,10 +318,11 @@ snell_update() {
     # 下载
     local url tmp_zip
     url=$(snell_get_download_url)
-    tmp_zip="/tmp/snell-server-$$.zip"
-    
+    tmp_zip=$(mktemp --suffix=.zip) || { log_error "无法创建临时文件"; restore_binary "$SNELL_BIN" "snell"; systemctl start snell; return 1; }
+
     if ! download_file "$url" "$tmp_zip"; then
         log_error "下载失败"
+        rm -f "$tmp_zip"
         restore_binary "$SNELL_BIN" "snell"
         systemctl start snell
         return 1
@@ -453,9 +458,13 @@ snell_modify_psk() {
     local old_psk
     old_psk=$(snell_get_psk)
     echo "当前 PSK: $old_psk"
-    
+
     local new_psk
-    new_psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20 || echo "newpsk12345")
+    new_psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20)
+    if [[ -z "$new_psk" || ${#new_psk} -lt 16 ]]; then
+        log_error "随机密钥生成失败，请检查系统熵源"
+        return 1
+    fi
     read -rp "新 PSK [$new_psk]: " input_psk || input_psk=""
     new_psk="${input_psk:-$new_psk}"
     

@@ -171,11 +171,13 @@ traffic_add_port() {
     traffic_add_nft_rules "$port"
     
     # 更新配置
-    local tmp="${TRAFFIC_DATA}.tmp.$$"
-    local escaped_remark
-    escaped_remark=$(echo "$remark" | sed 's/"/\\"/g')
-    
-    if jq ".ports.\"$port\" = {\"remark\": \"$escaped_remark\", \"created\": \"$(date -Iseconds)\"}" "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
+    local tmp
+    tmp=$(mktemp) || { log_error "无法创建临时文件"; return 1; }
+
+    # 使用 jq 的 --arg 参数安全传递字符串，避免注入
+    if jq --arg remark "$remark" --arg created "$(date -Iseconds)" \
+        '.ports[$port] = {remark: $remark, created: $created}' \
+        --arg port "$port" "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$TRAFFIC_DATA"
     else
         rm -f "$tmp"
@@ -191,7 +193,8 @@ traffic_remove_port() {
     traffic_remove_nft_rules "$port"
     
     # 更新配置
-    local tmp="${TRAFFIC_DATA}.tmp.$$"
+    local tmp
+    tmp=$(mktemp) || { log_error "无法创建临时文件"; return 1; }
     if jq "del(.ports.\"$port\")" "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$TRAFFIC_DATA"
     else
@@ -400,12 +403,13 @@ traffic_set_remark() {
     
     local port="${ports[$((sel-1))]}"
     read -rp "新备注 (留空清除): " new_remark || new_remark=""
-    
-    local escaped_remark
-    escaped_remark=$(echo "$new_remark" | sed 's/"/\\"/g')
-    
-    local tmp="${TRAFFIC_DATA}.tmp.$$"
-    if jq ".ports.\"$port\".remark = \"$escaped_remark\"" "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
+
+    local tmp
+    tmp=$(mktemp) || { _red "无法创建临时文件"; return 1; }
+
+    # 使用 jq 的 --arg 参数安全传递字符串
+    if jq --arg remark "$new_remark" --arg port "$port" \
+        '.ports[$port].remark = $remark' "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$TRAFFIC_DATA"
         _green "✓ 备注已更新"
     else
