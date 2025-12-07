@@ -472,21 +472,39 @@ change() {
     
     local conf_path="$is_conf_dir/$is_conf_file"
     local proto=$(jq -r '.inbounds[0].type' "$conf_path")
-    
+
     echo
     echo "修改: $is_conf_file ($proto)"
     echo
     echo "可修改项:"
     echo "  1. 端口"
     echo "  2. 主要凭证 (UUID/密码)"
+
+    # 检查是否支持 SNI（VLESS-Reality）
+    local has_sni=false
+    if [[ $proto == "vless" ]]; then
+        local server_name=$(jq -r '.inbounds[0].tls.server_name // empty' "$conf_path")
+        if [[ -n $server_name ]]; then
+            echo "  3. SNI (Server Name)"
+            has_sni=true
+        fi
+    fi
+
     echo
     echo "  0. 返回"
     echo
     read -rp "请选择: " change_pick
-    
+
     case $change_pick in
         1) change_port "$conf_path" ;;
         2) change_cred "$conf_path" "$proto" ;;
+        3)
+            if [[ $has_sni == true ]]; then
+                change_sni "$conf_path" "$proto"
+            else
+                _yellow "无效选择"
+            fi
+            ;;
         0|"") return 0 ;;
         *) _yellow "无效选择" ;;
     esac
@@ -530,7 +548,7 @@ change_port() {
 change_cred() {
     local conf_path=$1
     local proto=$2
-    
+
     case $proto in
         vless)
             local old_uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
@@ -558,6 +576,47 @@ change_cred() {
             ;;
         *) _yellow "此协议暂不支持修改凭证" ;;
     esac
+}
+
+change_sni() {
+    local conf_path=$1
+    local proto=$2
+
+    # 只有 VLESS-Reality 支持 SNI
+    if [[ $proto != "vless" ]]; then
+        _yellow "此协议不支持 SNI 配置"
+        return 1
+    fi
+
+    # 检查是否有 TLS 配置
+    local has_tls=$(jq -r '.inbounds[0].tls.server_name // empty' "$conf_path")
+    if [[ -z $has_tls ]]; then
+        _yellow "此配置未启用 Reality，不支持 SNI"
+        return 1
+    fi
+
+    local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+    echo "当前 SNI: $old_sni"
+    echo
+    echo "常用 SNI 示例:"
+    echo "  - www.microsoft.com"
+    echo "  - www.cloudflare.com"
+    echo "  - www.apple.com"
+    echo "  - www.google.com"
+    echo
+    read -rp "新 SNI: " new_sni
+
+    [[ -z $new_sni ]] && { echo "已取消"; return; }
+
+    jq ".inbounds[0].tls.server_name = \"$new_sni\"" "$conf_path" > "${conf_path}.tmp"
+    if $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
+        mv "${conf_path}.tmp" "$conf_path"
+        _green "SNI 已修改: $old_sni -> $new_sni"
+        restart_check
+    else
+        rm -f "${conf_path}.tmp"
+        _red "配置验证失败，请检查 SNI 格式"
+    fi
 }
 
 # 删除配置
