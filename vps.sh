@@ -19,6 +19,7 @@ set -euo pipefail
 # 版本和配置
 # =====================================
 SCRIPT_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 SNELL_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/Snell.sh"
 SINGBOX_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
@@ -501,21 +502,31 @@ install_component() {
     echo -e "\n${BOLD}${CYAN}📦 安装组件${RESET}\n"
 
     local choices=()
+    local has_missing=0
 
     if ! is_snell_installed; then
         choices+=("1. Snell Server")
+        has_missing=1
     fi
 
     if ! is_singbox_installed; then
         choices+=("2. sing-box")
+        has_missing=1
     fi
 
     if ! is_ptm_installed; then
         choices+=("3. 流量监控 (port-manage)")
+        has_missing=1
     fi
 
-    if [ ${#choices[@]} -eq 0 ]; then
-        success "所有组件都已安装"
+    # 检查模块是否存在
+    if [ ! -f "${SCRIPT_DIR}/system-optimize.sh" ] || [ ! -f "${SCRIPT_DIR}/telegram-notify.sh" ]; then
+        choices+=("4. 系统优化模块 (system-optimize.sh, telegram-notify.sh)")
+        has_missing=1
+    fi
+
+    if [ $has_missing -eq 0 ]; then
+        success "所有组件和模块都已安装"
         read -rp "按回车返回..." _
         return
     fi
@@ -549,6 +560,40 @@ install_component() {
                 log "开始安装 port-manage..."
                 bash <(curl -sL "$PTM_SCRIPT_URL")
             fi
+            ;;
+        4)
+            log "开始下载系统优化模块..."
+            local success_count=0
+
+            # 下载 system-optimize.sh
+            if curl -fsSL "${SCRIPT_URL%/*}/system-optimize.sh" -o "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null || \
+               wget -q "${SCRIPT_URL%/*}/system-optimize.sh" -O "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null; then
+                chmod +x "${SCRIPT_DIR}/system-optimize.sh"
+                success "system-optimize.sh 下载成功"
+                ((success_count++))
+            else
+                error "system-optimize.sh 下载失败"
+            fi
+
+            # 下载 telegram-notify.sh
+            if curl -fsSL "${SCRIPT_URL%/*}/telegram-notify.sh" -o "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null || \
+               wget -q "${SCRIPT_URL%/*}/telegram-notify.sh" -O "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null; then
+                chmod +x "${SCRIPT_DIR}/telegram-notify.sh"
+                success "telegram-notify.sh 下载成功"
+                ((success_count++))
+            else
+                error "telegram-notify.sh 下载失败"
+            fi
+
+            if [ $success_count -eq 2 ]; then
+                success "所有模块下载完成"
+            elif [ $success_count -gt 0 ]; then
+                warn "部分模块下载成功 ($success_count/2)"
+            else
+                error "所有模块下载失败，请检查网络连接"
+            fi
+
+            read -rp "按回车返回..." _
             ;;
         0)
             return
@@ -664,6 +709,13 @@ EOF
 # =====================================
 main() {
     check_root
+
+    # 创建快捷命令（如果不存在）
+    local script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    if [ ! -L /usr/local/bin/vps ] && [ -f "$script_path" ]; then
+        ln -sf "$script_path" /usr/local/bin/vps 2>/dev/null && \
+            log "已创建快捷命令：vps" || true
+    fi
 
     # 处理命令行参数
     if [ $# -gt 0 ]; then
