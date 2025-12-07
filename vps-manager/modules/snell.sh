@@ -1,11 +1,10 @@
 #!/bin/bash
 # ============================================================================
-# VPS Manager - Snell 模块 (完整版)
+# VPS Manager - Snell 模块
 # ============================================================================
 
-# 防止重复加载
-[[ "${XXX_LOADED:-}" == "true" ]] && return 0
-XXX_LOADED=true
+[[ "${SNELL_LOADED:-}" == "true" ]] && return 0
+SNELL_LOADED=true
 
 # ============================================================================
 # Snell 配置
@@ -17,43 +16,43 @@ readonly SNELL_CONF="$SNELL_DIR/snell-server.conf"
 readonly SNELL_SERVICE="/etc/systemd/system/snell.service"
 readonly SNELL_DL_BASE="https://dl.nssurge.com/snell"
 readonly SNELL_KB_URL="https://kb.nssurge.com/surge-knowledge-base/guidelines/snell"
-readonly SNELL_VERSION_CACHE_TTL=3600  # 1小时缓存
+
+SNELL_VERSION=""
 
 # ============================================================================
 # 版本检测
 # ============================================================================
 snell_detect_version() {
     local silent="${1:-}"
-    local cached_ver cached_time current_time
     
     # 检查缓存
-    cached_ver=$(config_get '.version_cache.snell.version')
-    cached_time=$(config_get '.version_cache.snell.updated')
+    local cached_ver cached_time current_time
+    cached_ver=$(config_get '.version_cache.snell.version' '')
+    cached_time=$(config_get '.version_cache.snell.updated' '0')
     current_time=$(date +%s)
     
     if [[ -n "$cached_ver" && -n "$cached_time" ]]; then
         local age=$((current_time - cached_time))
-        if [[ $age -lt $SNELL_VERSION_CACHE_TTL ]]; then
+        if [[ $age -lt 3600 ]]; then
             SNELL_VERSION="$cached_ver"
-            [[ -z "$silent" ]] && log_debug "使用缓存版本: $SNELL_VERSION"
             return 0
         fi
     fi
     
     [[ -z "$silent" ]] && log_info "检测最新版本..."
     
-    # 方法1: 从 KB 页面获取 (结构稳定)
+    # 从 KB 页面获取
     local version
     version=$(curl -sfm10 "$SNELL_KB_URL" 2>/dev/null | \
               grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | \
-              sort -V | tail -1 | sed 's/^v//')
+              sort -V | tail -1 | sed 's/^v//' || echo "")
     
-    # 方法2: 从下载目录获取 (备用)
+    # 备用方法
     if [[ -z "$version" ]]; then
         version=$(curl -sfm10 "${SNELL_DL_BASE}/" 2>/dev/null | \
                   grep -oE 'snell-server-v[0-9]+\.[0-9]+\.[0-9]+' | \
                   grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | \
-                  sort -V | tail -1)
+                  sort -V | tail -1 || echo "")
     fi
     
     # 使用回退版本
@@ -65,16 +64,14 @@ snell_detect_version() {
     SNELL_VERSION="$version"
     
     # 更新缓存
-    config_set ".version_cache.snell.version = \"$version\" | .version_cache.snell.updated = $current_time" &>/dev/null
-    
-    return 0
+    config_set ".version_cache.snell.version = \"$version\" | .version_cache.snell.updated = $current_time" &>/dev/null || true
 }
 
 snell_get_download_url() {
     local version="${1:-$SNELL_VERSION}"
     local arch
     
-    case $ARCH in
+    case "${ARCH:-amd64}" in
         amd64) arch="amd64" ;;
         arm64) arch="aarch64" ;;
         armv7) arch="armv7l" ;;
@@ -105,19 +102,35 @@ snell_get_status() {
 }
 
 snell_get_installed_version() {
-    [[ -f "$SNELL_DIR/version" ]] && cat "$SNELL_DIR/version" || echo ""
+    if [[ -f "$SNELL_DIR/version" ]]; then
+        cat "$SNELL_DIR/version"
+    else
+        echo ""
+    fi
 }
 
 snell_get_port() {
-    [[ -f "$SNELL_CONF" ]] && grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/'
+    if [[ -f "$SNELL_CONF" ]]; then
+        grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/' || echo ""
+    else
+        echo ""
+    fi
 }
 
 snell_get_psk() {
-    [[ -f "$SNELL_CONF" ]] && grep -E '^psk' "$SNELL_CONF" | awk -F'=' '{print $2}' | xargs
+    if [[ -f "$SNELL_CONF" ]]; then
+        grep -E '^psk' "$SNELL_CONF" | awk -F'=' '{print $2}' | xargs || echo ""
+    else
+        echo ""
+    fi
 }
 
 snell_get_node_name() {
-    [[ -f "$SNELL_DIR/node_name" ]] && cat "$SNELL_DIR/node_name" || hostname
+    if [[ -f "$SNELL_DIR/node_name" ]]; then
+        cat "$SNELL_DIR/node_name"
+    else
+        hostname
+    fi
 }
 
 # ============================================================================
@@ -129,18 +142,17 @@ snell_install() {
         return 1
     fi
     
-    # 检测版本
     snell_detect_version || { log_error "无法确定安装版本"; return 1; }
     
     log_info "开始安装 Snell v$SNELL_VERSION..."
     
-    # 检查依赖
     ensure_deps wget unzip curl
     
     # 询问端口
-    local default_port=$(rand_port)
-    read -rp "端口 [$default_port]: " port
-    port=${port:-$default_port}
+    local default_port
+    default_port=$(rand_port)
+    read -rp "端口 [$default_port]: " port || port=""
+    port="${port:-$default_port}"
     
     if ! is_valid_port "$port"; then
         _red "无效端口"
@@ -153,16 +165,19 @@ snell_install() {
     fi
     
     # 询问节点名称
-    local default_name=$(hostname)
-    read -rp "节点名称 [$default_name]: " node_name
-    node_name=${node_name:-$default_name}
+    local default_name
+    default_name=$(hostname)
+    read -rp "节点名称 [$default_name]: " node_name || node_name=""
+    node_name="${node_name:-$default_name}"
     
     # 生成 PSK
-    local psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)
+    local psk
+    psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20 || echo "defaultpsk12345")
     
     # 下载
-    local url=$(snell_get_download_url)
-    local tmp_zip="/tmp/snell-server-$$.zip"
+    local url tmp_zip
+    url=$(snell_get_download_url)
+    tmp_zip="/tmp/snell-server-$$.zip"
     
     log_info "下载: $url"
     if ! download_file "$url" "$tmp_zip"; then
@@ -211,7 +226,7 @@ WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable snell &>/dev/null
+    systemctl enable snell &>/dev/null || true
     systemctl start snell
     
     sleep 2
@@ -227,22 +242,22 @@ EOF
     firewall_allow "$port" udp
     
     # 联动流量监控
-    if [[ $(config_get '.settings.auto_traffic_monitor' 'true') == "true" ]]; then
+    if [[ "$(config_get '.settings.auto_traffic_monitor' 'true')" == "true" ]]; then
         if declare -f traffic_add_port &>/dev/null; then
-            log_info "联动: 添加端口流量监控..."
             traffic_add_port "$port" "Snell-$node_name"
         fi
     fi
     
     # 网络优化
-    if [[ $(config_get '.settings.auto_network_optimize' 'true') == "true" ]]; then
-        enable_tfo &>/dev/null
-        enable_bbr &>/dev/null
+    if [[ "$(config_get '.settings.auto_network_optimize' 'true')" == "true" ]]; then
+        enable_tfo &>/dev/null || true
+        enable_bbr &>/dev/null || true
     fi
     
     # Telegram 通知
-    if [[ $(config_get '.telegram.enabled' 'false') == "true" ]]; then
-        local server_name=$(config_get '.telegram.server_name' "$(hostname)")
+    if [[ "$(config_get '.telegram.enabled' 'false')" == "true" ]]; then
+        local server_name
+        server_name=$(config_get '.telegram.server_name' "$(hostname)")
         telegram_send "✅ <b>Snell 已安装</b>
 服务器: $server_name
 版本: v$SNELL_VERSION
@@ -265,16 +280,17 @@ snell_update() {
         return 1
     fi
     
-    local installed_ver=$(snell_get_installed_version)
+    local installed_ver
+    installed_ver=$(snell_get_installed_version)
     
-    # 强制刷新版本缓存
-    config_set ".version_cache.snell.updated = 0" &>/dev/null
+    # 刷新版本缓存
+    config_set ".version_cache.snell.updated = 0" &>/dev/null || true
     snell_detect_version
     
     if [[ -z "$installed_ver" ]]; then
         log_warn "无法获取已安装版本，继续更新..."
     else
-        compare_versions "$installed_ver" "$SNELL_VERSION"
+        compare_versions "$installed_ver" "$SNELL_VERSION" || true
         local cmp_result=$?
         
         if [[ $cmp_result -eq 0 ]]; then
@@ -288,59 +304,56 @@ snell_update() {
     
     log_info "更新 Snell: ${installed_ver:-未知} -> $SNELL_VERSION"
     
-    # 备份当前二进制
+    # 备份
     backup_binary "$SNELL_BIN" "snell"
     backup_file "$SNELL_CONF" "snell"
     
     # 停止服务
-    systemctl stop snell &>/dev/null
+    systemctl stop snell
     
-    # 下载新版本
-    local url=$(snell_get_download_url)
-    local tmp_zip="/tmp/snell-server-$$.zip"
+    # 下载
+    local url tmp_zip
+    url=$(snell_get_download_url)
+    tmp_zip="/tmp/snell-server-$$.zip"
     
     if ! download_file "$url" "$tmp_zip"; then
-        _red "下载失败，回滚中..."
+        log_error "下载失败"
         restore_binary "$SNELL_BIN" "snell"
         systemctl start snell
-        rm -f "$tmp_zip"
         return 1
     fi
     
-    # 安装
     if ! unzip -o "$tmp_zip" -d /usr/local/bin &>/dev/null; then
-        _red "解压失败，回滚中..."
+        log_error "解压失败"
+        rm -f "$tmp_zip"
         restore_binary "$SNELL_BIN" "snell"
         systemctl start snell
-        rm -f "$tmp_zip"
         return 1
     fi
     rm -f "$tmp_zip"
     chmod +x "$SNELL_BIN"
     
-    # 更新版本记录
+    # 更新版本
     echo "$SNELL_VERSION" > "$SNELL_DIR/version"
     
-    # 启动服务
     systemctl start snell
     sleep 2
     
     if systemctl is-active --quiet snell; then
         _green "更新成功: ${installed_ver:-未知} -> $SNELL_VERSION"
         
-        # Telegram 通知
-        if [[ $(config_get '.telegram.enabled' 'false') == "true" ]]; then
-            local server_name=$(config_get '.telegram.server_name' "$(hostname)")
+        if [[ "$(config_get '.telegram.enabled' 'false')" == "true" ]]; then
+            local server_name
+            server_name=$(config_get '.telegram.server_name' "$(hostname)")
             telegram_send "🔄 <b>Snell 已更新</b>
 服务器: $server_name
-版本: ${installed_ver:-未知} -> v$SNELL_VERSION"
+版本: ${installed_ver:-?} -> $SNELL_VERSION"
         fi
     else
-        _red "更新后启动失败，回滚中..."
+        _red "更新后启动失败，回滚..."
         restore_binary "$SNELL_BIN" "snell"
         echo "$installed_ver" > "$SNELL_DIR/version"
         systemctl start snell
-        journalctl -u snell -n 20 --no-pager
         return 1
     fi
 }
@@ -354,11 +367,12 @@ snell_show_config() {
         return 1
     fi
     
-    local port=$(snell_get_port)
-    local psk=$(snell_get_psk)
-    local node_name=$(snell_get_node_name)
-    local version=$(snell_get_installed_version)
-    local status=$(snell_get_status)
+    local port psk node_name version status
+    port=$(snell_get_port)
+    psk=$(snell_get_psk)
+    node_name=$(snell_get_node_name)
+    version=$(snell_get_installed_version)
+    status=$(snell_get_status)
     
     echo
     echo "=== Snell 配置 ==="
@@ -368,8 +382,8 @@ snell_show_config() {
     echo "端口: $port"
     echo "PSK:  $psk"
     echo
-    echo "=== Surge 配置 (可直接复制) ==="
-    echo "${node_name} = snell, ${SERVER_IP}, ${port}, psk=${psk}, version=4, tfo=true, reuse=true"
+    echo "=== Surge 配置 ==="
+    echo "${node_name} = snell, ${SERVER_IP:-IP}, ${port}, psk=${psk}, version=4, tfo=true, reuse=true"
     echo
 }
 
@@ -382,10 +396,11 @@ snell_modify_port() {
         return 1
     fi
     
-    local old_port=$(snell_get_port)
+    local old_port
+    old_port=$(snell_get_port)
     echo "当前端口: $old_port"
     
-    read -rp "新端口: " new_port
+    read -rp "新端口: " new_port || new_port=""
     [[ -z "$new_port" ]] && return 0
     
     if ! is_valid_port "$new_port"; then
@@ -398,18 +413,14 @@ snell_modify_port() {
         return 1
     fi
     
-    # 备份配置
     backup_file "$SNELL_CONF" "snell"
-    
-    # 修改配置
     sed -i "s/^listen = .*:${old_port}$/listen = ::0:${new_port}/" "$SNELL_CONF"
     
-    # 更新防火墙
-    firewall_remove "$old_port"
+    firewall_remove "$old_port" tcp
+    firewall_remove "$old_port" udp
     firewall_allow "$new_port" tcp
     firewall_allow "$new_port" udp
     
-    # 更新流量监控
     if declare -f traffic_remove_port &>/dev/null; then
         traffic_remove_port "$old_port"
     fi
@@ -423,9 +434,10 @@ snell_modify_port() {
     if systemctl is-active --quiet snell; then
         _green "端口已修改: $old_port -> $new_port"
     else
-        _red "修改后启动失败，回滚中..."
+        _red "修改后启动失败，回滚..."
         restore_file "$SNELL_CONF" "snell"
-        firewall_remove "$new_port"
+        firewall_remove "$new_port" tcp
+        firewall_remove "$new_port" udp
         firewall_allow "$old_port" tcp
         firewall_allow "$old_port" udp
         systemctl restart snell
@@ -438,12 +450,14 @@ snell_modify_psk() {
         return 1
     fi
     
-    local old_psk=$(snell_get_psk)
+    local old_psk
+    old_psk=$(snell_get_psk)
     echo "当前 PSK: $old_psk"
     
-    local new_psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)
-    read -rp "新 PSK [$new_psk]: " input_psk
-    new_psk=${input_psk:-$new_psk}
+    local new_psk
+    new_psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20 || echo "newpsk12345")
+    read -rp "新 PSK [$new_psk]: " input_psk || input_psk=""
+    new_psk="${input_psk:-$new_psk}"
     
     backup_file "$SNELL_CONF" "snell"
     sed -i "s/^psk = .*/psk = ${new_psk}/" "$SNELL_CONF"
@@ -455,7 +469,7 @@ snell_modify_psk() {
         _green "PSK 已修改"
         snell_show_config
     else
-        _red "修改后启动失败，回滚中..."
+        _red "修改后启动失败，回滚..."
         restore_file "$SNELL_CONF" "snell"
         systemctl restart snell
     fi
@@ -467,20 +481,14 @@ snell_modify_name() {
         return 1
     fi
     
-    local old_name=$(snell_get_node_name)
+    local old_name
+    old_name=$(snell_get_node_name)
     echo "当前名称: $old_name"
     
-    read -rp "新名称: " new_name
+    read -rp "新名称: " new_name || new_name=""
     [[ -z "$new_name" ]] && return 0
     
     echo "$new_name" > "$SNELL_DIR/node_name"
-    
-    # 更新流量监控备注
-    if declare -f traffic_add_port &>/dev/null; then
-        local port=$(snell_get_port)
-        # 更新备注逻辑可以在 traffic 模块中实现
-    fi
-    
     _green "名称已修改: $old_name -> $new_name"
 }
 
@@ -495,30 +503,27 @@ snell_uninstall() {
     
     confirm "确认卸载 Snell?" || return 0
     
-    local port=$(snell_get_port)
+    local port
+    port=$(snell_get_port)
     
-    systemctl stop snell &>/dev/null
-    systemctl disable snell &>/dev/null
+    systemctl stop snell &>/dev/null || true
+    systemctl disable snell &>/dev/null || true
     rm -f "$SNELL_SERVICE"
     rm -f "$SNELL_BIN"
     rm -rf "$SNELL_DIR"
     systemctl daemon-reload
     
-    # 清理防火墙
-    [[ -n "$port" ]] && {
+    if [[ -n "$port" ]]; then
         firewall_remove "$port" tcp
         firewall_remove "$port" udp
-    }
-    
-    # 联动移除流量监控
-    if declare -f traffic_remove_port &>/dev/null && [[ -n "$port" ]]; then
-        log_info "联动: 移除端口流量监控..."
-        traffic_remove_port "$port"
+        if declare -f traffic_remove_port &>/dev/null; then
+            traffic_remove_port "$port"
+        fi
     fi
     
-    # Telegram 通知
-    if [[ $(config_get '.telegram.enabled' 'false') == "true" ]]; then
-        local server_name=$(config_get '.telegram.server_name' "$(hostname)")
+    if [[ "$(config_get '.telegram.enabled' 'false')" == "true" ]]; then
+        local server_name
+        server_name=$(config_get '.telegram.server_name' "$(hostname)")
         telegram_send "❌ <b>Snell 已卸载</b>
 服务器: $server_name"
     fi
@@ -550,8 +555,9 @@ snell_logs() {
 # ============================================================================
 snell_menu() {
     while true; do
-        local status=$(snell_get_status)
-        local installed_ver=$(snell_get_installed_version)
+        local status installed_ver
+        status=$(snell_get_status)
+        installed_ver=$(snell_get_installed_version)
         
         clear
         echo
@@ -560,13 +566,12 @@ snell_menu() {
         echo "============================================"
         echo
         
-        case $status in
+        case "$status" in
             running)
                 echo "  状态: $(_green "运行中")"
                 echo "  版本: ${installed_ver:-未知}"
                 echo "  端口: $(snell_get_port)"
                 
-                # 检查更新提示
                 snell_detect_version "silent"
                 if [[ -n "$installed_ver" && -n "$SNELL_VERSION" ]]; then
                     compare_versions "$installed_ver" "$SNELL_VERSION" || true
@@ -587,7 +592,7 @@ snell_menu() {
         echo "--------------------------------------------"
         echo
         
-        if [[ $status == "not_installed" ]]; then
+        if [[ "$status" == "not_installed" ]]; then
             echo "  1. 安装 Snell"
         else
             echo "  1. 查看配置"
@@ -609,15 +614,16 @@ snell_menu() {
         echo
         echo "============================================"
         echo
-        read -rp "请选择: " choice
+        read -rp "请选择: " choice || choice=""
         
-        if [[ $status == "not_installed" ]]; then
-            case $choice in
+        if [[ "$status" == "not_installed" ]]; then
+            case "$choice" in
                 1) snell_install; pause ;;
-                0) return ;;
+                0|"") return ;;
+                *) _yellow "无效选择"; sleep 0.5 ;;
             esac
         else
-            case $choice in
+            case "$choice" in
                 1) snell_show_config; pause ;;
                 2) snell_modify_port; pause ;;
                 3) snell_modify_psk; pause ;;
@@ -627,11 +633,10 @@ snell_menu() {
                 7) snell_stop; sleep 1 ;;
                 8) snell_restart; sleep 1 ;;
                 9) snell_logs; pause ;;
-                10) snell_uninstall; pause; [[ ! -f "$SNELL_BIN" ]] && return ;;
-                0) return ;;
+                10) snell_uninstall; pause; snell_check_installed || return ;;
+                0|"") return ;;
+                *) _yellow "无效选择"; sleep 0.5 ;;
             esac
         fi
     done
 }
-
-log_debug "Snell 模块已加载"

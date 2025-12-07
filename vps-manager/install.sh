@@ -20,7 +20,10 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 # 检查 root
-[[ $EUID -ne 0 ]] && { log_error "请使用 root 用户运行"; exit 1; }
+if [[ $EUID -ne 0 ]]; then
+    log_error "请使用 root 用户运行"
+    exit 1
+fi
 
 echo
 echo "============================================"
@@ -28,21 +31,35 @@ echo "        VPS Manager 安装程序"
 echo "============================================"
 echo
 
-# 检测系统
+# 检测系统和包管理器
+PKG_UPDATE="true"
+PKG_INSTALL="true"
+
 if command -v apt-get &>/dev/null; then
+    PKG_UPDATE="apt-get update -y"
     PKG_INSTALL="apt-get install -y"
-    apt-get update -y &>/dev/null || true
+elif command -v dnf &>/dev/null; then
+    PKG_UPDATE="dnf makecache"
+    PKG_INSTALL="dnf install -y"
 elif command -v yum &>/dev/null; then
+    PKG_UPDATE="yum makecache"
     PKG_INSTALL="yum install -y"
-else
-    log_error "不支持的系统"
-    exit 1
+elif command -v apk &>/dev/null; then
+    PKG_UPDATE="apk update"
+    PKG_INSTALL="apk add"
 fi
 
 # 安装依赖
 log_info "安装依赖..."
+$PKG_UPDATE &>/dev/null || true
+
 for pkg in curl wget jq bc nftables; do
-    command -v $pkg &>/dev/null || $PKG_INSTALL $pkg &>/dev/null || true
+    if ! command -v "$pkg" &>/dev/null; then
+        case "$pkg" in
+            nftables) $PKG_INSTALL nftables &>/dev/null || true ;;
+            *) $PKG_INSTALL "$pkg" &>/dev/null || true ;;
+        esac
+    fi
 done
 
 # 创建目录
@@ -64,7 +81,7 @@ FILES=(
 
 for file in "${FILES[@]}"; do
     log_info "  下载 $file..."
-    if ! curl -sfL -o "$INSTALL_DIR/$file" "$REPO_URL/$file"; then
+    if ! curl -sfL --connect-timeout 30 --max-time 60 -o "$INSTALL_DIR/$file" "$REPO_URL/$file"; then
         log_error "下载失败: $file"
         exit 1
     fi
