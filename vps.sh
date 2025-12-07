@@ -64,13 +64,20 @@ check_dependencies() {
 
     # 检查可选工具（缺失时会影响功能但不会完全无法使用）
     command -v bc >/dev/null 2>&1 || optional_missing+=("bc")
+    command -v awk >/dev/null 2>&1 || optional_missing+=("awk")
     command -v nft >/dev/null 2>&1 || optional_missing+=("nftables")
     command -v ss >/dev/null 2>&1 || optional_missing+=("iproute2")
 
     if [ ${#missing[@]} -gt 0 ]; then
-        warn "缺少必需工具: ${missing[*]}"
-        warn "请安装: apt install ${missing[*]} 或 yum install ${missing[*]}"
+        error "缺少必需工具: ${missing[*]}"
+        error "vps.sh 需要 jq 来解析 JSON 配置文件"
         echo ""
+        error "请先安装缺失的工具："
+        echo "  Debian/Ubuntu: apt install ${missing[*]}"
+        echo "  CentOS/RHEL:   yum install ${missing[*]}"
+        echo "  macOS:         brew install ${missing[*]}"
+        echo ""
+        exit 1
     fi
 
     if [ ${#optional_missing[@]} -gt 0 ]; then
@@ -156,13 +163,13 @@ get_port_traffic() {
 format_bytes() {
     local bytes=${1:-0}
     if [ "$bytes" -ge 1099511627776 ]; then
-        printf "%.2fTB" "$(echo "scale=2; $bytes / 1099511627776" | bc)"
+        awk "BEGIN {printf \"%.2fTB\", $bytes/1099511627776}"
     elif [ "$bytes" -ge 1073741824 ]; then
-        printf "%.2fGB" "$(echo "scale=2; $bytes / 1073741824" | bc)"
+        awk "BEGIN {printf \"%.2fGB\", $bytes/1073741824}"
     elif [ "$bytes" -ge 1048576 ]; then
-        printf "%.2fMB" "$(echo "scale=2; $bytes / 1048576" | bc)"
+        awk "BEGIN {printf \"%.2fMB\", $bytes/1048576}"
     elif [ "$bytes" -ge 1024 ]; then
-        printf "%.2fKB" "$(echo "scale=2; $bytes / 1024" | bc)"
+        awk "BEGIN {printf \"%.2fKB\", $bytes/1024}"
     else
         echo "${bytes}B"
     fi
@@ -203,10 +210,10 @@ show_status() {
             local configs=$(get_singbox_ports)
             if [ -n "$configs" ]; then
                 echo -e "  配置:"
-                echo "$configs" | while IFS='|' read port proto; do
+                while IFS='|' read -r port proto; do
                     local traffic=$(get_port_traffic "$port")
                     printf "    ${CYAN}%-6s${RESET} %-20s 流量: ${YELLOW}%s${RESET}\n" "$port" "($proto)" "$traffic"
-                done
+                done < <(echo "$configs")
             else
                 echo -e "  配置: ${YELLOW}无${RESET}"
             fi
