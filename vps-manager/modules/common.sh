@@ -503,37 +503,38 @@ safe_mktemp() {
     local suffix="${1:-}"
     local tmp_file
 
-    # GNU mktemp (Linux)
-    if mktemp --help 2>&1 | grep -q -- '--suffix'; then
-        if [[ -n "$suffix" ]]; then
-            tmp_file=$(mktemp --suffix="$suffix")
-        else
-            tmp_file=$(mktemp)
-        fi
-    # BSD mktemp (macOS)
+    # 尝试 GNU mktemp (Linux)
+    if [[ -n "$suffix" ]]; then
+        tmp_file=$(mktemp --suffix="$suffix" 2>/dev/null) || \
+        tmp_file=$(mktemp -t "vps.XXXXXX${suffix}" 2>/dev/null)
     else
-        if [[ -n "$suffix" ]]; then
-            tmp_file=$(mktemp -t "vps.XXXXXX${suffix}")
-        else
-            tmp_file=$(mktemp -t "vps.XXXXXX")
-        fi
+        tmp_file=$(mktemp 2>/dev/null) || \
+        tmp_file=$(mktemp -t "vps.XXXXXX" 2>/dev/null)
+    fi
+
+    # 检查是否成功
+    if [[ -z "$tmp_file" || ! -e "$tmp_file" ]]; then
+        return 1
     fi
 
     echo "$tmp_file"
+    return 0
 }
 
 safe_mktemp_dir() {
     local tmp_dir
 
-    # GNU mktemp (Linux)
-    if mktemp --help 2>&1 | grep -q -- '--suffix'; then
-        tmp_dir=$(mktemp -d)
-    # BSD mktemp (macOS)
-    else
-        tmp_dir=$(mktemp -d -t "vps.XXXXXX")
+    # 尝试 GNU mktemp (Linux) 和 BSD mktemp (macOS)
+    tmp_dir=$(mktemp -d 2>/dev/null) || \
+    tmp_dir=$(mktemp -d -t "vps.XXXXXX" 2>/dev/null)
+
+    # 检查是否成功
+    if [[ -z "$tmp_dir" || ! -d "$tmp_dir" ]]; then
+        return 1
     fi
 
     echo "$tmp_dir"
+    return 0
 }
 
 get_ip() {
