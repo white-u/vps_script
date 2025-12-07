@@ -78,8 +78,8 @@ singbox_install() {
     # 下载
     local url tmp_file tmp_dir
     url="https://github.com/$SINGBOX_REPO/releases/download/v${version}/sing-box-${version}-linux-${ARCH:-amd64}.tar.gz"
-    tmp_file=$(mktemp --suffix=.tar.gz) || { log_error "无法创建临时文件"; return 1; }
-    tmp_dir=$(mktemp -d) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
+    tmp_file=$(safe_mktemp ".tar.gz") || { log_error "无法创建临时文件"; return 1; }
+    tmp_dir=$(safe_mktemp_dir) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
 
     log_info "下载: $url"
     if ! download_file "$url" "$tmp_file"; then
@@ -599,8 +599,8 @@ singbox_update() {
     
     local url tmp_file tmp_dir
     url="https://github.com/$SINGBOX_REPO/releases/download/v${latest}/sing-box-${latest}-linux-${ARCH:-amd64}.tar.gz"
-    tmp_file=$(mktemp --suffix=.tar.gz) || { log_error "无法创建临时文件"; return 1; }
-    tmp_dir=$(mktemp -d) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
+    tmp_file=$(safe_mktemp ".tar.gz") || { log_error "无法创建临时文件"; return 1; }
+    tmp_dir=$(safe_mktemp_dir) || { rm -f "$tmp_file"; log_error "无法创建临时目录"; return 1; }
 
     backup_binary "$SINGBOX_BIN" "sing-box"
 

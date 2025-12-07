@@ -181,7 +181,7 @@ snell_install() {
     # 下载
     local url tmp_zip
     url=$(snell_get_download_url)
-    tmp_zip=$(mktemp --suffix=.zip) || { log_error "无法创建临时文件"; return 1; }
+    tmp_zip=$(safe_mktemp ".zip") || { log_error "无法创建临时文件"; return 1; }
 
     log_info "下载: $url"
     if ! download_file "$url" "$tmp_zip"; then
@@ -318,7 +318,7 @@ snell_update() {
     # 下载
     local url tmp_zip
     url=$(snell_get_download_url)
-    tmp_zip=$(mktemp --suffix=.zip) || { log_error "无法创建临时文件"; restore_binary "$SNELL_BIN" "snell"; systemctl start snell; return 1; }
+    tmp_zip=$(safe_mktemp ".zip") || { log_error "无法创建临时文件"; restore_binary "$SNELL_BIN" "snell"; systemctl start snell; return 1; }
 
     if ! download_file "$url" "$tmp_zip"; then
         log_error "下载失败"

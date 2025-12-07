@@ -172,7 +172,7 @@ traffic_add_port() {
     
     # 更新配置
     local tmp
-    tmp=$(mktemp) || { log_error "无法创建临时文件"; return 1; }
+    tmp=$(safe_mktemp) || { log_error "无法创建临时文件"; return 1; }
 
     # 使用 jq 的 --arg 参数安全传递字符串，避免注入
     if jq --arg remark "$remark" --arg created "$(date -Iseconds)" \
@@ -194,7 +194,7 @@ traffic_remove_port() {
     
     # 更新配置
     local tmp
-    tmp=$(mktemp) || { log_error "无法创建临时文件"; return 1; }
+    tmp=$(safe_mktemp) || { log_error "无法创建临时文件"; return 1; }
     if jq "del(.ports.\"$port\")" "$TRAFFIC_DATA" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$TRAFFIC_DATA"
     else
@@ -405,7 +405,7 @@ traffic_set_remark() {
     read -rp "新备注 (留空清除): " new_remark || new_remark=""
 
     local tmp
-    tmp=$(mktemp) || { _red "无法创建临时文件"; return 1; }
+    tmp=$(safe_mktemp) || { _red "无法创建临时文件"; return 1; }
 
     # 使用 jq 的 --arg 参数安全传递字符串
     if jq --arg remark "$new_remark" --arg port "$port" \

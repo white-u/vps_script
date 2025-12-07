@@ -265,7 +265,7 @@ config_get() {
 config_set() {
     local expr="$1"
     local tmp
-    tmp=$(mktemp) || return 1
+    tmp=$(safe_mktemp) || return 1
 
     if jq "$expr" "$VPS_CONFIG" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$VPS_CONFIG"
@@ -498,6 +498,44 @@ EOF
 # ============================================================================
 # 工具函数
 # ============================================================================
+# 跨平台兼容的临时文件创建
+safe_mktemp() {
+    local suffix="${1:-}"
+    local tmp_file
+
+    # GNU mktemp (Linux)
+    if mktemp --help 2>&1 | grep -q -- '--suffix'; then
+        if [[ -n "$suffix" ]]; then
+            tmp_file=$(mktemp --suffix="$suffix")
+        else
+            tmp_file=$(mktemp)
+        fi
+    # BSD mktemp (macOS)
+    else
+        if [[ -n "$suffix" ]]; then
+            tmp_file=$(mktemp -t "vps.XXXXXX${suffix}")
+        else
+            tmp_file=$(mktemp -t "vps.XXXXXX")
+        fi
+    fi
+
+    echo "$tmp_file"
+}
+
+safe_mktemp_dir() {
+    local tmp_dir
+
+    # GNU mktemp (Linux)
+    if mktemp --help 2>&1 | grep -q -- '--suffix'; then
+        tmp_dir=$(mktemp -d)
+    # BSD mktemp (macOS)
+    else
+        tmp_dir=$(mktemp -d -t "vps.XXXXXX")
+    fi
+
+    echo "$tmp_dir"
+}
+
 get_ip() {
     local ipv4 ipv6
     ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null || curl -s4m5 ifconfig.me 2>/dev/null || echo "")
@@ -594,7 +632,7 @@ self_update() {
         if confirm "是否更新?"; then
             log_info "下载更新..."
             local tmp_script
-            tmp_script=$(mktemp --suffix=.sh) || { _red "无法创建临时文件"; return 1; }
+            tmp_script=$(safe_mktemp ".sh") || { _red "无法创建临时文件"; return 1; }
             if download_file "https://raw.githubusercontent.com/$VPS_REPO/$VPS_BRANCH/vps-manager/install.sh" "$tmp_script"; then
                 chmod +x "$tmp_script"
                 exec bash "$tmp_script"
