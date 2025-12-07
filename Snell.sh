@@ -653,13 +653,27 @@ install_snell() {
   rm -f "$TMP_DOWNLOAD"
   chmod +x "$SNELL_BIN" || warn "设置执行位失败"
 
-  # 创建快捷别名
-  if [ ! -f /usr/local/bin/snell ]; then
-    local script_path; script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [ -f "$script_path" ] && [ "$script_path" != "bash" ]; then
-      ln -sf "$script_path" /usr/local/bin/snell || warn "创建快捷别名失败（非致命）"
-      log "已创建快捷命令：snell"
+  # 安装管理脚本
+  log "安装管理脚本..."
+  local script_path; script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  local script_target="/usr/local/bin/snell-manager.sh"
+
+  # 如果是从 stdin 运行 (curl | bash)，则下载脚本
+  if [[ ! -f "$script_path" || "$script_path" =~ bash$ || "$script_path" == "/dev/stdin" ]]; then
+    if wget --no-check-certificate -q -O "$script_target" "$SCRIPT_URL"; then
+      log "管理脚本已下载"
+    else
+      warn "管理脚本下载失败，将无法使用快捷命令"
     fi
+  else
+    cp "$script_path" "$script_target" || warn "复制管理脚本失败"
+  fi
+
+  # 创建快捷别名
+  if [ -f "$script_target" ]; then
+    chmod +x "$script_target"
+    ln -sf "$script_target" /usr/local/bin/snell
+    log "已创建快捷命令：snell"
   fi
 
   # 创建用户
@@ -1018,7 +1032,7 @@ EOF
 # =====================================
 modify_config() {
   if [ ! -f "$SNELL_CONF" ]; then err "未检测到安装或配置文件，请先安装"; return 1; fi
-  
+
   echo ""
   echo "1) 修改端口"
   echo "2) 修改名称"
@@ -1026,7 +1040,7 @@ modify_config() {
   echo "0) 返回"
   printf "${BLUE}请选择: ${RESET}"
   read -r sub_opt || true
-  
+
   case "$sub_opt" in
     1) modify_port ;;
     2) modify_name ;;
@@ -1107,15 +1121,8 @@ update_script() {
     fi
   fi
   
-  # 确定脚本路径
-  local script_path
-  script_path=$(readlink -f "$0" 2>/dev/null || echo "")
-  
-  # 检查是否通过管道执行 (curl | bash)
-  if [ -z "$script_path" ] || [ "$script_path" = "bash" ] || [ ! -f "$script_path" ]; then
-    warn "检测到通过管道执行，将保存到 /usr/local/bin/snell-manager.sh"
-    script_path="/usr/local/bin/snell-manager.sh"
-  fi
+  # 使用固定路径
+  local script_path="/usr/local/bin/snell-manager.sh"
   
   # 下载新脚本
   log "正在下载新版本..."
@@ -1142,7 +1149,13 @@ update_script() {
   # 替换脚本
   chmod +x "$tmp_script"
   mv -f "$tmp_script" "$script_path"
-  
+
+  # 确保快捷别名存在
+  if [ ! -L /usr/local/bin/snell ]; then
+    ln -sf "$script_path" /usr/local/bin/snell
+    log "已创建快捷命令：snell"
+  fi
+
   log "脚本已更新到 v${remote_version}"
   log "保存位置: $script_path"
   log "3 秒后重新执行..."
