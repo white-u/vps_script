@@ -484,6 +484,149 @@ firewalld_remove() {
 }
 
 # =====================================
+# 自动流量监控 (port-manage.sh 集成)
+# =====================================
+auto_add_traffic_monitor() {
+  local port="$1"
+  local remark="${2:-Snell Server}"
+
+  # 检查 port-manage.sh 是否已安装
+  local ptm_config="/etc/port-traffic-monitor/config.json"
+  if [[ ! -f "$ptm_config" ]]; then
+    return 0  # 未安装，静默跳过
+  fi
+
+  # 检查 jq 是否可用
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "缺少 jq 命令，无法自动添加流量监控"
+    return 1
+  fi
+
+  # 检查端口是否已存在
+  if jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
+    log "端口 $port 已在流量监控中"
+    return 0
+  fi
+
+  log "自动添加端口 $port 到流量监控..."
+
+  # 读取 nftables 配置
+  local nft_table nft_family
+  nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
+  nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
+
+  # 构建配置 JSON
+  local timestamp; timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+  local config_json
+  config_json=$(cat <<EOF
+{
+  "billing": "single",
+  "quota": {
+    "limit": "unlimited",
+    "reset_day": null
+  },
+  "bandwidth": {
+    "rate": "unlimited"
+  },
+  "remark": "$remark",
+  "created": "$timestamp"
+}
+EOF
+)
+
+  # 更新配置文件
+  local tmp_config="${ptm_config}.tmp.$$"
+  if jq ".ports.\"$port\" = $config_json" "$ptm_config" > "$tmp_config" 2>/dev/null; then
+    mv "$tmp_config" "$ptm_config" || {
+      rm -f "$tmp_config"
+      warn "更新流量监控配置失败"
+      return 1
+    }
+  else
+    rm -f "$tmp_config"
+    warn "生成流量监控配置失败"
+    return 1
+  fi
+
+  # 添加 nftables 规则
+  local port_safe; port_safe=$(echo "$port" | tr '-' '_')
+
+  # 创建计数器
+  nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" >/dev/null 2>&1 || \
+    nft add counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
+  nft list counter "$nft_family" "$nft_table" "port_${port_safe}_out" >/dev/null 2>&1 || \
+    nft add counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
+
+  # 添加规则
+  local proto
+  for proto in tcp udp; do
+    nft add rule "$nft_family" "$nft_table" input "$proto" dport "$port" counter name "port_${port_safe}_in" 2>/dev/null || true
+    nft add rule "$nft_family" "$nft_table" forward "$proto" dport "$port" counter name "port_${port_safe}_in" 2>/dev/null || true
+    nft add rule "$nft_family" "$nft_table" output "$proto" sport "$port" counter name "port_${port_safe}_out" 2>/dev/null || true
+    nft add rule "$nft_family" "$nft_table" forward "$proto" sport "$port" counter name "port_${port_safe}_out" 2>/dev/null || true
+  done
+
+  log "✓ 已自动添加端口 $port 到流量监控（仅统计，无限制）"
+  echo "  使用 'ptm' 命令查看流量统计"
+}
+
+auto_remove_traffic_monitor() {
+  local port="$1"
+
+  # 检查 port-manage.sh 是否已安装
+  local ptm_config="/etc/port-traffic-monitor/config.json"
+  if [[ ! -f "$ptm_config" ]]; then
+    return 0  # 未安装，跳过
+  fi
+
+  # 检查 jq 是否可用
+  if ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # 检查端口是否存在
+  if ! jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
+    return 0  # 端口不存在，跳过
+  fi
+
+  log "自动移除端口 $port 的流量监控..."
+
+  # 读取 nftables 配置
+  local nft_table nft_family
+  nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
+  nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
+  local port_safe; port_safe=$(echo "$port" | tr '-' '_')
+
+  # 删除 nftables 规则
+  local deleted=0
+  while [ $deleted -lt 50 ]; do
+    local handle
+    handle=$(nft -a list table "$nft_family" "$nft_table" 2>/dev/null | \
+      grep -E "port_${port_safe}_" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
+    [ -z "$handle" ] && break
+    local chain
+    for chain in input output forward; do
+      nft delete rule "$nft_family" "$nft_table" "$chain" handle "$handle" 2>/dev/null && break
+    done
+    deleted=$((deleted + 1))
+  done
+
+  # 删除计数器
+  nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
+  nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
+
+  # 更新配置文件
+  local tmp_config="${ptm_config}.tmp.$$"
+  if jq "del(.ports.\"$port\")" "$ptm_config" > "$tmp_config" 2>/dev/null; then
+    mv "$tmp_config" "$ptm_config" || rm -f "$tmp_config"
+  else
+    rm -f "$tmp_config"
+  fi
+
+  log "✓ 已移除端口 $port 的流量监控"
+}
+
+# =====================================
 # 显示配置
 # =====================================
 show_port_psk() {
@@ -702,6 +845,10 @@ install_snell() {
     echo ""
     echo "=== Surge 配置（可直接复制） ==="
     cat "$SNELL_CFGTXT"
+
+    # 自动添加流量监控
+    echo ""
+    auto_add_traffic_monitor "$port" "Snell Server"
   else
     err "服务未能启动，尝试回滚二进制并输出日志"
     journalctl -u snell -n 50 --no-pager || true
@@ -835,14 +982,17 @@ uninstall_snell() {
   if [ -n "$cur_port" ]; then
     ufw_remove "$cur_port"
     firewalld_remove "$cur_port"
+
+    # 移除流量监控
+    auto_remove_traffic_monitor "$cur_port"
   fi
-  
+
   # 移除网络优化配置
   remove_tcp_optimization
-  
+
   # 清理缓存
   rm -f "$VERSION_CACHE"
-  
+
   log "卸载完成"
 }
 
@@ -896,6 +1046,12 @@ EOF
   # 重启验证
   if restart_check; then
     log "端口修改成功：${cur_port} -> ${new_port}"
+
+    # 更新流量监控
+    if [ -n "$cur_port" ]; then
+      auto_remove_traffic_monitor "$cur_port"
+    fi
+    auto_add_traffic_monitor "$new_port" "Snell Server"
   else
     err "修改端口失败，正在回滚配置..."
     local lastbak; lastbak=$(ls -1t ${SNELL_CONF}.bak.* 2>/dev/null | head -n1 || true)
