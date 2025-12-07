@@ -55,6 +55,32 @@ check_root() {
     fi
 }
 
+check_dependencies() {
+    local missing=()
+    local optional_missing=()
+
+    # 检查必需工具
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+
+    # 检查可选工具（缺失时会影响功能但不会完全无法使用）
+    command -v bc >/dev/null 2>&1 || optional_missing+=("bc")
+    command -v nft >/dev/null 2>&1 || optional_missing+=("nftables")
+    command -v ss >/dev/null 2>&1 || optional_missing+=("iproute2")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "缺少必需工具: ${missing[*]}"
+        warn "请安装: apt install ${missing[*]} 或 yum install ${missing[*]}"
+        echo ""
+    fi
+
+    if [ ${#optional_missing[@]} -gt 0 ]; then
+        warn "缺少可选工具: ${optional_missing[*]}"
+        warn "部分功能可能受限（流量统计、端口检查等）"
+        warn "建议安装: apt install ${optional_missing[*]} 或 yum install ${optional_missing[*]}"
+        echo ""
+    fi
+}
+
 # =====================================
 # 服务检测
 # =====================================
@@ -82,11 +108,11 @@ is_singbox_running() {
 
 get_singbox_ports() {
     if [ -d /etc/sing-box/conf ]; then
-        find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null | while read conf; do
+        while read -r conf; do
             local port=$(jq -r '.inbounds[0].listen_port' "$conf" 2>/dev/null)
             local proto=$(jq -r '.inbounds[0].type' "$conf" 2>/dev/null)
             [ -n "$port" ] && echo "$port|$proto"
-        done
+        done < <(find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null)
     fi
 }
 
@@ -237,13 +263,15 @@ health_check() {
         if is_singbox_running; then
             local configs=$(get_singbox_ports)
             if [ -n "$configs" ]; then
-                echo "$configs" | while IFS='|' read port proto; do
+                while IFS='|' read -r port proto; do
+                    ((total++))
                     if ss -tuln 2>/dev/null | grep -q ":$port "; then
                         success "sing-box 端口 $port ($proto) 正常监听"
                     else
                         fail "sing-box 端口 $port ($proto) 监听失败"
+                        ((failed++))
                     fi
-                done
+                done < <(echo "$configs")
             fi
         else
             ((total++))
@@ -413,7 +441,7 @@ uninstall_all() {
 
         # 获取所有端口用于清理防火墙
         if [ -d /etc/sing-box/conf ]; then
-            find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null | while read conf; do
+            while read -r conf; do
                 local port=$(jq -r '.inbounds[0].listen_port' "$conf" 2>/dev/null)
                 if [ -n "$port" ]; then
                     ufw delete allow "$port"/tcp 2>/dev/null || true
@@ -421,7 +449,7 @@ uninstall_all() {
                     firewall-cmd --permanent --remove-port="${port}"/tcp 2>/dev/null || true
                     firewall-cmd --permanent --remove-port="${port}"/udp 2>/dev/null || true
                 fi
-            done
+            done < <(find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null)
         fi
 
         # 删除文件
@@ -546,19 +574,19 @@ install_component() {
         1)
             if ! is_snell_installed; then
                 log "开始安装 Snell..."
-                bash <(curl -sL "$SNELL_SCRIPT_URL")
+                bash <(curl -fsSL "$SNELL_SCRIPT_URL")
             fi
             ;;
         2)
             if ! is_singbox_installed; then
                 log "开始安装 sing-box..."
-                bash <(curl -sL "$SINGBOX_SCRIPT_URL")
+                bash <(curl -fsSL "$SINGBOX_SCRIPT_URL")
             fi
             ;;
         3)
             if ! is_ptm_installed; then
                 log "开始安装 port-manage..."
-                bash <(curl -sL "$PTM_SCRIPT_URL")
+                bash <(curl -fsSL "$PTM_SCRIPT_URL")
             fi
             ;;
         4)
@@ -568,9 +596,15 @@ install_component() {
             # 下载 system-optimize.sh
             if curl -fsSL "${SCRIPT_URL%/*}/system-optimize.sh" -o "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null || \
                wget -q "${SCRIPT_URL%/*}/system-optimize.sh" -O "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null; then
-                chmod +x "${SCRIPT_DIR}/system-optimize.sh"
-                success "system-optimize.sh 下载成功"
-                ((success_count++))
+                # 验证语法
+                if bash -n "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null; then
+                    chmod +x "${SCRIPT_DIR}/system-optimize.sh"
+                    success "system-optimize.sh 下载并验证成功"
+                    ((success_count++))
+                else
+                    rm -f "${SCRIPT_DIR}/system-optimize.sh"
+                    error "system-optimize.sh 语法错误，已删除"
+                fi
             else
                 error "system-optimize.sh 下载失败"
             fi
@@ -578,9 +612,15 @@ install_component() {
             # 下载 telegram-notify.sh
             if curl -fsSL "${SCRIPT_URL%/*}/telegram-notify.sh" -o "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null || \
                wget -q "${SCRIPT_URL%/*}/telegram-notify.sh" -O "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null; then
-                chmod +x "${SCRIPT_DIR}/telegram-notify.sh"
-                success "telegram-notify.sh 下载成功"
-                ((success_count++))
+                # 验证语法
+                if bash -n "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null; then
+                    chmod +x "${SCRIPT_DIR}/telegram-notify.sh"
+                    success "telegram-notify.sh 下载并验证成功"
+                    ((success_count++))
+                else
+                    rm -f "${SCRIPT_DIR}/telegram-notify.sh"
+                    error "telegram-notify.sh 语法错误，已删除"
+                fi
             else
                 error "telegram-notify.sh 下载失败"
             fi
@@ -709,9 +749,17 @@ EOF
 # =====================================
 main() {
     check_root
+    check_dependencies
 
     # 创建快捷命令（如果不存在）
-    local script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    local script_path
+    if readlink -f "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+        script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    else
+        # macOS 兼容性：readlink 不支持 -f
+        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    fi
+
     if [ ! -L /usr/local/bin/vps ] && [ -f "$script_path" ]; then
         ln -sf "$script_path" /usr/local/bin/vps 2>/dev/null && \
             log "已创建快捷命令：vps" || true
@@ -736,7 +784,7 @@ main() {
                     error "Snell 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -sL "$SNELL_SCRIPT_URL")
+                        bash <(curl -fsSL "$SNELL_SCRIPT_URL")
                     fi
                 fi
                 ;;
@@ -747,7 +795,7 @@ main() {
                     error "sing-box 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -sL "$SINGBOX_SCRIPT_URL")
+                        bash <(curl -fsSL "$SINGBOX_SCRIPT_URL")
                     fi
                 fi
                 ;;
@@ -758,7 +806,7 @@ main() {
                     error "port-manage 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -sL "$PTM_SCRIPT_URL")
+                        bash <(curl -fsSL "$PTM_SCRIPT_URL")
                     fi
                 fi
                 ;;
