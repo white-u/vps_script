@@ -37,16 +37,34 @@ load_system_optimize_module() {
 
     # 本地不存在或加载失败，尝试下载
     _yellow "system-optimize.sh 模块未找到，尝试自动下载..."
-    if curl -sL "${REPO_URL}/system-optimize.sh" -o "$module_file" 2>/dev/null; then
-        chmod +x "$module_file"
-        if source "$module_file" 2>/dev/null; then
-            _green "system-optimize.sh 模块下载并加载成功"
-            return 0
+
+    # 尝试使用 curl 下载
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL "${REPO_URL}/system-optimize.sh" -o "$module_file" 2>/dev/null; then
+            chmod +x "$module_file"
+            if [ -s "$module_file" ] && source "$module_file" 2>/dev/null; then
+                _green "system-optimize.sh 模块下载并加载成功"
+                return 0
+            fi
         fi
     fi
 
-    # 下载失败，返回错误
+    # 尝试使用 wget 下载
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q "${REPO_URL}/system-optimize.sh" -O "$module_file" 2>/dev/null; then
+            chmod +x "$module_file"
+            if [ -s "$module_file" ] && source "$module_file" 2>/dev/null; then
+                _green "system-optimize.sh 模块下载并加载成功"
+                return 0
+            fi
+        fi
+    fi
+
+    # 下载失败，清理并返回错误
+    [ -f "$module_file" ] && rm -f "$module_file"
     _yellow "无法加载 system-optimize.sh 模块，将使用内置功能"
+    _yellow "提示：如需完整功能，请手动下载模块文件："
+    _yellow "  curl -O ${REPO_URL}/system-optimize.sh"
     return 1
 }
 
