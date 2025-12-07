@@ -45,6 +45,7 @@ BACKUP_DIR="/var/backups/snell-manager"
 TMP_DOWNLOAD="/tmp/snell-server.zip"
 VERSION_CACHE="/tmp/snell_version_cache"
 DL_BASE="https://dl.nssurge.com/snell"
+SNELL_LOG="/var/log/snell.log"
 
 # =====================================
 # 日志函数
@@ -373,8 +374,8 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
 Restart=on-failure
 RestartSec=5s
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:${SNELL_LOG}
+StandardError=append:${SNELL_LOG}
 SyslogIdentifier=snell-server
 
 [Install]
@@ -387,6 +388,18 @@ EOF
 # =====================================
 # PSK 和配置文件
 # =====================================
+get_ip() {
+  local ipv4 ipv6 addr
+  ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null || curl -s4m5 checkip.amazonaws.com 2>/dev/null)
+  ipv6=$(curl -s6m5 ip.sb 2>/dev/null)
+  addr=${ipv4:-$ipv6}
+  if [ -z "$addr" ]; then
+    echo "0.0.0.0"
+  else
+    echo "$addr"
+  fi
+}
+
 generate_psk() {
   local psk
   psk=$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 20)
@@ -410,12 +423,12 @@ EOF
 
   # 记录版本
   echo "v${VERSION}" > "$SNELL_VERSION_FILE"
-  
+
   # 记录节点名称
   echo "$node_name" > "${SNELL_DIR}/node_name.txt"
 
   local ip
-  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
+  ip=$(get_ip)
   cat > "$SNELL_CFGTXT" <<EOF
 ${node_name} = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
@@ -499,6 +512,43 @@ show_config() {
     cat "$SNELL_CFGTXT"
   else
     warn "找不到配置文件：$SNELL_CFGTXT"
+  fi
+}
+
+# =====================================
+# 日志管理
+# =====================================
+show_log() {
+  local lines="${1:-50}"
+  if [ ! -f "$SNELL_LOG" ]; then
+    warn "日志文件不存在：$SNELL_LOG"
+    echo "您可以使用 journalctl 查看系统日志："
+    echo "  journalctl -u snell -n 50"
+    return 1
+  fi
+  echo "--- 最近 $lines 行日志 ---"
+  tail -n "$lines" "$SNELL_LOG"
+}
+
+follow_log() {
+  if [ ! -f "$SNELL_LOG" ]; then
+    warn "日志文件不存在，使用 journalctl 实时查看"
+    echo "按 Ctrl+C 退出..."
+    sleep 1
+    journalctl -u snell -f
+    return
+  fi
+  echo "实时日志 (Ctrl+C 退出):"
+  echo ""
+  tail -f "$SNELL_LOG"
+}
+
+clear_log() {
+  if [ -f "$SNELL_LOG" ]; then
+    > "$SNELL_LOG"
+    log "日志已清空"
+  else
+    warn "日志文件不存在"
   fi
 }
 
@@ -602,6 +652,15 @@ install_snell() {
   fi
   rm -f "$TMP_DOWNLOAD"
   chmod +x "$SNELL_BIN" || warn "设置执行位失败"
+
+  # 创建快捷别名
+  if [ ! -f /usr/local/bin/snell ]; then
+    local script_path; script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    if [ -f "$script_path" ] && [ "$script_path" != "bash" ]; then
+      ln -sf "$script_path" /usr/local/bin/snell || warn "创建快捷别名失败（非致命）"
+      log "已创建快捷命令：snell"
+    fi
+  fi
 
   # 创建用户
   if ! id -u snell >/dev/null 2>&1; then
@@ -801,7 +860,7 @@ modify_port() {
 
   # 更新人类可读配置
   local ip node_name
-  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
+  ip=$(get_ip)
   # 读取已保存的节点名称，如果不存在则使用主机名
   if [ -f "${SNELL_DIR}/node_name.txt" ]; then
     node_name=$(cat "${SNELL_DIR}/node_name.txt")
@@ -877,8 +936,8 @@ modify_name() {
   local cur_port cur_psk ip
   cur_port=$(grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
   cur_psk=$(grep -E '^psk' "$SNELL_CONF" | awk -F'=' '{print $2}' | xargs || echo "")
-  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
-  
+  ip=$(get_ip)
+
   cat > "$SNELL_CFGTXT" <<EOF
 ${new_name} = snell, ${ip}, ${cur_port}, psk=${cur_psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
@@ -928,13 +987,13 @@ modify_psk() {
   # 更新 config.txt
   local cur_port node_name ip
   cur_port=$(grep -E '^listen' "$SNELL_CONF" | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
-  ip=$(curl -s --max-time 5 http://checkip.amazonaws.com || echo "0.0.0.0")
+  ip=$(get_ip)
   if [ -f "${SNELL_DIR}/node_name.txt" ]; then
     node_name=$(cat "${SNELL_DIR}/node_name.txt")
   else
     node_name=$(uname -n)
   fi
-  
+
   cat > "$SNELL_CFGTXT" <<EOF
 ${node_name} = snell, ${ip}, ${cur_port}, psk=${new_psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
@@ -1092,6 +1151,15 @@ update_script() {
 }
 
 # =====================================
+# 菜单辅助函数
+# =====================================
+pause_return() {
+  echo ""
+  echo -e "${YELLOW}按回车返回菜单...${RESET}"
+  read -r _
+}
+
+# =====================================
 # 菜单
 # =====================================
 menu() {
@@ -1141,21 +1209,23 @@ menu() {
     echo "5) 更新 Snell"
     echo "6) 查看配置"
     echo "7) 修改配置"
+    echo "8) 查看日志"
     echo -e "${GREEN}--- 系统设置 ---${RESET}"
-    echo "8) 网络优化开关 (TCP Fast Open + BBR)"
-    echo "9) 更新脚本"
+    echo "9) 网络优化开关 (TCP Fast Open + BBR)"
+    echo "10) 更新脚本"
     echo "0) 退出"
     printf "${BLUE}请选择: ${RESET}"
     read -r opt || true
     case "$opt" in
-      1) install_snell ;;
-      2) uninstall_snell ;;
-      3) 
+      1) install_snell; pause_return ;;
+      2) uninstall_snell; pause_return ;;
+      3)
         if [ ! -f "$SNELL_BIN" ]; then
           err "Snell 未安装"
         else
           systemctl start snell && sleep 1 && (systemctl is-active --quiet snell && log "已启动" || err "启动失败")
         fi
+        pause_return
         ;;
       4)
         if [ ! -f "$SNELL_BIN" ]; then
@@ -1163,22 +1233,204 @@ menu() {
         else
           systemctl stop snell && log "已停止"
         fi
+        pause_return
         ;;
-      5) update_snell ;;
-      6) show_config ;;
-      7) modify_config ;;
-      8) toggle_tcp_optimization ;;
-      9) update_script ;;
+      5) update_snell; pause_return ;;
+      6) show_config; pause_return ;;
+      7) modify_config; pause_return ;;
+      8)
+        echo ""
+        echo "1) 查看最近日志"
+        echo "2) 实时查看日志"
+        echo "3) 清空日志"
+        echo "0) 返回"
+        printf "${BLUE}请选择: ${RESET}"
+        read -r log_opt || true
+        case "$log_opt" in
+          1) show_log 100 ;;
+          2) follow_log ;;
+          3) clear_log ;;
+        esac
+        pause_return
+        ;;
+      9) toggle_tcp_optimization; pause_return ;;
+      10) update_script; pause_return ;;
       0) log "退出"; exit 0 ;;
-      *) warn "无效选项" ;;
+      *) warn "无效选项"; sleep 1 ;;
     esac
-    echo -e "${YELLOW}\n按回车返回菜单...${RESET}"
-    read -r _
   done
+}
+
+# =====================================
+# 帮助信息
+# =====================================
+show_help() {
+  cat <<EOF
+
+${GREEN}Snell 管理脚本 v${SCRIPT_VERSION}${RESET}
+
+用法: $(basename "$0") [命令]
+
+${GREEN}服务管理:${RESET}
+  start           启动 Snell 服务
+  stop            停止 Snell 服务
+  restart         重启 Snell 服务
+  status          查看服务状态
+
+${GREEN}配置管理:${RESET}
+  install         安装 Snell
+  uninstall       卸载 Snell
+  update          更新 Snell
+  info            查看配置信息
+  config          显示 Surge 配置
+
+${GREEN}修改配置:${RESET}
+  change-port     修改端口
+  change-name     修改名称
+  change-psk      修改 PSK
+
+${GREEN}日志管理:${RESET}
+  log [n]         查看最近 n 行日志（默认 50）
+  log-f           实时查看日志
+  log-clear       清空日志
+
+${GREEN}系统设置:${RESET}
+  enable-tfo      启用 TCP Fast Open
+  disable-tfo     禁用 TCP Fast Open
+  update-script   更新脚本
+
+${GREEN}其他:${RESET}
+  version         显示版本信息
+  help            显示此帮助
+
+不带参数运行进入交互式菜单。
+
+EOF
 }
 
 # =====================================
 # Main
 # =====================================
-check_root
-menu
+main() {
+  check_root
+
+  case "${1:-}" in
+    # 服务管理
+    start)
+      if [ ! -f "$SNELL_BIN" ]; then
+        err "Snell 未安装"
+        exit 1
+      fi
+      systemctl start snell
+      sleep 1
+      if systemctl is-active --quiet snell; then
+        log "Snell 已启动"
+      else
+        err "启动失败"
+        exit 1
+      fi
+      ;;
+    stop)
+      if [ ! -f "$SNELL_BIN" ]; then
+        err "Snell 未安装"
+        exit 1
+      fi
+      systemctl stop snell
+      log "Snell 已停止"
+      ;;
+    restart)
+      if [ ! -f "$SNELL_BIN" ]; then
+        err "Snell 未安装"
+        exit 1
+      fi
+      restart_check
+      ;;
+    status)
+      if [ ! -f "$SNELL_BIN" ]; then
+        err "Snell 未安装"
+        exit 1
+      fi
+      echo ""
+      if systemctl is-active --quiet snell; then
+        echo -e "状态: ${GREEN}运行中${RESET}"
+      else
+        echo -e "状态: ${RED}未运行${RESET}"
+      fi
+      local ver; ver=$(get_installed_version)
+      [ -n "$ver" ] && echo "版本: v$ver"
+      echo ""
+      ;;
+    # 配置管理
+    install)
+      install_snell
+      ;;
+    uninstall)
+      uninstall_snell
+      ;;
+    update)
+      update_snell
+      ;;
+    info)
+      show_port_psk
+      ;;
+    config)
+      show_config
+      ;;
+    # 修改配置
+    change-port)
+      modify_port
+      ;;
+    change-name)
+      modify_name
+      ;;
+    change-psk)
+      modify_psk
+      ;;
+    # 日志管理
+    log)
+      show_log "${2:-50}"
+      ;;
+    log-f)
+      follow_log
+      ;;
+    log-clear)
+      clear_log
+      ;;
+    # 系统设置
+    enable-tfo)
+      enable_tcp_fastopen
+      ;;
+    disable-tfo)
+      remove_tcp_optimization
+      ;;
+    update-script)
+      update_script
+      ;;
+    # 其他
+    version)
+      echo ""
+      echo "脚本版本: v${SCRIPT_VERSION}"
+      local ver; ver=$(get_installed_version)
+      if [ -n "$ver" ]; then
+        echo "Snell 版本: v$ver"
+      else
+        echo "Snell: 未安装"
+      fi
+      echo ""
+      ;;
+    help|--help|-h)
+      show_help
+      ;;
+    "")
+      # 无参数，显示菜单
+      menu
+      ;;
+    *)
+      warn "未知命令: $1"
+      echo "使用 '$0 help' 查看帮助"
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -38,6 +38,8 @@ is_config_json=$is_core_dir/config.json
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
+is_version_cache="/tmp/singbox_version_cache"
+is_sysctl_conf="/etc/sysctl.d/99-singbox.conf"
 
 # ==================== 状态检测 ====================
 refresh_status() {
@@ -120,7 +122,11 @@ EOF
     
     systemctl daemon-reload
     systemctl enable $is_core &>/dev/null
-    
+
+    # 启用网络优化
+    echo ">>> 启用网络优化..."
+    enable_tcp_fastopen
+
     # 创建默认配置
     echo ">>> 创建配置..."
     cat > $is_config_json <<EOF
@@ -144,6 +150,53 @@ EOF
     echo
     echo "快速开始: sb add"
     echo
+}
+
+# ==================== 防火墙管理 ====================
+ufw_allow() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q inactive; then
+            : # UFW 未启用，跳过
+        else
+            ufw allow "$port"/tcp >/dev/null 2>&1 || true
+            ufw allow "$port"/udp >/dev/null 2>&1 || true
+            _green "防火墙: ufw 已放行端口 $port"
+        fi
+    fi
+}
+
+ufw_remove() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q inactive; then
+            : # UFW 未启用，跳过
+        else
+            ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+            ufw delete allow "$port"/udp >/dev/null 2>&1 || true
+            _green "防火墙: ufw 已移除端口 $port"
+        fi
+    fi
+}
+
+firewalld_allow() {
+    local port=$1
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=${port}/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        _green "防火墙: firewalld 已放行端口 $port"
+    fi
+}
+
+firewalld_remove() {
+    local port=$1
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port=${port}/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        _green "防火墙: firewalld 已移除端口 $port"
+    fi
 }
 
 # ==================== 配置管理 ====================
@@ -275,6 +328,10 @@ add() {
     esac
     
     if save_conf; then
+        # 防火墙放行
+        ufw_allow "$is_port"
+        firewalld_allow "$is_port"
+
         systemctl restart $is_core &>/dev/null
         is_conf_file=$is_conf_name.json
         info_show
@@ -451,7 +508,19 @@ change_port() {
     if $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
         mv "${conf_path}.tmp" "$conf_path"
         _green "端口已修改: $old_port -> $new_port"
-        systemctl restart $is_core &>/dev/null
+
+        # 防火墙调整
+        if [ -n "$old_port" ]; then
+            ufw_remove "$old_port"
+            firewalld_remove "$old_port"
+        fi
+        ufw_allow "$new_port"
+        firewalld_allow "$new_port"
+
+        # 重启验证
+        if ! restart_check; then
+            _red "端口修改后服务启动失败，请检查配置"
+        fi
     else
         rm -f "${conf_path}.tmp"
         _red "配置验证失败"
@@ -471,7 +540,7 @@ change_cred() {
             new_uuid=${new_uuid:-$default_uuid}
             jq ".inbounds[0].users[0].uuid = \"$new_uuid\"" "$conf_path" > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
             _green "UUID 已修改"
-            systemctl restart $is_core &>/dev/null
+            restart_check
             ;;
         shadowsocks)
             local old_pass=$(jq -r '.inbounds[0].password' "$conf_path")
@@ -485,7 +554,7 @@ change_cred() {
             new_pass=${new_pass:-$default_pass}
             jq ".inbounds[0].password = \"$new_pass\"" "$conf_path" > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
             _green "密码已修改"
-            systemctl restart $is_core &>/dev/null
+            restart_check
             ;;
         *) _yellow "此协议暂不支持修改凭证" ;;
     esac
@@ -506,9 +575,19 @@ del() {
     echo
     read -rp "确认删除 $is_conf_file? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
-    
+
+    # 获取端口用于防火墙清理
+    local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$is_conf_file" 2>/dev/null)
+
     rm -f "$is_conf_dir/$is_conf_file"
     _green "已删除: $is_conf_file"
+
+    # 清理防火墙规则
+    if [ -n "$port" ]; then
+        ufw_remove "$port"
+        firewalld_remove "$port"
+    fi
+
     systemctl restart $is_core &>/dev/null
 }
 
@@ -617,6 +696,21 @@ gen_link() {
 }
 
 # ==================== 服务管理 ====================
+restart_check() {
+    systemctl restart $is_core
+    sleep 2
+    if systemctl is-active --quiet $is_core; then
+        _green "$is_core 已成功启动"
+        return 0
+    else
+        _red "$is_core 启动失败，请查看日志"
+        echo ""
+        echo "查看日志: $is_core log 50"
+        echo "或使用: journalctl -u $is_core -n 50"
+        return 1
+    fi
+}
+
 manage() {
     case $1 in
         start)
@@ -741,25 +835,25 @@ enable_bbr() {
         _red "BBR 需要 Linux 4.9+ 内核，当前: $(uname -r)"
         return 1
     fi
-    
+
     local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     if [[ $current == "bbr" ]]; then
         _green "BBR 已经启用"
         return 0
     fi
-    
+
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    
+
     cat >> /etc/sysctl.conf <<EOF
 
 # BBR
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-    
+
     sysctl -p &>/dev/null
-    
+
     current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     if [[ $current == "bbr" ]]; then
         _green "BBR 启用成功"
@@ -768,10 +862,107 @@ EOF
     fi
 }
 
+# ==================== TCP Fast Open ====================
+enable_tcp_fastopen() {
+    local kernel_major=$(uname -r | cut -d. -f1)
+    local kernel_minor=$(uname -r | cut -d. -f2)
+
+    if [[ $kernel_major -lt 3 ]]; then
+        _yellow "内核版本过低 (${kernel_major}.x)，无法支持 TCP Fast Open"
+        return 1
+    fi
+
+    # 检查 BBR 支持
+    local bbr_supported="false"
+    if [[ $kernel_major -gt 4 ]] || { [[ $kernel_major -eq 4 ]] && [[ $kernel_minor -ge 9 ]]; }; then
+        if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            bbr_supported="true"
+        fi
+    fi
+
+    echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || true
+
+    # 创建网络优化配置文件
+    cat > "$is_sysctl_conf" << 'SYSCTL_EOF'
+# sing-box 网络优化配置
+
+fs.file-max = 51200
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 65536
+net.core.wmem_default = 65536
+net.core.netdev_max_backlog = 4096
+net.core.somaxconn = 4096
+
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.ip_local_port_range = 10000 65000
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+SYSCTL_EOF
+
+    # 如果支持 BBR，添加 BBR 配置
+    if [[ $bbr_supported == "true" ]]; then
+        cat >> "$is_sysctl_conf" << 'BBR_EOF'
+
+# BBR 拥塞控制
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+BBR_EOF
+        _green "TCP Fast Open 和 BBR 已启用"
+    else
+        _green "TCP Fast Open 已启用 (BBR 需要内核 >= 4.9)"
+    fi
+
+    # 应用配置
+    sysctl --system >/dev/null 2>&1 || true
+}
+
+disable_tcp_optimization() {
+    if [ -f "$is_sysctl_conf" ]; then
+        rm -f "$is_sysctl_conf"
+        sysctl --system >/dev/null 2>&1 || true
+        _green "已移除网络优化配置"
+    else
+        _yellow "网络优化未启用"
+    fi
+}
+
 # ==================== 更新管理 ====================
 get_latest_version() {
     local repo=$1
-    curl -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/'
+    local cache_time=3600  # 1小时缓存
+    local current_time=$(date +%s)
+
+    # 检查缓存
+    if [ -f "$is_version_cache" ]; then
+        local cache_timestamp=$(head -1 "$is_version_cache" 2>/dev/null || echo "0")
+        local cached_version=$(sed -n '2p' "$is_version_cache" 2>/dev/null || echo "")
+
+        if [ -n "$cache_timestamp" ] && [ -n "$cached_version" ]; then
+            if [ $((current_time - cache_timestamp)) -lt $cache_time ]; then
+                echo "$cached_version"
+                return 0
+            fi
+        fi
+    fi
+
+    # 获取最新版本
+    local version=$(curl -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+
+    if [ -n "$version" ]; then
+        # 更新缓存
+        echo "$current_time" > "$is_version_cache"
+        echo "$version" >> "$is_version_cache"
+    fi
+
+    echo "$version"
 }
 
 update_core() {
@@ -842,7 +1033,16 @@ uninstall() {
     read -rp "确认卸载? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
     
-    if grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
+    # 清理网络优化配置
+    if [ -f "$is_sysctl_conf" ]; then
+        echo
+        read -rp "是否清理网络优化设置 (TCP Fast Open + BBR)? [y/N]: " opt_confirm
+        if [[ $opt_confirm =~ ^[Yy]$ ]]; then
+            rm -f "$is_sysctl_conf"
+            sysctl --system &>/dev/null
+            _green "网络优化设置已清理"
+        fi
+    elif grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
         echo
         read -rp "是否清理 BBR 设置? [y/N]: " bbr_confirm
         if [[ $bbr_confirm =~ ^[Yy]$ ]]; then
@@ -899,6 +1099,8 @@ show_help() {
     echo "  set-dns     设置 DNS"
     echo "  bbr         查看 BBR 状态"
     echo "  set-bbr     启用 BBR"
+    echo "  tfo         启用 TCP Fast Open + BBR"
+    echo "  tfo-off     禁用网络优化"
     echo
     echo "更新管理:"
     echo "  update      更新核心"
@@ -984,11 +1186,13 @@ main() {
         log) show_log ${2:-50} ;;
         log-f|logf) follow_log ;;
         log-clear) clear_log ;;
-        # DNS/BBR
+        # DNS/BBR/TFO
         dns) show_dns ;;
         set-dns) set_dns ;;
         bbr) check_bbr ;;
         set-bbr) enable_bbr ;;
+        tfo) enable_tcp_fastopen ;;
+        tfo-off) disable_tcp_optimization ;;
         # 更新管理
         update)
             case $2 in
