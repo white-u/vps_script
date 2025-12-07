@@ -1,0 +1,1023 @@
+#!/bin/bash
+
+# sing-box 单文件管理脚本
+# https://github.com/white-u/vps_script
+# Usage: bash <(curl -sL url) [args]
+
+is_sh_ver=v2.0
+
+# ==================== 颜色函数 ====================
+_red() { echo -e "\e[31m$@\e[0m"; }
+_green() { echo -e "\e[32m$@\e[0m"; }
+_yellow() { echo -e "\e[33m$@\e[0m"; }
+
+err() {
+    echo -e "\n\e[41m 错误 \e[0m $@\n"
+    exit 1
+}
+
+# ==================== 环境检测 ====================
+[[ $EUID != 0 ]] && err "请使用 root 用户运行此脚本"
+
+cmd=$(type -P apt-get || type -P yum)
+[[ ! $cmd ]] && err "此脚本仅支持 Ubuntu/Debian/CentOS 系统"
+
+case $(uname -m) in
+    amd64 | x86_64) is_arch=amd64 ;;
+    *aarch64* | *armv8*) is_arch=arm64 ;;
+    *) err "此脚本仅支持 64 位系统" ;;
+esac
+
+# ==================== 全局变量 ====================
+is_core=sing-box
+is_core_dir=/etc/$is_core
+is_core_bin=$is_core_dir/bin/$is_core
+is_core_repo=SagerNet/$is_core
+is_conf_dir=$is_core_dir/conf
+is_config_json=$is_core_dir/config.json
+is_log_dir=/var/log/$is_core
+is_sh_bin=/usr/local/bin/$is_core
+is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
+
+# ==================== 状态检测 ====================
+refresh_status() {
+    [[ -f $is_core_bin ]] && is_core_ver=$($is_core_bin version 2>/dev/null | head -n1 | cut -d' ' -f3)
+    if systemctl is-active --quiet $is_core 2>/dev/null; then
+        is_core_status=$(_green "运行中")
+        is_core_stop=0
+    else
+        is_core_status=$(_red "未运行")
+        is_core_stop=1
+    fi
+}
+
+get_ip() {
+    is_ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null)
+    is_ipv6=$(curl -s6m5 ip.sb 2>/dev/null)
+    is_addr=${is_ipv4:-$is_ipv6}
+    [[ -z $is_addr ]] && is_addr="<未知IP>"
+}
+
+# ==================== 安装功能 ====================
+install_singbox() {
+    echo
+    echo ">>> 安装 $is_core..."
+    
+    # 安装依赖
+    echo ">>> 安装依赖..."
+    $cmd update -y &>/dev/null
+    $cmd install -y wget tar jq openssl &>/dev/null || err "依赖安装失败"
+    
+    # 获取版本
+    echo ">>> 下载 $is_core 核心..."
+    local version=$(wget -qO- "https://api.github.com/repos/$is_core_repo/releases/latest" | grep tag_name | grep -oE "v[0-9.]+")
+    [[ -z $version ]] && err "获取最新版本失败"
+    echo "    版本: $version"
+    
+    # 下载核心
+    local tmp_dir=$(mktemp -d)
+    local core_url="https://github.com/$is_core_repo/releases/download/$version/$is_core-${version#v}-linux-$is_arch.tar.gz"
+    wget --no-check-certificate -t 3 -q -O "$tmp_dir/core.tar.gz" "$core_url" || err "下载失败"
+    
+    # 创建目录
+    mkdir -p $is_core_dir/bin $is_conf_dir $is_log_dir
+    
+    # 解压核心
+    tar -xzf "$tmp_dir/core.tar.gz" -C $is_core_dir/bin --strip-components=1
+    rm -rf "$tmp_dir"
+    
+    # 安装脚本
+    echo ">>> 安装管理脚本..."
+    local script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    
+    # 如果是从 stdin 运行 (curl | bash)，则下载脚本
+    if [[ ! -f "$script_path" || "$script_path" =~ bash$ || "$script_path" == "/dev/stdin" ]]; then
+        wget --no-check-certificate -q -O "$is_sh_bin" "$is_sh_url" || err "脚本下载失败"
+    else
+        cp "$script_path" "$is_sh_bin"
+    fi
+    
+    # 创建链接
+    ln -sf $is_sh_bin /usr/local/bin/sb
+    chmod +x $is_core_bin $is_sh_bin /usr/local/bin/sb
+    
+    # 创建 systemd 服务
+    echo ">>> 创建服务..."
+    cat > /etc/systemd/system/$is_core.service <<EOF
+[Unit]
+Description=$is_core Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=$is_core_bin run -c $is_config_json -C $is_conf_dir
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable $is_core &>/dev/null
+    
+    # 创建默认配置
+    echo ">>> 创建配置..."
+    cat > $is_config_json <<EOF
+{
+    "log": {
+        "level": "info",
+        "output": "$is_log_dir/sing-box.log",
+        "timestamp": true
+    },
+    "dns": {},
+    "outbounds": [
+        {"type": "direct", "tag": "direct"}
+    ]
+}
+EOF
+    
+    echo
+    _green "安装完成!"
+    echo "版本: $version"
+    echo "命令: sb 或 $is_core"
+    echo
+    echo "快速开始: sb add"
+    echo
+}
+
+# ==================== 配置管理 ====================
+get_conf_list() {
+    conf_list=()
+    while IFS= read -r -d '' file; do
+        conf_list+=("$(basename "$file")")
+    done < <(find "$is_conf_dir" -maxdepth 1 -name "*.json" -print0 2>/dev/null)
+}
+
+select_conf() {
+    get_conf_list
+    [[ ${#conf_list[@]} -eq 0 ]] && { _yellow "没有找到配置文件"; return 1; }
+    
+    if [[ ${#conf_list[@]} -eq 1 ]]; then
+        is_conf_file=${conf_list[0]}
+        echo "自动选择: $is_conf_file"
+        return 0
+    fi
+    
+    echo
+    echo "请选择配置:"
+    echo
+    for i in "${!conf_list[@]}"; do
+        local f=${conf_list[$i]}
+        local proto=$(jq -r '.inbounds[0].type' "$is_conf_dir/$f" 2>/dev/null)
+        local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$f" 2>/dev/null)
+        printf "  %2d. %-30s [%s:%s]\n" "$((i+1))" "$f" "$proto" "$port"
+    done
+    echo
+    echo "   0. 返回"
+    echo
+    read -rp "请输入序号: " pick
+    [[ -z $pick || $pick == "0" ]] && return 1
+    [[ ! $pick =~ ^[0-9]+$ ]] && { _yellow "请输入数字"; return 1; }
+    [[ $pick -lt 1 || $pick -gt ${#conf_list[@]} ]] && { _yellow "序号超出范围"; return 1; }
+    is_conf_file=${conf_list[$((pick-1))]}
+    return 0
+}
+
+# 协议列表
+protocols=("VLESS-Reality" "Shadowsocks")
+
+# 检查端口是否被占用
+is_port_used() {
+    ss -tuln | grep -qE "(:|])$1\b"
+}
+
+rand_port() {
+    local port
+    while :; do
+        port=$((RANDOM % 30000 + 10000))
+        is_port_used $port || break
+    done
+    echo $port
+}
+
+rand_uuid() { cat /proc/sys/kernel/random/uuid; }
+
+gen_reality_keys() {
+    local keys=$($is_core_bin generate reality-keypair 2>/dev/null)
+    is_private_key=$(echo "$keys" | grep PrivateKey | awk '{print $2}')
+    is_public_key=$(echo "$keys" | grep PublicKey | awk '{print $2}')
+}
+
+gen_short_id() { openssl rand -hex 8; }
+
+input_port() {
+    local default_port=$(rand_port)
+    read -rp "端口 [$default_port]: " is_port
+    is_port=${is_port:-$default_port}
+    [[ ! $is_port =~ ^[0-9]+$ ]] && { _yellow "端口必须是数字"; input_port; return; }
+    [[ $is_port -lt 1 || $is_port -gt 65535 ]] && { _yellow "端口范围: 1-65535"; input_port; return; }
+    is_port_used $is_port && { _yellow "端口 $is_port 已被占用"; input_port; return; }
+}
+
+input_uuid() {
+    local default_uuid=$(rand_uuid)
+    read -rp "UUID [$default_uuid]: " is_uuid
+    is_uuid=${is_uuid:-$default_uuid}
+}
+
+input_sni() {
+    local default_sni="www.time.is"
+    read -rp "SNI [$default_sni]: " is_sni
+    is_sni=${is_sni:-$default_sni}
+}
+
+input_remark() {
+    local default_remark=$(hostname)  # 主机名
+    read -rp "备注 [$default_remark]: " is_remark
+    is_remark=${is_remark:-$default_remark}
+}
+
+# 添加配置
+add() {
+    if [[ $1 ]]; then
+        case ${1,,} in
+            r|reality|vless|vless-reality) is_protocol="VLESS-Reality" ;;
+            ss|shadowsocks) is_protocol="Shadowsocks" ;;
+            *) _yellow "未找到匹配的协议: $1"; _yellow "可用: r (Reality), ss (Shadowsocks)"; return 1 ;;
+        esac
+    else
+        echo
+        echo "请选择协议:"
+        echo
+        for i in "${!protocols[@]}"; do
+            printf "  %2d. %s\n" $((i+1)) "${protocols[$i]}"
+        done
+        echo
+        echo "   0. 返回"
+        echo
+        read -rp "请输入序号: " pick
+        [[ -z $pick || $pick == "0" ]] && return 0
+        [[ ! $pick =~ ^[0-9]+$ ]] && { _yellow "请输入数字"; return 1; }
+        [[ $pick -lt 1 || $pick -gt ${#protocols[@]} ]] && { _yellow "序号超出范围"; return 1; }
+        is_protocol=${protocols[$((pick-1))]}
+    fi
+    
+    echo
+    _green ">>> 配置 $is_protocol"
+    echo
+    
+    input_port
+    
+    case $is_protocol in
+        VLESS-Reality) add_vless_reality ;;
+        Shadowsocks) add_shadowsocks ;;
+    esac
+    
+    if save_conf; then
+        systemctl restart $is_core &>/dev/null
+        is_conf_file=$is_conf_name.json
+        info_show
+    fi
+}
+
+add_vless_reality() {
+    input_uuid
+    input_sni
+    input_remark
+    gen_reality_keys
+    is_short_id=$(gen_short_id)
+    is_conf_name="vless-reality-${is_port}"
+    
+    is_conf=$(cat <<EOF
+{
+    "inbounds": [{
+        "type": "vless",
+        "tag": "$is_conf_name",
+        "listen": "::",
+        "listen_port": $is_port,
+        "users": [{
+            "uuid": "$is_uuid",
+            "flow": "xtls-rprx-vision"
+        }],
+        "tls": {
+            "enabled": true,
+            "server_name": "$is_sni",
+            "reality": {
+                "enabled": true,
+                "handshake": {
+                    "server": "$is_sni",
+                    "server_port": 443
+                },
+                "private_key": "$is_private_key",
+                "short_id": ["$is_short_id"]
+            }
+        }
+    }],
+    "outbounds": [
+        {"type": "direct"},
+        {"type": "direct", "tag": "public_key_$is_public_key"}
+    ]
+}
+EOF
+)
+}
+
+add_shadowsocks() {
+    echo
+    echo "加密方式:"
+    echo "  1. 2022-blake3-aes-128-gcm (推荐)"
+    echo "  2. 2022-blake3-aes-256-gcm"
+    echo "  3. 2022-blake3-chacha20-poly1305"
+    echo
+    read -rp "选择 [1]: " method_pick
+    case ${method_pick:-1} in
+        1) is_method="2022-blake3-aes-128-gcm"; is_ss_pass=$(openssl rand -base64 16) ;;
+        2) is_method="2022-blake3-aes-256-gcm"; is_ss_pass=$(openssl rand -base64 32) ;;
+        3) is_method="2022-blake3-chacha20-poly1305"; is_ss_pass=$(openssl rand -base64 32) ;;
+        *) is_method="2022-blake3-aes-128-gcm"; is_ss_pass=$(openssl rand -base64 16) ;;
+    esac
+    
+    input_remark
+    is_conf_name="shadowsocks-${is_port}"
+    
+    is_conf=$(cat <<EOF
+{
+    "inbounds": [{
+        "type": "shadowsocks",
+        "tag": "$is_conf_name",
+        "listen": "::",
+        "listen_port": $is_port,
+        "method": "$is_method",
+        "password": "$is_ss_pass"
+    }]
+}
+EOF
+)
+}
+
+save_conf() {
+    local tmp_file="$is_conf_dir/$is_conf_name.json"
+    echo "$is_conf" | jq . > "$tmp_file" 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        _red "配置保存失败，JSON 格式错误"
+        return 1
+    fi
+    
+    local check_result
+    check_result=$($is_core_bin check -c "$is_config_json" -C "$is_conf_dir" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo
+        _red "配置验证失败:"
+        echo "$check_result"
+        rm -f "$tmp_file"
+        return 1
+    fi
+    
+    _green "配置已保存: $is_conf_name.json"
+    return 0
+}
+
+# 列出配置
+list() {
+    local files=($(ls $is_conf_dir 2>/dev/null | grep '\.json$'))
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo
+        _yellow "暂无配置"
+        echo
+        return
+    fi
+    
+    echo
+    printf "%-3s %-30s %-12s %-6s\n" "#" "名称" "协议" "端口"
+    echo "------------------------------------------------------"
+    
+    for i in "${!files[@]}"; do
+        local f=${files[$i]}
+        local proto=$(jq -r '.inbounds[0].type' "$is_conf_dir/$f")
+        local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$f")
+        printf "%-3s %-30s %-12s %-6s\n" "$((i+1))" "$f" "$proto" "$port"
+    done
+    echo
+}
+
+# 修改配置
+change() {
+    if [[ $1 ]]; then
+        get_conf_list
+        for f in "${conf_list[@]}"; do
+            [[ $f =~ $1 ]] && is_conf_file=$f && break
+        done
+        [[ -z $is_conf_file ]] && { _yellow "未找到匹配的配置: $1"; return 1; }
+    else
+        select_conf || return 1
+    fi
+    
+    local conf_path="$is_conf_dir/$is_conf_file"
+    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
+    
+    echo
+    echo "修改: $is_conf_file ($proto)"
+    echo
+    echo "可修改项:"
+    echo "  1. 端口"
+    echo "  2. 主要凭证 (UUID/密码)"
+    echo
+    echo "  0. 返回"
+    echo
+    read -rp "请选择: " change_pick
+    
+    case $change_pick in
+        1) change_port "$conf_path" ;;
+        2) change_cred "$conf_path" "$proto" ;;
+        0|"") return 0 ;;
+        *) _yellow "无效选择" ;;
+    esac
+}
+
+change_port() {
+    local conf_path=$1
+    local old_port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
+    
+    echo "当前端口: $old_port"
+    read -rp "新端口: " new_port
+    
+    [[ -z $new_port ]] && { echo "已取消"; return; }
+    [[ ! $new_port =~ ^[0-9]+$ ]] && { _yellow "端口必须是数字"; return; }
+    [[ $new_port -lt 1 || $new_port -gt 65535 ]] && { _yellow "端口范围: 1-65535"; return; }
+    is_port_used $new_port && { _yellow "端口 $new_port 已被占用"; return; }
+    
+    jq ".inbounds[0].listen_port = $new_port" "$conf_path" > "${conf_path}.tmp"
+    if $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
+        mv "${conf_path}.tmp" "$conf_path"
+        _green "端口已修改: $old_port -> $new_port"
+        systemctl restart $is_core &>/dev/null
+    else
+        rm -f "${conf_path}.tmp"
+        _red "配置验证失败"
+    fi
+}
+
+change_cred() {
+    local conf_path=$1
+    local proto=$2
+    
+    case $proto in
+        vless)
+            local old_uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            echo "当前 UUID: $old_uuid"
+            local default_uuid=$(rand_uuid)
+            read -rp "新 UUID [$default_uuid]: " new_uuid
+            new_uuid=${new_uuid:-$default_uuid}
+            jq ".inbounds[0].users[0].uuid = \"$new_uuid\"" "$conf_path" > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
+            _green "UUID 已修改"
+            systemctl restart $is_core &>/dev/null
+            ;;
+        shadowsocks)
+            local old_pass=$(jq -r '.inbounds[0].password' "$conf_path")
+            local method=$(jq -r '.inbounds[0].method' "$conf_path")
+            echo "当前密码: $old_pass"
+            echo "加密方式: $method"
+            local key_len=16
+            [[ $method =~ "256" || $method =~ "chacha20" ]] && key_len=32
+            local default_pass=$(openssl rand -base64 $key_len)
+            read -rp "新密码 [$default_pass]: " new_pass
+            new_pass=${new_pass:-$default_pass}
+            jq ".inbounds[0].password = \"$new_pass\"" "$conf_path" > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
+            _green "密码已修改"
+            systemctl restart $is_core &>/dev/null
+            ;;
+        *) _yellow "此协议暂不支持修改凭证" ;;
+    esac
+}
+
+# 删除配置
+del() {
+    if [[ $1 ]]; then
+        get_conf_list
+        for f in "${conf_list[@]}"; do
+            [[ $f =~ $1 ]] && is_conf_file=$f && break
+        done
+        [[ -z $is_conf_file ]] && { _yellow "未找到匹配的配置: $1"; return 1; }
+    else
+        select_conf || return 1
+    fi
+    
+    echo
+    read -rp "确认删除 $is_conf_file? [y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
+    
+    rm -f "$is_conf_dir/$is_conf_file"
+    _green "已删除: $is_conf_file"
+    systemctl restart $is_core &>/dev/null
+}
+
+# 查看配置
+info() {
+    if [[ $1 ]]; then
+        get_conf_list
+        for f in "${conf_list[@]}"; do
+            [[ $f =~ $1 ]] && is_conf_file=$f && break
+        done
+        [[ -z $is_conf_file ]] && { _yellow "未找到匹配的配置: $1"; return 1; }
+    else
+        select_conf || return 1
+    fi
+    info_show
+}
+
+info_show() {
+    local conf_path="$is_conf_dir/$is_conf_file"
+    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
+    local port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
+    
+    echo
+    echo "============================================"
+    echo "             配置信息"
+    echo "============================================"
+    echo
+    echo "配置文件: $is_conf_file"
+    echo "协议类型: $proto"
+    echo "监听端口: $port"
+    echo "服务地址: $is_addr"
+    echo
+    
+    case $proto in
+        vless)
+            local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            local flow=$(jq -r '.inbounds[0].users[0].flow // empty' "$conf_path")
+            local reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' "$conf_path")
+            echo "UUID: $uuid"
+            [[ $flow ]] && echo "Flow: $flow"
+            if [[ $reality == "true" ]]; then
+                local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+                local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
+                local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
+                echo "SNI: $sni"
+                [[ $pbk ]] && echo "PublicKey: $pbk"
+                echo "ShortID: $sid"
+                echo "Fingerprint: chrome"
+            fi
+            ;;
+        shadowsocks)
+            local method=$(jq -r '.inbounds[0].method' "$conf_path")
+            local password=$(jq -r '.inbounds[0].password' "$conf_path")
+            echo "加密方式: $method"
+            echo "密码: $password"
+            ;;
+    esac
+    
+    echo
+    echo "============================================"
+    echo "             分享链接"
+    echo "============================================"
+    echo
+    gen_link
+    echo
+    echo "============================================"
+}
+
+gen_link() {
+    local conf_path="$is_conf_dir/$is_conf_file"
+    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
+    local port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
+    local remark="${is_remark:-$(hostname)}"
+    
+    case $proto in
+        vless)
+            local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            local flow=$(jq -r '.inbounds[0].users[0].flow // empty' "$conf_path")
+            local reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' "$conf_path")
+            
+            if [[ $reality == "true" ]]; then
+                local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+                local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
+                local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
+                local fp="chrome"
+                
+                if [[ -z $pbk ]]; then
+                    _red "错误: 未找到 PublicKey，请重新创建配置"
+                elif [[ $flow ]]; then
+                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=tcp#${remark}"
+                else
+                    echo "vless://${uuid}@${is_addr}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=tcp#${remark}"
+                fi
+            else
+                echo "vless://${uuid}@${is_addr}:${port}?encryption=none&type=tcp#${remark}"
+            fi
+            ;;
+        shadowsocks)
+            local method=$(jq -r '.inbounds[0].method' "$conf_path")
+            local password=$(jq -r '.inbounds[0].password' "$conf_path")
+            local encoded=$(echo -n "${method}:${password}" | base64 -w 0)
+            echo "ss://${encoded}@${is_addr}:${port}#${remark}"
+            ;;
+        *) echo "暂不支持生成 $proto 的分享链接" ;;
+    esac
+}
+
+# ==================== 服务管理 ====================
+manage() {
+    case $1 in
+        start)
+            systemctl start $is_core
+            refresh_status
+            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已启动" || _red "启动失败"
+            ;;
+        stop)
+            systemctl stop $is_core
+            refresh_status
+            [[ $is_core_stop -eq 1 ]] && _green "$is_core 已停止" || _red "停止失败"
+            ;;
+        restart)
+            systemctl restart $is_core
+            refresh_status
+            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已重启" || _red "重启失败"
+            ;;
+        status)
+            refresh_status
+            echo
+            echo "$is_core 状态: $is_core_status"
+            [[ $is_core_ver ]] && echo "版本: $is_core_ver"
+            echo
+            ;;
+    esac
+}
+
+# ==================== 日志管理 ====================
+show_log() {
+    local lines=${1:-50}
+    local log_file="$is_log_dir/sing-box.log"
+    [[ ! -f $log_file ]] && { _yellow "日志文件不存在"; return; }
+    echo
+    echo "--- 最近 $lines 行 ---"
+    tail -n $lines "$log_file"
+    echo
+}
+
+follow_log() {
+    local log_file="$is_log_dir/sing-box.log"
+    [[ ! -f $log_file ]] && { _yellow "日志文件不存在"; return; }
+    echo "实时日志 (Ctrl+C 退出):"
+    echo
+    tail -f "$log_file"
+}
+
+clear_log() {
+    local log_file="$is_log_dir/sing-box.log"
+    read -rp "确认清空日志? [y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return; }
+    > "$log_file"
+    _green "日志已清空"
+}
+
+# ==================== DNS 管理 ====================
+show_dns() {
+    echo
+    echo "当前 DNS 配置:"
+    echo
+    cat /etc/resolv.conf | grep nameserver
+    echo
+}
+
+set_dns() {
+    echo
+    echo "设置 DNS 服务器"
+    echo
+    echo "  1. Cloudflare (1.1.1.1)"
+    echo "  2. Google (8.8.8.8)"
+    echo "  3. 阿里云 (223.5.5.5)"
+    echo "  4. 自定义"
+    echo "  0. 取消"
+    echo
+    read -rp "请选择: " dns_pick
+    
+    case $dns_pick in
+        1) dns1="1.1.1.1"; dns2="1.0.0.1" ;;
+        2) dns1="8.8.8.8"; dns2="8.8.4.4" ;;
+        3) dns1="223.5.5.5"; dns2="223.6.6.6" ;;
+        4)
+            read -rp "主 DNS: " dns1
+            read -rp "备 DNS: " dns2
+            [[ -z $dns1 ]] && { _yellow "DNS 不能为空"; return; }
+            ;;
+        0) echo "已取消"; return ;;
+        *) _yellow "无效选择"; return ;;
+    esac
+    
+    [[ -f /etc/resolv.conf ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
+    cat > /etc/resolv.conf <<EOF
+nameserver $dns1
+nameserver $dns2
+EOF
+    _green "DNS 已设置: $dns1, $dns2"
+}
+
+# ==================== BBR 管理 ====================
+check_bbr() {
+    local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    local available=$(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | awk '{print $3}')
+    
+    echo
+    echo "BBR 状态:"
+    echo "  当前算法: ${current:-未知}"
+    echo "  可用算法: ${available:-未知}"
+    
+    if [[ $current == "bbr" ]]; then
+        echo
+        _green "BBR 已启用"
+    else
+        echo
+        _yellow "BBR 未启用"
+    fi
+    echo
+}
+
+enable_bbr() {
+    # 检查内核版本 (需要 4.9+)
+    local kernel_major=$(uname -r | cut -d. -f1)
+    local kernel_minor=$(uname -r | cut -d. -f2)
+    if [[ $kernel_major -lt 4 ]] || [[ $kernel_major -eq 4 && $kernel_minor -lt 9 ]]; then
+        _red "BBR 需要 Linux 4.9+ 内核，当前: $(uname -r)"
+        return 1
+    fi
+    
+    local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    if [[ $current == "bbr" ]]; then
+        _green "BBR 已经启用"
+        return 0
+    fi
+    
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    
+    cat >> /etc/sysctl.conf <<EOF
+
+# BBR
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    
+    sysctl -p &>/dev/null
+    
+    current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    if [[ $current == "bbr" ]]; then
+        _green "BBR 启用成功"
+    else
+        _red "BBR 启用失败"
+    fi
+}
+
+# ==================== 更新管理 ====================
+get_latest_version() {
+    local repo=$1
+    curl -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/'
+}
+
+update_core() {
+    echo
+    echo "检查 sing-box 更新..."
+    
+    local latest=$(get_latest_version $is_core_repo)
+    [[ -z $latest ]] && { _red "无法获取最新版本"; return 1; }
+    
+    local current=${is_core_ver:-未安装}
+    
+    echo "当前版本: $current"
+    echo "最新版本: $latest"
+    
+    if [[ $current == $latest ]]; then
+        _green "已是最新版本"
+        return 0
+    fi
+    
+    echo
+    read -rp "是否更新? [Y/n]: " confirm
+    [[ $confirm =~ ^[Nn]$ ]] && { echo "已取消"; return 0; }
+    
+    local url="https://github.com/$is_core_repo/releases/download/v${latest}/sing-box-${latest}-linux-${is_arch}.tar.gz"
+    local tmp_file="/tmp/sing-box.tar.gz"
+    
+    echo "下载中..."
+    curl -fLm120 -o "$tmp_file" "$url"
+    [[ $? -ne 0 ]] && { _red "下载失败"; return 1; }
+    
+    systemctl stop $is_core
+    tar -xzf "$tmp_file" -C /tmp
+    cp "/tmp/sing-box-${latest}-linux-${is_arch}/sing-box" "$is_core_bin"
+    chmod +x "$is_core_bin"
+    rm -rf "$tmp_file" "/tmp/sing-box-${latest}-linux-${is_arch}"
+    systemctl start $is_core
+    
+    _green "更新完成: $current -> $latest"
+}
+
+update_sh() {
+    echo
+    echo "更新脚本..."
+    
+    local tmp_file="/tmp/sing-box.sh"
+    curl -sfLm30 -o "$tmp_file" "$is_sh_url"
+    [[ $? -ne 0 ]] && { _red "下载失败"; return 1; }
+    
+    cp "$tmp_file" "$is_sh_bin"
+    chmod +x "$is_sh_bin"
+    rm -f "$tmp_file"
+    
+    _green "脚本更新完成"
+}
+
+# ==================== 卸载 ====================
+uninstall() {
+    echo
+    _yellow "警告: 即将卸载 sing-box"
+    echo
+    echo "将删除以下内容:"
+    echo "  - $is_core_dir (配置、核心)"
+    echo "  - $is_log_dir (日志)"
+    echo "  - /etc/systemd/system/${is_core}.service"
+    echo "  - /usr/local/bin/sb, /usr/local/bin/$is_core"
+    echo
+    
+    read -rp "确认卸载? [y/N]: " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
+    
+    if grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
+        echo
+        read -rp "是否清理 BBR 设置? [y/N]: " bbr_confirm
+        if [[ $bbr_confirm =~ ^[Yy]$ ]]; then
+            sed -i '/# BBR/d' /etc/sysctl.conf
+            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+            sysctl -p &>/dev/null
+            _green "BBR 设置已清理"
+        fi
+    fi
+    
+    echo
+    echo "正在卸载..."
+    
+    systemctl stop $is_core &>/dev/null
+    systemctl disable $is_core &>/dev/null
+    rm -rf "$is_core_dir"
+    rm -rf "$is_log_dir"
+    rm -f /etc/systemd/system/${is_core}.service
+    systemctl daemon-reload
+    rm -f /usr/local/bin/sb
+    rm -f /usr/local/bin/$is_core
+    rm -f /etc/resolv.conf.bak
+    
+    echo
+    _green "sing-box 已完全卸载"
+}
+
+# ==================== 帮助 ====================
+show_help() {
+    echo
+    echo "Usage: $is_core <command>"
+    echo
+    echo "配置管理:"
+    echo "  add [r|ss]  添加配置 (r=Reality, ss=Shadowsocks)"
+    echo "  change      修改配置"
+    echo "  del         删除配置"
+    echo "  list        列出配置"
+    echo "  info        查看配置详情"
+    echo
+    echo "服务管理:"
+    echo "  start       启动服务"
+    echo "  stop        停止服务"
+    echo "  restart     重启服务"
+    echo "  status      查看状态"
+    echo
+    echo "日志管理:"
+    echo "  log [n]     查看最近 n 行日志"
+    echo "  log-f       实时查看日志"
+    echo "  log-clear   清空日志"
+    echo
+    echo "系统优化:"
+    echo "  dns         查看 DNS"
+    echo "  set-dns     设置 DNS"
+    echo "  bbr         查看 BBR 状态"
+    echo "  set-bbr     启用 BBR"
+    echo
+    echo "更新管理:"
+    echo "  update      更新核心"
+    echo "  update sh   更新脚本"
+    echo "  uninstall   卸载"
+    echo
+    echo "其他:"
+    echo "  version     查看版本"
+    echo "  help        显示帮助"
+    echo
+}
+
+# ==================== 菜单 ====================
+pause_return() {
+    echo
+    read -rp "按 Enter 返回主菜单..."
+}
+
+show_menu() {
+    while true; do
+        refresh_status
+        clear
+        echo
+        echo "============================================"
+        echo "          sing-box 管理脚本 $is_sh_ver"
+        echo "============================================"
+        echo
+        echo "  状态: $is_core_status    版本: ${is_core_ver:-未安装}"
+        echo "  地址: $is_addr"
+        echo
+        echo "--------------------------------------------"
+        echo
+        echo "  1. 添加配置       2. 修改配置"
+        echo "  3. 删除配置       4. 查看配置"
+        echo "  5. 配置列表"
+        echo
+        echo "  6. 启动服务       7. 停止服务       8. 重启服务"
+        echo
+        echo "  9. 查看日志      10. BBR 优化"
+        echo " 11. 更新核心      12. 更新脚本"
+        echo " 13. 卸载"
+        echo
+        echo "  0. 退出"
+        echo
+        echo "============================================"
+        echo
+        read -rp "请选择: " menu_pick
+        
+        case $menu_pick in
+            1) add; pause_return ;;
+            2) change; pause_return ;;
+            3) del; pause_return ;;
+            4) info; pause_return ;;
+            5) list; pause_return ;;
+            6) manage start; pause_return ;;
+            7) manage stop; pause_return ;;
+            8) manage restart; pause_return ;;
+            9) show_log; pause_return ;;
+            10) enable_bbr; pause_return ;;
+            11) update_core; pause_return ;;
+            12) update_sh; pause_return ;;
+            13) uninstall; break ;;
+            0) echo; echo "再见!"; echo; exit 0 ;;
+            "") ;;
+            *) _yellow "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+# ==================== 主入口 ====================
+main() {
+    case $1 in
+        # 配置管理
+        a|add) add $2 ;;
+        c|change) change $2 ;;
+        d|del|rm) del $2 ;;
+        l|list|ls) list ;;
+        i|info) info $2 ;;
+        # 服务管理
+        start|stop|restart) manage $1 ;;
+        s|status) manage status ;;
+        # 日志管理
+        log) show_log ${2:-50} ;;
+        log-f|logf) follow_log ;;
+        log-clear) clear_log ;;
+        # DNS/BBR
+        dns) show_dns ;;
+        set-dns) set_dns ;;
+        bbr) check_bbr ;;
+        set-bbr) enable_bbr ;;
+        # 更新管理
+        update)
+            case $2 in
+                sh|script) update_sh ;;
+                *) update_core ;;
+            esac
+            ;;
+        un|uninstall) uninstall ;;
+        # 其他
+        v|version)
+            echo
+            echo "$is_core 版本: $(_green ${is_core_ver:-未安装})"
+            echo "脚本版本: $(_green $is_sh_ver)"
+            echo
+            ;;
+        h|help) show_help ;;
+        "") show_menu ;;
+        *) _yellow "未知命令: $1"; echo "使用 '$is_core help' 查看帮助" ;;
+    esac
+}
+
+# ==================== 启动 ====================
+if [[ -f $is_sh_bin && -d $is_core_dir && -f $is_core_bin ]]; then
+    # 已安装，正常运行
+    refresh_status
+    get_ip
+    main "$@"
+else
+    # 未安装，执行安装
+    get_ip
+    install_singbox
+fi
