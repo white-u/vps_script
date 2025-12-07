@@ -55,6 +55,42 @@ warn()   { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 err()    { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 
 # =====================================
+# 模块加载
+# =====================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://raw.githubusercontent.com/white-u/vps_script/main"
+
+load_system_optimize_module() {
+    local module_file="${SCRIPT_DIR}/system-optimize.sh"
+
+    # 如果已经加载过，直接返回
+    if type enable_network_optimization >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 本地存在，直接加载
+    if [ -f "$module_file" ]; then
+        if source "$module_file" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 本地不存在或加载失败，尝试下载
+    warn "system-optimize.sh 模块未找到，尝试自动下载..."
+    if curl -sL "${REPO_URL}/system-optimize.sh" -o "$module_file" 2>/dev/null; then
+        chmod +x "$module_file"
+        if source "$module_file" 2>/dev/null; then
+            log "system-optimize.sh 模块下载并加载成功"
+            return 0
+        fi
+    fi
+
+    # 下载失败，返回错误
+    warn "无法加载 system-optimize.sh 模块，将使用内置功能"
+    return 1
+}
+
+# =====================================
 # 系统检查
 # =====================================
 check_root() {
@@ -237,18 +273,26 @@ compare_versions() {
 }
 
 # =====================================
-# TCP Fast Open + BBR 优化（从 V3 移植）
+# TCP Fast Open + BBR 优化（使用统一模块）
 # =====================================
 enable_tcp_fastopen() {
+  # 尝试使用统一的系统优化模块
+  if load_system_optimize_module; then
+    # 使用模块提供的功能
+    enable_network_optimization "$SYSCTL_CONF" true true
+    return $?
+  fi
+
+  # 模块加载失败，使用内置实现（向后兼容）
   local kernel_major kernel_minor
   kernel_major=$(uname -r | awk -F . '{print $1}')
   kernel_minor=$(uname -r | awk -F . '{print $2}')
-  
+
   if [ "$kernel_major" -lt 3 ]; then
     warn "内核版本过低 (${kernel_major}.x)，无法支持 TCP Fast Open"
     return 1
   fi
-  
+
   # 检查 BBR 支持 (需要内核 >= 4.9)
   local bbr_supported="false"
   if [ "$kernel_major" -gt 4 ] || { [ "$kernel_major" -eq 4 ] && [ "$kernel_minor" -ge 9 ]; }; then
@@ -256,9 +300,9 @@ enable_tcp_fastopen() {
       bbr_supported="true"
     fi
   fi
-  
+
   echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || true
-  
+
   # 创建 Snell 专用的 sysctl 配置文件
   cat > "$SYSCTL_CONF" << 'SYSCTL_EOF'
 # Snell Server 网络优化配置
@@ -297,13 +341,20 @@ BBR_EOF
   else
     log "TCP Fast Open 已启用 (BBR 需要内核 >= 4.9)"
   fi
-  
+
   # 应用配置
   sysctl --system >/dev/null 2>&1 || true
 }
 
 # 移除网络优化配置
 remove_tcp_optimization() {
+  # 尝试使用统一的系统优化模块
+  if load_system_optimize_module; then
+    remove_network_optimization "$SYSCTL_CONF"
+    return $?
+  fi
+
+  # 模块加载失败，使用内置实现
   if [ -f "$SYSCTL_CONF" ]; then
     rm -f "$SYSCTL_CONF"
     sysctl --system >/dev/null 2>&1 || true

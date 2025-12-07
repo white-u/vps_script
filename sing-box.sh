@@ -16,6 +16,40 @@ err() {
     exit 1
 }
 
+# ==================== 模块加载 ====================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://raw.githubusercontent.com/white-u/vps_script/main"
+
+load_system_optimize_module() {
+    local module_file="${SCRIPT_DIR}/system-optimize.sh"
+
+    # 如果已经加载过，直接返回
+    if type enable_network_optimization >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 本地存在，直接加载
+    if [ -f "$module_file" ]; then
+        if source "$module_file" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 本地不存在或加载失败，尝试下载
+    _yellow "system-optimize.sh 模块未找到，尝试自动下载..."
+    if curl -sL "${REPO_URL}/system-optimize.sh" -o "$module_file" 2>/dev/null; then
+        chmod +x "$module_file"
+        if source "$module_file" 2>/dev/null; then
+            _green "system-optimize.sh 模块下载并加载成功"
+            return 0
+        fi
+    fi
+
+    # 下载失败，返回错误
+    _yellow "无法加载 system-optimize.sh 模块，将使用内置功能"
+    return 1
+}
+
 # ==================== 环境检测 ====================
 [[ $EUID != 0 ]] && err "请使用 root 用户运行此脚本"
 
@@ -1020,16 +1054,23 @@ EOF
     _green "DNS 已设置: $dns1, $dns2"
 }
 
-# ==================== BBR 管理 ====================
+# ==================== BBR 管理（使用统一模块）====================
 check_bbr() {
+    # 尝试使用统一模块
+    if load_system_optimize_module; then
+        check_bbr_status
+        return $?
+    fi
+
+    # 模块加载失败，使用内置实现
     local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
     local available=$(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | awk '{print $3}')
-    
+
     echo
     echo "BBR 状态:"
     echo "  当前算法: ${current:-未知}"
     echo "  可用算法: ${available:-未知}"
-    
+
     if [[ $current == "bbr" ]]; then
         echo
         _green "BBR 已启用"
@@ -1041,6 +1082,13 @@ check_bbr() {
 }
 
 enable_bbr() {
+    # 尝试使用统一模块
+    if load_system_optimize_module; then
+        enable_bbr /etc/sysctl.conf
+        return $?
+    fi
+
+    # 模块加载失败，使用内置实现
     # 检查内核版本 (需要 4.9+)
     local kernel_major=$(uname -r | cut -d. -f1)
     local kernel_minor=$(uname -r | cut -d. -f2)
@@ -1075,8 +1123,15 @@ EOF
     fi
 }
 
-# ==================== TCP Fast Open ====================
+# ==================== TCP Fast Open（使用统一模块）====================
 enable_tcp_fastopen() {
+    # 尝试使用统一模块
+    if load_system_optimize_module; then
+        enable_network_optimization "$is_sysctl_conf" true true
+        return $?
+    fi
+
+    # 模块加载失败，使用内置实现
     local kernel_major=$(uname -r | cut -d. -f1)
     local kernel_minor=$(uname -r | cut -d. -f2)
 
@@ -1138,6 +1193,13 @@ BBR_EOF
 }
 
 disable_tcp_optimization() {
+    # 尝试使用统一模块
+    if load_system_optimize_module; then
+        remove_network_optimization "$is_sysctl_conf"
+        return $?
+    fi
+
+    # 模块加载失败，使用内置实现
     if [ -f "$is_sysctl_conf" ]; then
         rm -f "$is_sysctl_conf"
         sysctl --system >/dev/null 2>&1 || true
