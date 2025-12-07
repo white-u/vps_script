@@ -294,10 +294,204 @@ show_menu() {
     echo "  ${CYAN}[5]${RESET} 健康检查"
     echo "  ${CYAN}[6]${RESET} 安装缺失组件"
     echo ""
+    echo "  ${RED}[7]${RESET} 一键卸载所有组件"
+    echo ""
     echo "  ${CYAN}[0]${RESET} 退出"
     echo ""
     echo -e "${CYAN}────────────────────────────────────────────────────────${RESET}"
     echo ""
+}
+
+# =====================================
+# 一键卸载所有组件
+# =====================================
+uninstall_all() {
+    clear
+    echo -e "${BOLD}${RED}════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${RED}          ⚠️  一键卸载所有组件  ⚠️${RESET}"
+    echo -e "${BOLD}${RED}════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo -e "${YELLOW}此操作将卸载以下所有组件：${RESET}"
+    echo ""
+
+    local to_uninstall=()
+
+    if is_snell_installed; then
+        echo "  ✓ Snell Server"
+        to_uninstall+=("snell")
+    fi
+
+    if is_singbox_installed; then
+        echo "  ✓ sing-box"
+        to_uninstall+=("singbox")
+    fi
+
+    if is_ptm_installed; then
+        echo "  ✓ 流量监控 (port-manage)"
+        to_uninstall+=("ptm")
+    fi
+
+    echo "  ✓ VPS 统一管理平台"
+
+    echo ""
+
+    if [ ${#to_uninstall[@]} -eq 0 ]; then
+        warn "未检测到已安装的组件"
+        read -rp "按回车返回..." _
+        return
+    fi
+
+    echo -e "${RED}${BOLD}警告：此操作将：${RESET}"
+    echo "  • 停止并卸载所有代理服务"
+    echo "  • 删除所有配置文件和数据"
+    echo "  • 清理防火墙规则"
+    echo "  • 移除网络优化设置"
+    echo "  • 删除所有安装的脚本和二进制文件"
+    echo "  • 清理流量统计数据"
+    echo ""
+    echo -e "${RED}${BOLD}此操作不可逆！${RESET}"
+    echo ""
+
+    read -rp "确认要卸载所有组件吗？请输入 YES 继续: " confirm
+
+    if [ "$confirm" != "YES" ]; then
+        warn "已取消卸载"
+        sleep 1
+        return
+    fi
+
+    echo ""
+    echo -e "${CYAN}开始卸载...${RESET}"
+    echo ""
+
+    # 卸载 Snell
+    if is_snell_installed; then
+        log "正在卸载 Snell Server..."
+
+        # 停止服务
+        systemctl stop snell 2>/dev/null || true
+        systemctl disable snell 2>/dev/null || true
+
+        # 获取端口用于清理防火墙
+        local snell_port=""
+        if [ -f /etc/snell/snell-server.conf ]; then
+            snell_port=$(grep -E '^listen' /etc/snell/snell-server.conf 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
+        fi
+
+        # 删除文件
+        rm -f /etc/systemd/system/snell.service
+        rm -f /usr/local/bin/snell-server
+        rm -rf /etc/snell
+        rm -rf /var/backups/snell-manager
+        rm -f /usr/local/bin/snell-manager.sh
+        rm -f /usr/local/bin/snell
+        rm -f /tmp/snell_version_cache
+
+        # 清理防火墙
+        if [ -n "$snell_port" ]; then
+            ufw delete allow "$snell_port"/tcp 2>/dev/null || true
+            ufw delete allow "$snell_port"/udp 2>/dev/null || true
+            firewall-cmd --permanent --remove-port="${snell_port}"/tcp 2>/dev/null || true
+            firewall-cmd --permanent --remove-port="${snell_port}"/udp 2>/dev/null || true
+        fi
+
+        # 清理网络优化
+        rm -f /etc/sysctl.d/99-snell.conf
+
+        systemctl daemon-reload 2>/dev/null || true
+        success "Snell Server 已卸载"
+    fi
+
+    # 卸载 sing-box
+    if is_singbox_installed; then
+        log "正在卸载 sing-box..."
+
+        # 停止服务
+        systemctl stop sing-box 2>/dev/null || true
+        systemctl disable sing-box 2>/dev/null || true
+
+        # 获取所有端口用于清理防火墙
+        if [ -d /etc/sing-box/conf ]; then
+            find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null | while read conf; do
+                local port=$(jq -r '.inbounds[0].listen_port' "$conf" 2>/dev/null)
+                if [ -n "$port" ]; then
+                    ufw delete allow "$port"/tcp 2>/dev/null || true
+                    ufw delete allow "$port"/udp 2>/dev/null || true
+                    firewall-cmd --permanent --remove-port="${port}"/tcp 2>/dev/null || true
+                    firewall-cmd --permanent --remove-port="${port}"/udp 2>/dev/null || true
+                fi
+            done
+        fi
+
+        # 删除文件
+        rm -f /etc/systemd/system/sing-box.service
+        rm -rf /etc/sing-box
+        rm -rf /var/log/sing-box
+        rm -f /usr/local/bin/sing-box
+        rm -f /tmp/singbox_version_cache
+
+        # 清理网络优化
+        rm -f /etc/sysctl.d/99-singbox.conf
+
+        systemctl daemon-reload 2>/dev/null || true
+        success "sing-box 已卸载"
+    fi
+
+    # 卸载 port-manage
+    if is_ptm_installed; then
+        log "正在卸载流量监控..."
+
+        # 删除定时任务
+        crontab -l 2>/dev/null | grep -v port-traffic-monitor | crontab - 2>/dev/null || true
+
+        # 删除 nftables 规则
+        nft delete table inet port_monitor 2>/dev/null || true
+
+        # 删除 tc 规则
+        local interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+        if [ -n "$interface" ]; then
+            tc qdisc del dev "$interface" handle ffff: ingress 2>/dev/null || true
+        fi
+        tc qdisc del dev ifb0 root 2>/dev/null || true
+        ip link set ifb0 down 2>/dev/null || true
+
+        # 删除文件
+        rm -rf /etc/port-traffic-monitor
+        rm -f /usr/local/bin/ptm
+        rm -f /usr/local/bin/port-traffic-monitor.sh
+
+        success "流量监控已卸载"
+    fi
+
+    # 卸载 VPS 统一管理平台
+    log "正在卸载 VPS 统一管理平台..."
+    rm -f /usr/local/bin/vps
+    success "VPS 统一管理平台已卸载"
+
+    # 重新加载防火墙
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    # 重新加载 sysctl
+    sysctl -p 2>/dev/null || true
+
+    echo ""
+    echo -e "${GREEN}${BOLD}✓ 所有组件已卸载完成！${RESET}"
+    echo ""
+    echo -e "${YELLOW}已清理的内容：${RESET}"
+    echo "  • 所有服务和二进制文件"
+    echo "  • 所有配置文件和数据"
+    echo "  • 防火墙规则"
+    echo "  • 网络优化设置"
+    echo "  • 定时任务"
+    echo "  • 流量统计规则"
+    echo ""
+    echo -e "${CYAN}感谢使用 VPS 代理管理平台！${RESET}"
+    echo ""
+
+    read -rp "按回车退出..." _
+    exit 0
 }
 
 # =====================================
@@ -410,6 +604,9 @@ handle_command() {
         install)
             install_component
             ;;
+        uninstall)
+            uninstall_all
+            ;;
         version|v|-v|--version)
             echo "VPS 代理统一管理平台 v${SCRIPT_VERSION}"
             exit 0
@@ -447,6 +644,7 @@ VPS 代理统一管理平台 v${SCRIPT_VERSION}
   sb            进入 sing-box 管理
   traffic, ptm  进入流量监控
   install       安装缺失组件
+  uninstall     一键卸载所有组件
   version, v    显示版本
   help          显示此帮助
 
@@ -476,7 +674,7 @@ main() {
     # 主菜单循环
     while true; do
         show_menu
-        read -rp "请选择 [0-6]: " choice
+        read -rp "请选择 [0-7]: " choice
 
         case "$choice" in
             1)
@@ -522,6 +720,9 @@ main() {
                 ;;
             6)
                 install_component
+                ;;
+            7)
+                uninstall_all
                 ;;
             0)
                 echo ""
