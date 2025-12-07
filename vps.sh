@@ -524,6 +524,99 @@ uninstall_all() {
 }
 
 # =====================================
+# 自更新功能
+# =====================================
+update_self() {
+    echo -e "\n${BOLD}${CYAN}🔄 检查 vps.sh 更新${RESET}\n"
+
+    local current_version="$SCRIPT_VERSION"
+    local temp_file="/tmp/vps_new.sh"
+    local backup_file="/tmp/vps_backup_$(date +%Y%m%d_%H%M%S).sh"
+
+    # 备份当前脚本
+    local script_path
+    if readlink -f "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+        script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    else
+        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    fi
+
+    if [ -f "$script_path" ]; then
+        cp "$script_path" "$backup_file"
+        log "已备份当前版本到: $backup_file"
+    fi
+
+    # 下载最新版本
+    log "正在从 GitHub 下载最新版本..."
+    if curl -fsSL "$SCRIPT_URL" -o "$temp_file" 2>/dev/null; then
+        log "下载成功，正在验证..."
+    elif wget -q "$SCRIPT_URL" -O "$temp_file" 2>/dev/null; then
+        log "下载成功（使用 wget），正在验证..."
+    else
+        error "下载失败，请检查网络连接"
+        rm -f "$temp_file"
+        read -rp "按回车返回..." _
+        return 1
+    fi
+
+    # 验证语法
+    if ! bash -n "$temp_file" 2>/dev/null; then
+        error "下载的文件语法错误，更新已取消"
+        rm -f "$temp_file"
+        warn "如需恢复，备份文件位于: $backup_file"
+        read -rp "按回车返回..." _
+        return 1
+    fi
+
+    # 获取新版本号
+    local new_version=$(grep '^SCRIPT_VERSION=' "$temp_file" | head -1 | cut -d'"' -f2)
+
+    echo ""
+    echo -e "${CYAN}当前版本:${RESET} $current_version"
+    echo -e "${CYAN}最新版本:${RESET} $new_version"
+    echo ""
+
+    # 版本比较
+    if [ "$current_version" = "$new_version" ]; then
+        success "已是最新版本，无需更新"
+        rm -f "$temp_file"
+        read -rp "按回车返回..." _
+        return 0
+    fi
+
+    # 确认更新
+    read -rp "确认更新到 v$new_version? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        warn "已取消更新"
+        rm -f "$temp_file"
+        read -rp "按回车返回..." _
+        return 0
+    fi
+
+    # 执行更新
+    log "正在更新..."
+    chmod +x "$temp_file"
+
+    if mv "$temp_file" "$script_path" 2>/dev/null; then
+        success "✓ 更新成功！"
+        echo ""
+        echo -e "${GREEN}版本已更新: $current_version → $new_version${RESET}"
+        echo -e "${CYAN}备份文件: $backup_file${RESET}"
+        echo ""
+        warn "请重新运行 vps 命令以使用新版本"
+        echo ""
+        read -rp "按回车退出..." _
+        exit 0
+    else
+        error "更新失败，可能需要 root 权限"
+        warn "请尝试: sudo bash $temp_file"
+        warn "或手动复制: sudo mv $temp_file $script_path"
+        read -rp "按回车返回..." _
+        return 1
+    fi
+}
+
+# =====================================
 # 安装组件
 # =====================================
 install_component() {
@@ -692,6 +785,9 @@ handle_command() {
         uninstall)
             uninstall_all
             ;;
+        update|upgrade)
+            update_self
+            ;;
         version|v|-v|--version)
             echo "VPS 代理统一管理平台 v${SCRIPT_VERSION}"
             exit 0
@@ -730,6 +826,7 @@ VPS 代理统一管理平台 v${SCRIPT_VERSION}
   traffic, ptm  进入流量监控
   install       安装缺失组件
   uninstall     一键卸载所有组件
+  update        更新 vps.sh 到最新版本
   version, v    显示版本
   help          显示此帮助
 
@@ -740,6 +837,7 @@ VPS 代理统一管理平台 v${SCRIPT_VERSION}
   vps snell        # 管理 Snell
   vps sb           # 管理 sing-box
   vps traffic      # 管理流量监控
+  vps update       # 更新到最新版本
 
 EOF
 }
