@@ -3,8 +3,8 @@
 # VPS Manager - sing-box 模块
 # ============================================================================
 
-[[ "${SINGBOX_LOADED:-}" == "true" ]] && return 0
-SINGBOX_LOADED=true
+[[ "${XXX_LOADED:-}" == "true" ]] && return 0
+XXX_LOADED=true
 
 # ============================================================================
 # sing-box 配置
