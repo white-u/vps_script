@@ -13,6 +13,8 @@ NC='\033[0m'
 
 INSTALL_DIR="/usr/local/lib/vps-manager"
 BIN_LINK="/usr/local/bin/vps"
+CONFIG_DIR="/etc/vps-manager"
+BACKUP_DIR="/var/backups/vps-manager"
 REPO_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps-manager"
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -65,8 +67,29 @@ done
 # 创建目录
 log_info "创建目录..."
 mkdir -p "$INSTALL_DIR/modules"
-mkdir -p /etc/vps-manager
-mkdir -p /var/backups/vps-manager
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$BACKUP_DIR"
+
+# 创建默认配置文件
+if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
+    log_info "创建默认配置..."
+    cat > "$CONFIG_DIR/config.json" <<'EOF'
+{
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "server_name": ""
+  },
+  "settings": {
+    "auto_traffic_monitor": true,
+    "auto_firewall": true,
+    "auto_network_optimize": true
+  },
+  "version_cache": {}
+}
+EOF
+fi
 
 # 下载文件
 log_info "下载文件..."
