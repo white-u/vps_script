@@ -1183,7 +1183,9 @@ install_snell() {
   snell_service_control reload
   snell_service_control enable
   if snell_service_control start; then
-    log "安装完成！"
+    echo ""
+    log "✓ Snell 服务已启动并设置为开机自启"
+    log "✓ 安装完成！"
     echo ""
     echo "=== Surge 配置（可直接复制） ==="
     cat "$SNELL_CFGTXT"
@@ -1191,6 +1193,10 @@ install_snell() {
     # 自动添加流量监控
     echo ""
     auto_add_traffic_monitor "$port" "Snell Server"
+
+    echo ""
+    log "服务状态: systemctl status snell"
+    log "实时日志: journalctl -u snell -f"
   else
     err "服务未能启动，尝试回滚二进制并输出日志"
     journalctl -u snell -n 50 --no-pager || true
