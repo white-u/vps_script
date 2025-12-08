@@ -40,6 +40,40 @@ readonly MAX_TIMEOUT=30
 readonly SHORTCUT_COMMAND="ptm"
 readonly ALERT_THRESHOLDS=(30 50 80 100)
 
+# 网络重试常量
+readonly CURL_MAX_RETRIES=3
+readonly CURL_RETRY_DELAY=2
+
+# 字节转换常量
+readonly BYTES_PER_KB=1024
+readonly BYTES_PER_MB=1048576
+readonly BYTES_PER_GB=1073741824
+readonly BYTES_PER_TB=1099511627776
+
+# 速率转换常量
+readonly KBPS_PER_MBPS=1000
+readonly KBPS_PER_GBPS=1000000
+
+# nftables 操作常量
+readonly MAX_NFT_DELETE_ITERATIONS=50
+
+# TC 带宽控制常量
+readonly BURST_CALC_DIVISOR=20
+readonly MIN_BURST_BYTES=3000
+readonly DEFAULT_INTERFACE="eth0"
+
+# 流量历史常量
+readonly TRAFFIC_HISTORY_MAX_LINES=150
+readonly TRAFFIC_HISTORY_KEEP_LINES=120
+
+# 端口范围
+readonly PORT_MIN=1
+readonly PORT_MAX=65535
+
+# 协议定义
+readonly PROTO_TCP=6
+readonly PROTO_UDP=17
+
 NFT_TABLE=""
 NFT_FAMILY=""
 
@@ -50,24 +84,78 @@ NFT_FAMILY=""
 acquire_lock() {
     local timeout=${1:-5}
     local count=0
+
     mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    while [ -f "$LOCK_FILE" ]; do
-        local pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            count=$((count + 1))
-            [ $count -ge $timeout ] && return 1
-            sleep 1
+
+    # 使用 set -C (noclobber) 保证原子性
+    while ! (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; do
+        if [ -f "$LOCK_FILE" ]; then
+            local pid
+            pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+
+            # 检查进程是否存活
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                count=$((count + 1))
+                if [ $count -ge $timeout ]; then
+                    return 1
+                fi
+                sleep 1
+            else
+                # 进程已死，清理陈旧锁文件
+                rm -f "$LOCK_FILE"
+            fi
         else
-            rm -f "$LOCK_FILE"
-            break
+            # 锁文件被其他进程删除，短暂等待后重试
+            sleep 0.1
         fi
     done
-    echo $$ > "$LOCK_FILE"
+
     return 0
 }
 
 release_lock() {
     [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null || echo "")" = "$$" ] && rm -f "$LOCK_FILE"
+}
+
+# ============================================================================
+# 日志函数
+# ============================================================================
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $*"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+# ============================================================================
+# 网络请求重试
+# ============================================================================
+
+curl_with_retry() {
+    local url=$1
+    shift
+    local retry_count=0
+
+    while [ $retry_count -lt $CURL_MAX_RETRIES ]; do
+        if curl -s --connect-timeout $CONNECT_TIMEOUT --max-time $MAX_TIMEOUT "$@" "$url"; then
+            return 0
+        fi
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $CURL_MAX_RETRIES ]; then
+            sleep $CURL_RETRY_DELAY
+        fi
+    done
+    return 1
 }
 
 # ============================================================================
@@ -233,14 +321,14 @@ format_bytes() {
     local bytes=${1:-0}
     [[ ! "$bytes" =~ ^[0-9]+$ ]] && bytes=0
 
-    if [ $bytes -ge 1099511627776 ]; then
-        printf "%.2fTB" "$(echo "scale=2; $bytes / 1099511627776" | bc)"
-    elif [ $bytes -ge 1073741824 ]; then
-        printf "%.2fGB" "$(echo "scale=2; $bytes / 1073741824" | bc)"
-    elif [ $bytes -ge 1048576 ]; then
-        printf "%.2fMB" "$(echo "scale=2; $bytes / 1048576" | bc)"
-    elif [ $bytes -ge 1024 ]; then
-        printf "%.2fKB" "$(echo "scale=2; $bytes / 1024" | bc)"
+    if [ $bytes -ge $BYTES_PER_TB ]; then
+        printf "%.2fTB" "$(echo "scale=2; $bytes / $BYTES_PER_TB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_GB ]; then
+        printf "%.2fGB" "$(echo "scale=2; $bytes / $BYTES_PER_GB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_MB ]; then
+        printf "%.2fMB" "$(echo "scale=2; $bytes / $BYTES_PER_MB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_KB ]; then
+        printf "%.2fKB" "$(echo "scale=2; $bytes / $BYTES_PER_KB" | bc)"
     else
         echo "${bytes}B"
     fi
@@ -249,11 +337,11 @@ format_bytes() {
 format_rate() {
     local kbps=${1:-0}
     [[ ! "$kbps" =~ ^[0-9]+$ ]] && kbps=0
-    
-    if [ $kbps -ge 1000000 ]; then
-        printf "%.2fGbps" "$(echo "scale=2; $kbps / 1000000" | bc)"
-    elif [ $kbps -ge 1000 ]; then
-        printf "%.2fMbps" "$(echo "scale=2; $kbps / 1000" | bc)"
+
+    if [ $kbps -ge $KBPS_PER_GBPS ]; then
+        printf "%.2fGbps" "$(echo "scale=2; $kbps / $KBPS_PER_GBPS" | bc)"
+    elif [ $kbps -ge $KBPS_PER_MBPS ]; then
+        printf "%.2fMbps" "$(echo "scale=2; $kbps / $KBPS_PER_MBPS" | bc)"
     else
         echo "${kbps}Kbps"
     fi
@@ -315,18 +403,18 @@ parse_size_to_bytes() {
     local size_str=$1
     local number=$(echo "$size_str" | grep -oE '^[0-9]+\.?[0-9]*')
     local unit=$(echo "$size_str" | grep -oE '[A-Za-z]+$' | tr '[:lower:]' '[:upper:]')
-    
+
     [ -z "$number" ] && echo "0" && return 1
-    
+
     local multiplier=0
     case $unit in
-        "KB"|"K") multiplier=1024 ;;
-        "MB"|"M") multiplier=1048576 ;;
-        "GB"|"G") multiplier=1073741824 ;;
-        "TB"|"T") multiplier=1099511627776 ;;
+        "KB"|"K") multiplier=$BYTES_PER_KB ;;
+        "MB"|"M") multiplier=$BYTES_PER_MB ;;
+        "GB"|"G") multiplier=$BYTES_PER_GB ;;
+        "TB"|"T") multiplier=$BYTES_PER_TB ;;
         *) echo "0" && return 1 ;;
     esac
-    
+
     echo "scale=0; $number * $multiplier / 1" | bc
 }
 
@@ -353,7 +441,12 @@ jq_safe() {
 }
 
 update_config() {
-    local tmp="${CONFIG_FILE}.tmp.$$"
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || {
+        log_error "Failed to create temporary file"
+        return 1
+    }
+
     if jq "$1" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$CONFIG_FILE"
     else
@@ -365,7 +458,12 @@ update_config() {
 update_json_file() {
     local file=$1
     local expr=$2
-    local tmp="${file}.tmp.$$"
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXX") || {
+        log_error "Failed to create temporary file for $file"
+        return 1
+    }
+
     if jq "$expr" "$file" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$file"
     else
@@ -393,9 +491,9 @@ validate_port_range() {
     if is_port_range "$port"; then
         local start=$(echo "$port" | cut -d'-' -f1)
         local end=$(echo "$port" | cut -d'-' -f2)
-        [ "$start" -ge 1 ] && [ "$end" -le 65535 ] && [ "$start" -lt "$end" ]
+        [ "$start" -ge $PORT_MIN ] && [ "$end" -le $PORT_MAX ] && [ "$start" -lt "$end" ]
     else
-        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge $PORT_MIN ] && [ "$port" -le $PORT_MAX ]
     fi
 }
 
@@ -519,8 +617,8 @@ record_traffic_snapshot() {
     
     if [ -f "$history_file" ]; then
         local lines=$(wc -l < "$history_file" 2>/dev/null || echo "0")
-        if [ "$lines" -gt 150 ]; then
-            tail -n 120 "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
+        if [ "$lines" -gt $TRAFFIC_HISTORY_MAX_LINES ]; then
+            tail -n $TRAFFIC_HISTORY_KEEP_LINES "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
         fi
     fi
 }
@@ -595,7 +693,7 @@ remove_nftables_rules() {
     local port_safe=$(get_port_safe "$port")
 
     local deleted=0
-    while [ $deleted -lt 50 ]; do
+    while [ $deleted -lt $MAX_NFT_DELETE_ITERATIONS ]; do
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
             grep -E "port_${port_safe}_" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
         [ -z "$handle" ] && break
@@ -650,7 +748,7 @@ remove_quota() {
     local quota_name="port_${port_safe}_quota"
 
     local deleted=0
-    while [ $deleted -lt 50 ]; do
+    while [ $deleted -lt $MAX_NFT_DELETE_ITERATIONS ]; do
         local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
             grep "quota name \"$quota_name\"" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
         [ -z "$handle" ] && break
@@ -669,11 +767,11 @@ remove_quota() {
 
 calculate_burst() {
     local rate_kbps=$1
-    local burst_bytes=$(( rate_kbps * 1000 / 8 / 20 ))
-    [ $burst_bytes -lt 3000 ] && burst_bytes=3000
-    
-    if [ $burst_bytes -ge 1048576 ]; then echo "$((burst_bytes / 1048576))m"
-    elif [ $burst_bytes -ge 1024 ]; then echo "$((burst_bytes / 1024))k"
+    local burst_bytes=$(( rate_kbps * 1000 / 8 / BURST_CALC_DIVISOR ))
+    [ $burst_bytes -lt $MIN_BURST_BYTES ] && burst_bytes=$MIN_BURST_BYTES
+
+    if [ $burst_bytes -ge $BYTES_PER_MB ]; then echo "$((burst_bytes / BYTES_PER_MB))m"
+    elif [ $burst_bytes -ge $BYTES_PER_KB ]; then echo "$((burst_bytes / BYTES_PER_KB))k"
     else echo "$burst_bytes"; fi
 }
 
@@ -706,7 +804,7 @@ setup_ifb() {
 apply_tc_limit() {
     local port=$1 rate=$2
     local interface=$(get_default_interface)
-    [ -z "$interface" ] && interface="eth0"
+    [ -z "$interface" ] && interface="$DEFAULT_INTERFACE"
 
     local tc_rate rate_lower=$(echo "$rate" | tr '[:upper:]' '[:lower:]')
     if [[ "$rate_lower" =~ kbps$ ]]; then tc_rate=$(echo "$rate_lower" | sed 's/kbps$/kbit/')
@@ -756,7 +854,7 @@ apply_tc_limit() {
 remove_tc_limit() {
     local port=$1
     local interface=$(get_default_interface)
-    [ -z "$interface" ] && interface="eth0"
+    [ -z "$interface" ] && interface="$DEFAULT_INTERFACE"
 
     local class_id=$(get_tc_class_id "$port")
     
