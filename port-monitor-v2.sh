@@ -1349,13 +1349,19 @@ ui_show_status() {
     local ports=($(db_port_list))
     local total_used=0
 
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}             ${CYAN}${SCRIPT_NAME} v${SCRIPT_VERSION}${NC}               ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
+    # 标题
+    echo ""
+    echo -e "  ${BOLD}${SCRIPT_NAME}${NC} ${GRAY}v${SCRIPT_VERSION}${NC}"
+    echo -e "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
 
     if [ ${#ports[@]} -eq 0 ]; then
-        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                            ${BLUE}║${NC}"
+        echo -e "  ${YELLOW}暂无监控端口${NC}"
     else
+        # 表头
+        printf "  ${GRAY}%-10s %-12s %-12s %-12s %s${NC}\n" "端口" "上传" "下载" "计费流量" "状态"
+        echo -e "  ${GRAY}──────────────────────────────────────────────────${NC}"
+
         for port in "${ports[@]}"; do
             local traffic=($(nft_get_port_traffic "$port"))
             local billing=$(db_port_get_billing "$port")
@@ -1373,85 +1379,69 @@ ui_show_status() {
             local quota=$(db_quota_get "$port")
             local rate_kbps=$(db_bandwidth_get "$port")
 
-            local percent_display=""
+            # 状态标识
+            local status=""
             if [ "$quota" != "null" ]; then
                 local limit_bytes=$(echo "$quota" | jq -r '.limit_bytes')
                 local percent=$((used_bytes * 100 / limit_bytes))
-
                 if [ $percent -ge 100 ]; then
-                    percent_display=" ${RED}[${percent}%]${NC}"
+                    status+="${RED}${percent}%${NC} "
                 elif [ $percent -ge 80 ]; then
-                    percent_display=" ${YELLOW}[${percent}%]${NC}"
+                    status+="${YELLOW}${percent}%${NC} "
                 else
-                    percent_display=" ${GREEN}[${percent}%]${NC}"
+                    status+="${GREEN}${percent}%${NC} "
                 fi
             fi
 
             # 检查突发保护状态
-            local burst_display=""
             local burst_state=$(db_burst_get_state "$port")
             if [ "$burst_state" != "null" ]; then
                 local throttle_start=$(echo "$burst_state" | jq -r '.throttle_start')
                 local now=$(date +%s)
                 local remaining=$(( (throttle_start + 600 - now) / 60 ))
                 [ $remaining -lt 0 ] && remaining=0
-                burst_display=" ${RED}🔽${remaining}m${NC}"
+                status+="${RED}[限速${remaining}m]${NC}"
             else
                 local burst_config=$(db_burst_get_config "$port")
                 if [ "$burst_config" != "null" ]; then
-                    burst_display=" ${GREEN}⚡${NC}"
+                    status+="${GREEN}[保护]${NC}"
                 fi
             fi
 
-            # 显示端口行
-            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b ${BLUE}║${NC}\n" \
-                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" \
-                "$(format_bytes $used_bytes)" "$percent_display" "$burst_display"
+            # 端口显示（带备注）
+            local port_display="$port"
+            [ -n "$remark" ] && port_display="$port${GRAY}($remark)${NC}"
 
-            # 显示标签行
-            local tags=""
-            [ -n "$remark" ] && tags+="[$remark] "
+            # 显示端口行
+            printf "  ${GREEN}%-10s${NC} %-12s %-12s %-12s %b\n" \
+                "$port_display" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" \
+                "$(format_bytes $used_bytes)" "$status"
+
+            # 显示配额和限速信息（如果有）
+            local extra=""
             if [ "$quota" != "null" ]; then
                 local limit_bytes=$(echo "$quota" | jq -r '.limit_bytes')
-                tags+="配额:$(format_bytes $limit_bytes) "
+                extra+="配额:$(format_bytes $limit_bytes) "
             fi
-            [ "$rate_kbps" -gt 0 ] && tags+="限速:${rate_kbps}kbps"
-
-            if [ -n "$tags" ]; then
-                printf "${BLUE}║${NC}    ${GRAY}%-56s${NC} ${BLUE}║${NC}\n" "$tags"
-            fi
+            [ "$rate_kbps" -gt 0 ] && extra+="限速:${rate_kbps}kbps"
+            [ -n "$extra" ] && printf "  ${GRAY}  └─ %s${NC}\n" "$extra"
         done
     fi
 
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
-    printf "${BLUE}║${NC}  监控端口: ${GREEN}%-2d${NC}  总流量: ${GREEN}%-12s${NC}  快捷命令: ${CYAN}%-4s${NC}  ${BLUE}║${NC}\n" \
-        "${#ports[@]}" "$(format_bytes $total_used)" "$SHORTCUT_COMMAND"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${GRAY}⚡=突发保护启用  🔽=限速中(剩余分钟数)${NC}"
+    echo -e "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  监控: ${GREEN}${#ports[@]}${NC} 个  总流量: ${GREEN}$(format_bytes $total_used)${NC}  命令: ${CYAN}${SHORTCUT_COMMAND}${NC}"
     echo ""
 }
 
 ui_show_menu() {
-    echo -e "${CYAN}╔════════════════╗${NC}"
-    echo -e "${CYAN}║  端口管理      ║${NC}"
-    echo -e "${CYAN}╚════════════════╝${NC}"
-    echo "  1. 添加端口       2. 删除端口       3. 修改备注"
+    echo -e "  ${BOLD}操作菜单${NC}"
+    echo -e "  ${GRAY}────────────────────────────────────────${NC}"
     echo ""
-    echo -e "${CYAN}╔════════════════╗${NC}"
-    echo -e "${CYAN}║  流量控制      ║${NC}"
-    echo -e "${CYAN}╚════════════════╝${NC}"
-    echo "  4. 带宽限速       5. 流量配额       6. 重置流量"
-    echo ""
-    echo -e "${CYAN}╔════════════════╗${NC}"
-    echo -e "${CYAN}║  高级功能      ║${NC}"
-    echo -e "${CYAN}╚════════════════╝${NC}"
-    echo "  7. 突发保护       8. Telegram       9. 立即推送"
-    echo ""
-    echo -e "${CYAN}╔════════════════╗${NC}"
-    echo -e "${CYAN}║  系统          ║${NC}"
-    echo -e "${CYAN}╚════════════════╝${NC}"
-    echo "  10. 卸载          0. 退出"
+    echo -e "  ${CYAN}[端口]${NC}  1.添加  2.删除  3.备注"
+    echo -e "  ${CYAN}[流量]${NC}  4.限速  5.配额  6.重置"
+    echo -e "  ${CYAN}[高级]${NC}  7.突发保护  8.Telegram  9.推送"
+    echo -e "  ${CYAN}[系统]${NC}  10.卸载  0.退出"
     echo ""
 }
 
@@ -1506,11 +1496,19 @@ ui_add_port() {
     if [ ${#listening_ports[@]} -eq 0 ]; then
         echo -e "  ${GRAY}(无可用端口)${NC}"
     else
+        # 水平排列显示，每行5个
         local i=1
+        local line=""
         for port in "${listening_ports[@]}"; do
-            printf "  ${GREEN}%d.${NC} %s\n" "$i" "$port"
+            line+=$(printf "${GREEN}%d.${NC}%-6s  " "$i" "$port")
+            if [ $((i % 5)) -eq 0 ]; then
+                echo -e "  $line"
+                line=""
+            fi
             i=$((i + 1))
         done
+        # 输出剩余的
+        [ -n "$line" ] && echo -e "  $line"
     fi
     echo ""
 
