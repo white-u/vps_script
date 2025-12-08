@@ -69,22 +69,82 @@ check_dependencies() {
     command -v ss >/dev/null 2>&1 || optional_missing+=("iproute2")
 
     if [ ${#missing[@]} -gt 0 ]; then
-        error "缺少必需工具: ${missing[*]}"
-        error "vps.sh 需要 jq 来解析 JSON 配置文件"
+        warn "缺少必需工具: ${missing[*]}"
+        log "正在安装依赖工具..."
         echo ""
-        error "请先安装缺失的工具："
-        echo "  Debian/Ubuntu: apt install ${missing[*]}"
-        echo "  CentOS/RHEL:   yum install ${missing[*]}"
-        echo "  macOS:         brew install ${missing[*]}"
+
+        # 检测包管理器并自动安装
+        if command -v apt >/dev/null 2>&1; then
+            apt update -qq && apt install -y ${missing[*]}
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y ${missing[*]}
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y ${missing[*]}
+        elif command -v apk >/dev/null 2>&1; then
+            apk add ${missing[*]}
+        elif command -v brew >/dev/null 2>&1; then
+            brew install ${missing[*]}
+        else
+            error "未检测到支持的包管理器"
+            echo ""
+            error "请手动安装缺失的工具："
+            echo "  Debian/Ubuntu: apt install ${missing[*]}"
+            echo "  CentOS/RHEL:   yum install ${missing[*]}"
+            echo "  Alpine:        apk add ${missing[*]}"
+            echo "  macOS:         brew install ${missing[*]}"
+            echo ""
+            exit 1
+        fi
+
+        # 验证安装
+        local install_failed=()
+        for tool in "${missing[@]}"; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                install_failed+=("$tool")
+            fi
+        done
+
+        if [ ${#install_failed[@]} -gt 0 ]; then
+            error "安装失败: ${install_failed[*]}"
+            echo ""
+            error "请手动安装后重试："
+            echo "  Debian/Ubuntu: apt install ${install_failed[*]}"
+            echo "  CentOS/RHEL:   yum install ${install_failed[*]}"
+            echo "  Alpine:        apk add ${install_failed[*]}"
+            echo "  macOS:         brew install ${install_failed[*]}"
+            echo ""
+            exit 1
+        fi
+
+        success "依赖工具安装成功"
         echo ""
-        exit 1
     fi
 
     if [ ${#optional_missing[@]} -gt 0 ]; then
         warn "缺少可选工具: ${optional_missing[*]}"
         warn "部分功能可能受限（流量统计、端口检查等）"
-        warn "建议安装: apt install ${optional_missing[*]} 或 yum install ${optional_missing[*]}"
         echo ""
+
+        # 询问是否安装可选工具
+        read -rp "是否安装可选工具以启用完整功能? [y/N]: " install_optional
+        if [[ "$install_optional" =~ ^[Yy]$ ]]; then
+            log "正在安装可选工具..."
+
+            if command -v apt >/dev/null 2>&1; then
+                apt install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
+            elif command -v apk >/dev/null 2>&1; then
+                apk add ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
+            fi
+
+            echo ""
+        else
+            warn "已跳过可选工具安装，建议稍后手动安装以启用完整功能"
+            echo ""
+        fi
     fi
 }
 
