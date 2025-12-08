@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 v2.5.0
+# 端口流量监控脚本 v2.5.5
 # 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知、突发速率保护
-# 改进: 并发安全、边界处理、日志系统、输入校验
+# 改进: 并发安全、边界处理、日志系统、输入校验、在线更新
 # ============================================================================
 
 set -o pipefail
 
-readonly SCRIPT_VERSION="2.5.4"
+readonly SCRIPT_VERSION="2.5.5"
 readonly SCRIPT_NAME="端口流量监控"
+readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
 if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]] || [[ "$0" == "bash" ]] || [[ "$0" == /tmp/* ]]; then
@@ -2777,8 +2778,100 @@ show_menu() {
     echo -e "${CYAN}── 通知设置 ──${NC}"
     echo "  8. Telegram    9. 立即推送"
     echo -e "${CYAN}── 系统 ──${NC}"
-    echo "  10. 查看日志   11. 卸载       0. 退出"
+    echo "  10. 查看日志   11. 卸载       12. 检查更新"
+    echo "  0. 退出"
     echo
+}
+
+# ============================================================================
+# 版本更新
+# ============================================================================
+
+# 版本号转数字 (2.5.4 -> 20504)
+version_to_num() {
+    local version=$1
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$version"
+    echo $((major * 10000 + minor * 100 + ${patch:-0}))
+}
+
+# 比较版本: 返回 0=相等, 1=v1>v2, 2=v1<v2
+compare_versions() {
+    local v1=$(version_to_num "$1")
+    local v2=$(version_to_num "$2")
+    
+    if [ "$v1" -eq "$v2" ]; then echo 0
+    elif [ "$v1" -gt "$v2" ]; then echo 1
+    else echo 2
+    fi
+}
+
+check_update() {
+    echo -e "${CYAN}=== 检查更新 ===${NC}\n"
+    echo -e "当前版本: ${GREEN}v${SCRIPT_VERSION}${NC}"
+    echo -e "检查中..."
+    
+    # 获取远程版本
+    local remote_script
+    remote_script=$(curl -s --connect-timeout 10 --max-time 30 "$UPDATE_URL" 2>/dev/null)
+    
+    if [ -z "$remote_script" ]; then
+        echo -e "${RED}✗ 无法连接更新服务器${NC}"
+        sleep 2
+        return
+    fi
+    
+    local remote_version
+    remote_version=$(echo "$remote_script" | grep -m1 "^readonly SCRIPT_VERSION=" | cut -d'"' -f2)
+    
+    if [ -z "$remote_version" ]; then
+        echo -e "${RED}✗ 无法获取远程版本号${NC}"
+        sleep 2
+        return
+    fi
+    
+    echo -e "最新版本: ${CYAN}v${remote_version}${NC}"
+    echo
+    
+    local cmp=$(compare_versions "$remote_version" "$SCRIPT_VERSION")
+    
+    case $cmp in
+        0)
+            echo -e "${GREEN}✓ 已是最新版本${NC}"
+            sleep 2
+            ;;
+        1)
+            echo -e "${YELLOW}发现新版本!${NC}"
+            echo
+            echo "1. 立即更新"
+            echo "0. 返回"
+            read -p "选择: " choice
+            
+            if [ "$choice" = "1" ]; then
+                echo
+                echo -e "备份当前版本..."
+                cp "$SCRIPT_PATH" "${SCRIPT_PATH}.bak.${SCRIPT_VERSION}" 2>/dev/null && \
+                    echo -e "${GREEN}✓ 已备份到 ${SCRIPT_PATH}.bak.${SCRIPT_VERSION}${NC}"
+                
+                echo -e "下载新版本..."
+                if echo "$remote_script" > "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
+                    echo -e "${GREEN}✓ 更新成功!${NC}"
+                    echo -e "${YELLOW}请重新运行脚本以使用新版本${NC}"
+                    log_action "SYSTEM" "updated from v$SCRIPT_VERSION to v$remote_version"
+                    sleep 2
+                    exit 0
+                else
+                    echo -e "${RED}✗ 更新失败，正在恢复...${NC}"
+                    cp "${SCRIPT_PATH}.bak.${SCRIPT_VERSION}" "$SCRIPT_PATH" 2>/dev/null
+                    sleep 2
+                fi
+            fi
+            ;;
+        2)
+            echo -e "${CYAN}当前版本比远程版本更新 (开发版本?)${NC}"
+            sleep 2
+            ;;
+    esac
 }
 
 uninstall() {
@@ -2897,6 +2990,9 @@ main() {
             --logs)
                 show_logs "${2:-50}"
                 exit 0 ;;
+            --update)
+                check_update
+                exit 0 ;;
             --version|-v)
                 echo "$SCRIPT_NAME v$SCRIPT_VERSION"
                 exit 0 ;;
@@ -2907,6 +3003,7 @@ main() {
                 echo "  --check-alert    检查阈值告警"
                 echo "  --check-burst    检查突发速率保护"
                 echo "  --logs [n]       查看最近 n 条日志"
+                echo "  --update         检查并更新脚本"
                 echo "  --version        显示版本"
                 exit 0 ;;
             *)
@@ -2920,7 +3017,7 @@ main() {
     while true; do
         show_status
         show_menu
-        read -p "选择 [0-11]: " choice
+        read -p "选择 [0-12]: " choice
         case $choice in
             1) add_port ;;
             2) remove_port ;;
@@ -2945,6 +3042,7 @@ main() {
                 sleep 1 ;;
             10) show_logs 50 true ;;
             11) uninstall ;;
+            12) check_update ;;
             0) 
                 log_action "SYSTEM" "interactive session ended"
                 exit 0 ;;
