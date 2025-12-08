@@ -109,9 +109,20 @@ install_component_safely() {
     if curl -fsSL "$download_url" -o "$temp_file" 2>/dev/null || \
        wget -q "$download_url" -O "$temp_file" 2>/dev/null; then
         if bash -n "$temp_file" 2>/dev/null; then
-            bash "$temp_file"
-            local exit_code=$?
+            # 复制到临时文件，避免执行过程中被删除
+            local persistent_file=$(mktemp /tmp/"${component_name}"_exec_XXXXXX.sh)
+            cp "$temp_file" "$persistent_file"
+            chmod +x "$persistent_file"
+
+            # 删除下载的临时文件
             rm -f "$temp_file"
+
+            # 执行副本（脚本可以安全运行，即使是交互式的）
+            bash "$persistent_file"
+            local exit_code=$?
+
+            # 清理执行副本
+            rm -f "$persistent_file"
             return $exit_code
         else
             error "下载的安装脚本语法错误"
@@ -900,7 +911,7 @@ handle_command() {
             ;;
         snell)
             if is_snell_installed; then
-                snell
+                exec /usr/local/bin/snell "$@"
             else
                 error "Snell 未安装，请先安装"
                 echo "运行: vps 并选择 [6] 安装缺失组件"
@@ -909,7 +920,7 @@ handle_command() {
             ;;
         sb|singbox|sing-box)
             if is_singbox_installed; then
-                sing-box
+                exec /usr/local/bin/sing-box "$@"
             else
                 error "sing-box 未安装，请先安装"
                 echo "运行: vps 并选择 [6] 安装缺失组件"
@@ -918,7 +929,7 @@ handle_command() {
             ;;
         traffic|ptm)
             if is_ptm_installed; then
-                ptm
+                exec /usr/local/bin/ptm "$@"
             else
                 error "port-manage 未安装，请先安装"
                 echo "运行: vps 并选择 [6] 安装缺失组件"
@@ -1039,7 +1050,7 @@ main() {
         case "$choice" in
             1)
                 if is_snell_installed; then
-                    snell
+                    /usr/local/bin/snell || true
                 else
                     error "Snell 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
@@ -1050,7 +1061,7 @@ main() {
                 ;;
             2)
                 if is_singbox_installed; then
-                    sing-box
+                    /usr/local/bin/sing-box || true
                 else
                     error "sing-box 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
@@ -1061,7 +1072,7 @@ main() {
                 ;;
             3)
                 if is_ptm_installed; then
-                    ptm
+                    /usr/local/bin/ptm || true
                 else
                     error "port-manage 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm

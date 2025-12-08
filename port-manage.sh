@@ -522,7 +522,7 @@ get_port_traffic() {
 }
 
 calculate_total_traffic() {
-    local input=$1 output=$2 mode=${3:-"single"}
+    local input=${1:-0} output=${2:-0} mode=${3:-"single"}
     [ "$mode" = "double" ] && echo $((input + output)) || echo $output
 }
 
