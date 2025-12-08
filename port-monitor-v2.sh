@@ -1459,11 +1459,71 @@ ui_show_menu() {
 # UI 层 - 交互功能
 # ============================================================================
 
+# 排除的常用系统端口
+readonly EXCLUDED_PORTS="22 80 443 53 67 68 546 547 25 110 143 993 995 587 465 21 23 3306 5432 6379 27017 11211"
+
+# 获取当前监听的端口列表（排除常用端口和已监控端口）
+get_listening_ports() {
+    local monitored_ports=($(db_port_list 2>/dev/null))
+
+    # 构建排除列表
+    local all_excluded="$EXCLUDED_PORTS"
+    for p in "${monitored_ports[@]}"; do
+        all_excluded="$all_excluded $p"
+    done
+
+    # 获取监听端口并过滤
+    ss -tlnp 2>/dev/null | awk 'NR>1 {
+        split($4, a, ":")
+        port = a[length(a)]
+        if (port ~ /^[0-9]+$/) {
+            ports[port] = 1
+        }
+    }
+    END {
+        for (p in ports) print p
+    }' | while read port; do
+        local skip=0
+        for excluded in $all_excluded; do
+            if [ "$port" = "$excluded" ]; then
+                skip=1
+                break
+            fi
+        done
+        [ $skip -eq 0 ] && echo "$port"
+    done | sort -n
+}
+
 ui_add_port() {
     echo -e "\n${CYAN}=== 添加端口 ===${NC}\n"
 
-    read -p "端口号 (如: 8000 或 8000-9000): " port
-    [ -z "$port" ] && return
+    # 显示当前监听的端口
+    echo -e "${YELLOW}当前监听的端口（已排除系统常用端口和已监控端口）:${NC}"
+    echo ""
+
+    local listening_ports=($(get_listening_ports))
+
+    if [ ${#listening_ports[@]} -eq 0 ]; then
+        echo -e "  ${GRAY}(无可用端口)${NC}"
+    else
+        local i=1
+        for port in "${listening_ports[@]}"; do
+            printf "  ${GREEN}%d.${NC} %s\n" "$i" "$port"
+            i=$((i + 1))
+        done
+    fi
+    echo ""
+
+    # 支持输入序号或端口号
+    read -p "输入序号或端口号 (如: 1 或 8000 或 8000-9000): " input
+    [ -z "$input" ] && return
+
+    local port="$input"
+    # 如果输入的是纯数字且在列表范围内，则视为序号
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#listening_ports[@]} ]; then
+        port="${listening_ports[$((input - 1))]}"
+        echo -e "已选择端口: ${GREEN}$port${NC}"
+    fi
 
     if ! validate_port "$port"; then
         log_error "无效的端口格式"
