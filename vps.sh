@@ -57,33 +57,45 @@ check_root() {
 
 check_dependencies() {
     local missing=()
-    local optional_missing=()
 
-    # 检查必需工具
+    # 检查所有工具
     command -v jq >/dev/null 2>&1 || missing+=("jq")
+    command -v bc >/dev/null 2>&1 || missing+=("bc")
+    command -v nft >/dev/null 2>&1 || missing+=("nftables")
+    command -v ss >/dev/null 2>&1 || missing+=("iproute2")
 
-    # 检查可选工具（缺失时会影响功能但不会完全无法使用）
-    command -v bc >/dev/null 2>&1 || optional_missing+=("bc")
-    command -v awk >/dev/null 2>&1 || optional_missing+=("awk")
-    command -v nft >/dev/null 2>&1 || optional_missing+=("nftables")
-    command -v ss >/dev/null 2>&1 || optional_missing+=("iproute2")
+    # awk 通常是系统自带的，单独检查
+    if ! command -v awk >/dev/null 2>&1; then
+        missing+=("gawk")
+    fi
 
     if [ ${#missing[@]} -gt 0 ]; then
-        warn "缺少必需工具: ${missing[*]}"
-        log "正在安装依赖工具..."
+        warn "缺少依赖工具: ${missing[*]}"
+        log "正在自动安装依赖工具..."
         echo ""
 
         # 检测包管理器并自动安装
+        local install_success=false
         if command -v apt >/dev/null 2>&1; then
-            apt update -qq && apt install -y ${missing[*]}
+            if apt update -qq && apt install -y ${missing[*]}; then
+                install_success=true
+            fi
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y ${missing[*]}
+            if yum install -y ${missing[*]}; then
+                install_success=true
+            fi
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y ${missing[*]}
+            if dnf install -y ${missing[*]}; then
+                install_success=true
+            fi
         elif command -v apk >/dev/null 2>&1; then
-            apk add ${missing[*]}
+            if apk add ${missing[*]}; then
+                install_success=true
+            fi
         elif command -v brew >/dev/null 2>&1; then
-            brew install ${missing[*]}
+            if brew install ${missing[*]}; then
+                install_success=true
+            fi
         else
             error "未检测到支持的包管理器"
             echo ""
@@ -96,55 +108,43 @@ check_dependencies() {
             exit 1
         fi
 
-        # 验证安装
-        local install_failed=()
-        for tool in "${missing[@]}"; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-                install_failed+=("$tool")
-            fi
-        done
+        # 验证安装结果
+        local still_missing=()
+        local required_missing=()
 
-        if [ ${#install_failed[@]} -gt 0 ]; then
-            error "安装失败: ${install_failed[*]}"
+        # 检查必需工具（jq）
+        if ! command -v jq >/dev/null 2>&1; then
+            required_missing+=("jq")
+        fi
+
+        # 检查其他工具（可选工具安装失败不影响运行）
+        command -v bc >/dev/null 2>&1 || still_missing+=("bc")
+        command -v nft >/dev/null 2>&1 || still_missing+=("nftables")
+        command -v ss >/dev/null 2>&1 || still_missing+=("iproute2")
+        command -v awk >/dev/null 2>&1 || still_missing+=("awk")
+
+        # 如果必需工具安装失败，退出
+        if [ ${#required_missing[@]} -gt 0 ]; then
+            error "必需工具安装失败: ${required_missing[*]}"
             echo ""
             error "请手动安装后重试："
-            echo "  Debian/Ubuntu: apt install ${install_failed[*]}"
-            echo "  CentOS/RHEL:   yum install ${install_failed[*]}"
-            echo "  Alpine:        apk add ${install_failed[*]}"
-            echo "  macOS:         brew install ${install_failed[*]}"
+            echo "  Debian/Ubuntu: apt install ${required_missing[*]}"
+            echo "  CentOS/RHEL:   yum install ${required_missing[*]}"
+            echo "  Alpine:        apk add ${required_missing[*]}"
+            echo "  macOS:         brew install ${required_missing[*]}"
             echo ""
             exit 1
         fi
 
-        success "依赖工具安装成功"
-        echo ""
-    fi
-
-    if [ ${#optional_missing[@]} -gt 0 ]; then
-        warn "缺少可选工具: ${optional_missing[*]}"
-        warn "部分功能可能受限（流量统计、端口检查等）"
-        echo ""
-
-        # 询问是否安装可选工具
-        read -rp "是否安装可选工具以启用完整功能? [y/N]: " install_optional
-        if [[ "$install_optional" =~ ^[Yy]$ ]]; then
-            log "正在安装可选工具..."
-
-            if command -v apt >/dev/null 2>&1; then
-                apt install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
-            elif command -v yum >/dev/null 2>&1; then
-                yum install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
-            elif command -v dnf >/dev/null 2>&1; then
-                dnf install -y ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
-            elif command -v apk >/dev/null 2>&1; then
-                apk add ${optional_missing[*]} 2>/dev/null || warn "部分可选工具安装失败（不影响核心功能）"
-            fi
-
-            echo ""
+        # 显示安装结果
+        if [ ${#still_missing[@]} -eq 0 ]; then
+            success "所有依赖工具安装成功"
         else
-            warn "已跳过可选工具安装，建议稍后手动安装以启用完整功能"
-            echo ""
+            success "核心依赖工具安装成功"
+            warn "部分可选工具未安装: ${still_missing[*]}"
+            warn "部分功能可能受限（流量统计、端口检查等）"
         fi
+        echo ""
     fi
 }
 
