@@ -667,8 +667,18 @@ uninstall_ptm() {
     nft delete table inet port_traffic 2>/dev/null || true
 
     # 删除 systemd timers
+    # 先禁用运行中的定时器
     systemctl disable --now port-traffic-alert.timer 2>/dev/null || true
     systemctl disable --now port-traffic-burst.timer 2>/dev/null || true
+
+    # 遍历并禁用所有端口的 reset timer
+    for timer_file in /etc/systemd/system/port-traffic-reset-*.timer; do
+        [ -f "$timer_file" ] || continue
+        local timer_name=$(basename "$timer_file")
+        systemctl disable --now "$timer_name" 2>/dev/null || true
+    done
+
+    # 删除所有 systemd 单元文件
     rm -f /etc/systemd/system/port-traffic-*.{service,timer} 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
 
