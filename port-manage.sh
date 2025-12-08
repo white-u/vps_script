@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.2"
 readonly SCRIPT_NAME="端口流量监控"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
@@ -1120,10 +1120,21 @@ add_nftables_rules() {
     local port=$1
     local port_safe=$(get_port_safe "$port")
 
+    # 创建计数器 (如果不存在)
     nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" >/dev/null 2>&1 || \
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null || true
     nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" >/dev/null 2>&1 || \
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
+
+    # 检查规则是否已存在 (通过检查是否有使用该计数器的规则)
+    local existing_rules
+    existing_rules=$(nft list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep -c "counter name \"port_${port_safe}_" || echo "0")
+    
+    # 如果已有规则，跳过添加
+    if [ "$existing_rules" -gt 0 ]; then
+        log_debug "nftables rules for port $port already exist, skipping"
+        return
+    fi
 
     local proto
     for proto in tcp udp; do
@@ -1312,16 +1323,19 @@ get_tc_filter_prio() {
     fi
 }
 
-# 单端口 filter
+# 单端口 filter (为每个端口+协议组合使用唯一 prio)
 _apply_tc_filter_single() {
     local interface=$1 port=$2 class_id=$3 prio=$4 direction=$5
-    local proto_num
+    local proto_num proto_offset=0
     
     for proto_num in $PROTO_TCP $PROTO_UDP; do
-        tc filter add dev "$interface" protocol ip parent 1:0 prio "$prio" u32 \
+        # 每个协议使用不同的 prio 偏移，确保唯一性
+        local actual_prio=$((prio * 10 + proto_offset))
+        tc filter add dev "$interface" protocol ip parent 1:0 prio "$actual_prio" u32 \
             match ip protocol "$proto_num" 0xff \
             match ip "$direction" "$port" 0xffff \
             flowid "$class_id" 2>/dev/null || true
+        proto_offset=$((proto_offset + 1))
     done
 }
 
@@ -1336,13 +1350,19 @@ _apply_tc_filter_range() {
     local range_size=$((end - start + 1))
     
     if [ "$range_size" -le 16 ]; then
+        local port_offset=0
         for p in $(seq "$start" "$end"); do
+            local proto_offset=0
             for proto_num in $PROTO_TCP $PROTO_UDP; do
-                tc filter add dev "$interface" protocol ip parent 1:0 prio "$prio" u32 \
+                # 每个端口+协议组合使用唯一 prio
+                local actual_prio=$((prio * 1000 + port_offset * 10 + proto_offset))
+                tc filter add dev "$interface" protocol ip parent 1:0 prio "$actual_prio" u32 \
                     match ip protocol "$proto_num" 0xff \
                     match ip "$direction" "$p" 0xffff \
                     flowid "$class_id" 2>/dev/null || true
+                proto_offset=$((proto_offset + 1))
             done
+            port_offset=$((port_offset + 1))
         done
     else
         _apply_tc_filter_range_via_mark "$interface" "$port_range" "$class_id" "$prio" "$direction"
@@ -1369,18 +1389,23 @@ _apply_tc_filter_range_via_mark() {
 
 _apply_tc_filter_single_ingress() {
     local interface=$1 port=$2 ifb_class_id=$3 filter_prio=$4 ifb_prio=$5
-    local proto_num
+    local proto_num proto_offset=0
     
     for proto_num in $PROTO_TCP $PROTO_UDP; do
-        tc filter add dev "$interface" parent ffff: protocol ip prio "$ifb_prio" u32 \
+        local actual_ifb_prio=$((ifb_prio * 10 + proto_offset))
+        local actual_filter_prio=$((filter_prio * 10 + proto_offset))
+        
+        tc filter add dev "$interface" parent ffff: protocol ip prio "$actual_ifb_prio" u32 \
             match ip protocol "$proto_num" 0xff \
             match ip dport "$port" 0xffff \
             action mirred egress redirect dev ifb0 2>/dev/null || true
             
-        tc filter add dev ifb0 protocol ip parent 1:0 prio "$filter_prio" u32 \
+        tc filter add dev ifb0 protocol ip parent 1:0 prio "$actual_filter_prio" u32 \
             match ip protocol "$proto_num" 0xff \
             match ip dport "$port" 0xffff \
             flowid "$ifb_class_id" 2>/dev/null || true
+        
+        proto_offset=$((proto_offset + 1))
     done
 }
 
@@ -1393,18 +1418,26 @@ _apply_tc_filter_range_ingress() {
     local range_size=$((end - start + 1))
     
     if [ "$range_size" -le 16 ]; then
+        local port_offset=0
         for p in $(seq "$start" "$end"); do
+            local proto_offset=0
             for proto_num in $PROTO_TCP $PROTO_UDP; do
-                tc filter add dev "$interface" parent ffff: protocol ip prio "$ifb_prio" u32 \
+                local actual_ifb_prio=$((ifb_prio * 1000 + port_offset * 10 + proto_offset))
+                local actual_filter_prio=$((filter_prio * 1000 + port_offset * 10 + proto_offset))
+                
+                tc filter add dev "$interface" parent ffff: protocol ip prio "$actual_ifb_prio" u32 \
                     match ip protocol "$proto_num" 0xff \
                     match ip dport "$p" 0xffff \
                     action mirred egress redirect dev ifb0 2>/dev/null || true
                     
-                tc filter add dev ifb0 protocol ip parent 1:0 prio "$filter_prio" u32 \
+                tc filter add dev ifb0 protocol ip parent 1:0 prio "$actual_filter_prio" u32 \
                     match ip protocol "$proto_num" 0xff \
                     match ip dport "$p" 0xffff \
                     flowid "$ifb_class_id" 2>/dev/null || true
+                
+                proto_offset=$((proto_offset + 1))
             done
+            port_offset=$((port_offset + 1))
         done
     else
         local mark_value=$start
@@ -1471,12 +1504,12 @@ apply_tc_limit() {
 
 _remove_tc_filter_single() {
     local interface=$1 port=$2 prio=$3 direction=$4
-    local proto_num
+    local proto_offset=0
     
-    for proto_num in $PROTO_TCP $PROTO_UDP; do
-        tc filter del dev "$interface" protocol ip parent 1:0 prio "$prio" u32 \
-            match ip protocol "$proto_num" 0xff \
-            match ip "$direction" "$port" 0xffff 2>/dev/null || true
+    # 删除该端口对应的所有 filter (通过删除整个 prio)
+    for proto_offset in 0 1; do
+        local actual_prio=$((prio * 10 + proto_offset))
+        tc filter del dev "$interface" parent 1:0 prio "$actual_prio" 2>/dev/null || true
     done
 }
 
@@ -1489,9 +1522,12 @@ _remove_tc_filter_range() {
     range_size=$((end - start + 1))
     
     if [ "$range_size" -le 16 ]; then
-        local p
-        for p in $(seq "$start" "$end"); do
-            _remove_tc_filter_single "$interface" "$p" "$prio" "$direction"
+        local port_offset proto_offset
+        for port_offset in $(seq 0 $((range_size - 1))); do
+            for proto_offset in 0 1; do
+                local actual_prio=$((prio * 1000 + port_offset * 10 + proto_offset))
+                tc filter del dev "$interface" parent 1:0 prio "$actual_prio" 2>/dev/null || true
+            done
         done
     else
         local iptables_direction="--sport"
@@ -1500,21 +1536,20 @@ _remove_tc_filter_range() {
         iptables -t mangle -D POSTROUTING -p tcp "$iptables_direction" "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
         iptables -t mangle -D POSTROUTING -p udp "$iptables_direction" "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
         
-        tc filter del dev "$interface" protocol ip parent 1:0 prio "$prio" handle "$start" fw 2>/dev/null || true
+        tc filter del dev "$interface" parent 1:0 prio "$prio" 2>/dev/null || true
     fi
 }
 
 _remove_tc_filter_single_ingress() {
     local interface=$1 port=$2 filter_prio=$3 ifb_prio=$4
-    local proto_num
+    local proto_offset
     
-    for proto_num in $PROTO_TCP $PROTO_UDP; do
-        tc filter del dev "$interface" parent ffff: protocol ip prio "$ifb_prio" u32 \
-            match ip protocol "$proto_num" 0xff \
-            match ip dport "$port" 0xffff 2>/dev/null || true
-        tc filter del dev ifb0 protocol ip parent 1:0 prio "$filter_prio" u32 \
-            match ip protocol "$proto_num" 0xff \
-            match ip dport "$port" 0xffff 2>/dev/null || true
+    for proto_offset in 0 1; do
+        local actual_ifb_prio=$((ifb_prio * 10 + proto_offset))
+        local actual_filter_prio=$((filter_prio * 10 + proto_offset))
+        
+        tc filter del dev "$interface" parent ffff: prio "$actual_ifb_prio" 2>/dev/null || true
+        tc filter del dev ifb0 parent 1:0 prio "$actual_filter_prio" 2>/dev/null || true
     done
 }
 
@@ -1527,16 +1562,22 @@ _remove_tc_filter_range_ingress() {
     range_size=$((end - start + 1))
     
     if [ "$range_size" -le 16 ]; then
-        local p
-        for p in $(seq "$start" "$end"); do
-            _remove_tc_filter_single_ingress "$interface" "$p" "$filter_prio" "$ifb_prio"
+        local port_offset proto_offset
+        for port_offset in $(seq 0 $((range_size - 1))); do
+            for proto_offset in 0 1; do
+                local actual_ifb_prio=$((ifb_prio * 1000 + port_offset * 10 + proto_offset))
+                local actual_filter_prio=$((filter_prio * 1000 + port_offset * 10 + proto_offset))
+                
+                tc filter del dev "$interface" parent ffff: prio "$actual_ifb_prio" 2>/dev/null || true
+                tc filter del dev ifb0 parent 1:0 prio "$actual_filter_prio" 2>/dev/null || true
+            done
         done
     else
         iptables -t mangle -D PREROUTING -p tcp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
         iptables -t mangle -D PREROUTING -p udp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
         
-        tc filter del dev "$interface" parent ffff: protocol ip prio "$ifb_prio" handle "$start" fw 2>/dev/null || true
-        tc filter del dev ifb0 protocol ip parent 1:0 prio "$filter_prio" handle "$start" fw 2>/dev/null || true
+        tc filter del dev "$interface" parent ffff: prio "$ifb_prio" 2>/dev/null || true
+        tc filter del dev ifb0 parent 1:0 prio "$filter_prio" 2>/dev/null || true
     fi
 }
 
@@ -1721,8 +1762,10 @@ get_burst_status() {
 
 setup_reset_cron() {
     local port=$1
+    # 转义端口中的特殊字符用于 grep
+    local port_escaped=$(echo "$port" | sed 's/[.[\*^$()+?{|]/\\&/g')
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控重置$port\$" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
 
     local reset_day=$(jq_safe ".ports.\"$port\".quota.reset_day" "$CONFIG_FILE" "")
     local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
@@ -1736,8 +1779,10 @@ setup_reset_cron() {
 
 remove_reset_cron() {
     local port=$1
+    # 转义端口中的特殊字符用于 grep
+    local port_escaped=$(echo "$port" | sed 's/[.[\*^$()+?{|]/\\&/g')
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控重置$port\$" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
     crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
@@ -1790,7 +1835,13 @@ reset_port_traffic() {
 
     nft reset counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" >/dev/null 2>&1 || true
     nft reset counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" >/dev/null 2>&1 || true
-    nft reset quota $NFT_FAMILY $NFT_TABLE "port_${port_safe}_quota" >/dev/null 2>&1 || true
+    
+    # 重置配额并重新应用 (以恢复被阻断的连接)
+    local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
+    if [ "$limit" != "unlimited" ]; then
+        remove_quota "$port"
+        apply_quota "$port" "$limit"
+    fi
 
     update_json_file "$ALERT_STATE_FILE" "del(.\"$port\")" 2>/dev/null || true
     
@@ -1829,12 +1880,18 @@ format_status_message() {
     local ports=($(get_active_ports))
     local total=0 port_info=""
     local port
+    local port_count=0
+    local max_ports=15  # 限制显示的端口数量，避免消息过长
 
     for port in "${ports[@]}"; do
         local traffic=($(get_port_traffic "$port"))
         local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
         local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
         total=$((total + used))
+
+        # 超过限制时只统计流量，不添加详情
+        port_count=$((port_count + 1))
+        [ $port_count -gt $max_ports ] && continue
 
         local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
@@ -1863,13 +1920,18 @@ format_status_message() {
    └ 总计: $(format_bytes $used)"
     done
 
+    local truncated_note=""
+    [ ${#ports[@]} -gt $max_ports ] && truncated_note="
+━━━━━━━━━━━━━━━━
+⚠️ 仅显示前 $max_ports 个端口"
+
     echo "🔔 <b>端口流量监控状态</b>
 ━━━━━━━━━━━━━━━━
 ⏰ ${timestamp}
 🖥 ${server_name}
 📊 监控端口: ${#ports[@]} 个
 💾 总流量: $(format_bytes $total)
-━━━━━━━━━━━━━━━━${port_info}"
+━━━━━━━━━━━━━━━━${port_info}${truncated_note}"
 }
 
 # ============================================================================
@@ -2087,8 +2149,26 @@ remove_port() {
         rm -f "$TRAFFIC_HISTORY_DIR/${port_safe}.log"
 
         if command -v conntrack >/dev/null 2>&1; then
-            conntrack -D -p tcp --dport "$port" 2>/dev/null || true
-            conntrack -D -p udp --dport "$port" 2>/dev/null || true
+            if is_port_range "$port"; then
+                local start end
+                start=$(get_port_range_start "$port")
+                end=$(get_port_range_end "$port")
+                local range_size=$((end - start + 1))
+                
+                # 范围过大时跳过逐个清理
+                if [ "$range_size" -le 100 ]; then
+                    local p
+                    for p in $(seq "$start" "$end"); do
+                        conntrack -D -p tcp --dport "$p" 2>/dev/null || true
+                        conntrack -D -p udp --dport "$p" 2>/dev/null || true
+                    done
+                else
+                    log_info "端口范围 $port 过大，跳过 conntrack 清理"
+                fi
+            else
+                conntrack -D -p tcp --dport "$port" 2>/dev/null || true
+                conntrack -D -p udp --dport "$port" 2>/dev/null || true
+            fi
         fi
 
         log_port_action "$port" "remove" ""
@@ -2582,6 +2662,7 @@ setup_telegram() {
 
 show_logs() {
     local lines=${1:-50}
+    local interactive=${2:-false}
     
     echo -e "${CYAN}=== 最近 $lines 条日志 ===${NC}\n"
     
@@ -2602,7 +2683,7 @@ show_logs() {
     fi
     
     echo
-    read -p "按回车键返回..."
+    [ "$interactive" = "true" ] && read -p "按回车键返回..."
 }
 
 # ============================================================================
@@ -2707,6 +2788,17 @@ uninstall() {
         remove_quota "$port"
         remove_tc_limit "$port"
         remove_reset_cron "$port"
+        
+        # 清理该端口相关的 iptables mark 规则
+        if is_port_range "$port"; then
+            local start end
+            start=$(get_port_range_start "$port")
+            end=$(get_port_range_end "$port")
+            iptables -t mangle -D PREROUTING -p tcp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+            iptables -t mangle -D PREROUTING -p udp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+            iptables -t mangle -D POSTROUTING -p tcp --sport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+            iptables -t mangle -D POSTROUTING -p udp --sport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+        fi
     done
 
     remove_notify_cron
@@ -2719,10 +2811,6 @@ uninstall() {
     fi
     tc qdisc del dev ifb0 root 2>/dev/null || true
     ip link set ifb0 down 2>/dev/null || true
-
-    # 清理 iptables mark 规则
-    iptables -t mangle -F PREROUTING 2>/dev/null || true
-    iptables -t mangle -F POSTROUTING 2>/dev/null || true
 
     rm -rf "$CONFIG_DIR"
     rm -f "/usr/local/bin/$SHORTCUT_COMMAND"
@@ -2779,7 +2867,15 @@ main() {
     if [ $# -gt 0 ]; then
         case $1 in
             --reset)
-                [ -n "$2" ] && reset_port_traffic "$2" && echo "端口 $2 已重置"
+                if [ -z "$2" ]; then
+                    echo "用法: $0 --reset <port>"
+                    exit 1
+                fi
+                if ! jq -e ".ports.\"$2\"" "$CONFIG_FILE" >/dev/null 2>&1; then
+                    echo "错误: 端口 $2 未被监控"
+                    exit 1
+                fi
+                reset_port_traffic "$2" && echo "端口 $2 已重置"
                 exit 0 ;;
             --notify|--status)
                 [ "$(jq_safe '.telegram.enabled' "$CONFIG_FILE" "false")" = "true" ] && telegram_send "$(format_status_message)"
@@ -2827,13 +2923,19 @@ main() {
             7) setup_burst_protection ;;
             8) setup_telegram ;;
             9)
-                if [ "$(jq_safe '.telegram.enabled' "$CONFIG_FILE" "false")" = "true" ]; then
-                    telegram_send "$(format_status_message)" && log_success "已发送" || echo -e "${RED}✗ 发送失败${NC}"
-                else
+                local tg_enabled=$(jq_safe '.telegram.enabled' "$CONFIG_FILE" "false")
+                local tg_token=$(jq_safe '.telegram.bot_token' "$CONFIG_FILE" "")
+                local tg_chat=$(jq_safe '.telegram.chat_id' "$CONFIG_FILE" "")
+                
+                if [ "$tg_enabled" != "true" ]; then
                     echo -e "${YELLOW}请先启用 Telegram 通知${NC}"
+                elif [ -z "$tg_token" ] || [ -z "$tg_chat" ]; then
+                    echo -e "${YELLOW}请先配置 Bot Token 和 Chat ID${NC}"
+                else
+                    telegram_send "$(format_status_message)" && log_success "已发送" || echo -e "${RED}✗ 发送失败${NC}"
                 fi
                 sleep 1 ;;
-            10) show_logs 50 ;;
+            10) show_logs 50 true ;;
             11) uninstall ;;
             0) 
                 log_action "SYSTEM" "interactive session ended"
