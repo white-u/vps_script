@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-readonly SCRIPT_VERSION="2.5.2"
+readonly SCRIPT_VERSION="2.5.3"
 readonly SCRIPT_NAME="端口流量监控"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
@@ -795,14 +795,13 @@ jq_safe() {
 get_active_ports() {
     [ ! -f "$CONFIG_FILE" ] && return
     jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | while read -r port; do
-        local sort_key
-        if [[ "$port" =~ ^([0-9]+)-[0-9]+$ ]]; then
-            sort_key=${BASH_REMATCH[1]}
+        if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
+            local start=$(echo "$port" | cut -d'-' -f1)
+            printf "%05d-%s\n" "$start" "$port"
         else
-            sort_key=$port
+            printf "%05d-%s\n" "$port" "$port"
         fi
-        printf "%05d\t%s\n" "$sort_key" "$port"
-    done | sort -n | cut -f2
+    done | sort -n | cut -d'-' -f2-
 }
 
 is_port_range() { [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; }
@@ -1128,8 +1127,8 @@ add_nftables_rules() {
         nft add counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 
     # 检查规则是否已存在 (通过检查是否有使用该计数器的规则)
-    local existing_rules
-    existing_rules=$(nft list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep -c "counter name \"port_${port_safe}_" || echo "0")
+    local existing_rules=0
+    existing_rules=$(nft list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | grep -c "counter name \"port_${port_safe}_") || existing_rules=0
     
     # 如果已有规则，跳过添加
     if [ "$existing_rules" -gt 0 ]; then
@@ -1763,10 +1762,10 @@ get_burst_status() {
 
 setup_reset_cron() {
     local port=$1
-    # 转义端口中的特殊字符用于 grep
-    local port_escaped=$(echo "$port" | sed 's/[][.\\*^$()+?{|]/\\&/g')
+    # 端口号只含数字和-，grep基本正则中无需转义
+    local port_escaped="$port"
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}$" > "$temp_cron" || true
 
     local reset_day=$(jq_safe ".ports.\"$port\".quota.reset_day" "$CONFIG_FILE" "")
     local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
@@ -1780,10 +1779,10 @@ setup_reset_cron() {
 
 remove_reset_cron() {
     local port=$1
-    # 转义端口中的特殊字符用于 grep
-    local port_escaped=$(echo "$port" | sed 's/[][.\\*^$()+?{|]/\\&/g')
+    # 端口号只含数字和-，grep基本正则中无需转义
+    local port_escaped="$port"
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
+    crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}$" > "$temp_cron" || true
     crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
 }
