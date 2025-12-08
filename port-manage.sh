@@ -8,7 +8,7 @@
 
 set -o pipefail
 
-readonly SCRIPT_VERSION="2.5.3"
+readonly SCRIPT_VERSION="2.5.4"
 readonly SCRIPT_NAME="端口流量监控"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
@@ -2008,7 +2008,7 @@ send_threshold_alert() {
 # ============================================================================
 
 add_port() {
-    echo -e "${CYAN}=== 添加端口监控 ===${NC}"
+    echo -e "${CYAN}=== 添加端口监控 ===${NC}  ${YELLOW}(0=返回)${NC}"
     echo
 
     local system_ports="20|21|22|23|25|53|67|68|80|110|143|443|465|546|587|993|995|3306|5432|6379"
@@ -2019,6 +2019,7 @@ add_port() {
     echo
 
     read -p "请输入端口号 (多个用逗号分隔, 支持范围如 8000-8010): " port_input
+    [ "$port_input" = "0" ] && return
     [ -z "$port_input" ] && return
 
     local ports=()
@@ -2111,7 +2112,7 @@ remove_port() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 删除端口监控 ===${NC}\n"
+    echo -e "${CYAN}=== 删除端口监控 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     local i port
     for i in "${!ports[@]}"; do
         port=${ports[$i]}
@@ -2123,6 +2124,7 @@ remove_port() {
     echo
 
     read -p "选择要删除的端口 (多个用逗号分隔): " choice
+    [ "$choice" = "0" ] && return
     [ -z "$choice" ] && return
 
     local sel
@@ -2183,7 +2185,7 @@ set_bandwidth() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 设置带宽限制 ===${NC}\n"
+    echo -e "${CYAN}=== 设置带宽限制 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     local i port
     for i in "${!ports[@]}"; do
         port=${ports[$i]}
@@ -2196,6 +2198,7 @@ set_bandwidth() {
     echo
 
     read -p "选择端口: " sel
+    [ "$sel" = "0" ] && return
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
     port=${ports[$((sel-1))]}
@@ -2238,7 +2241,7 @@ set_quota() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 设置流量配额 ===${NC}\n"
+    echo -e "${CYAN}=== 设置流量配额 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     local i port
     for i in "${!ports[@]}"; do
         port=${ports[$i]}
@@ -2251,6 +2254,7 @@ set_quota() {
     echo
 
     read -p "选择端口: " sel
+    [ "$sel" = "0" ] && return
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
     port=${ports[$((sel-1))]}
@@ -2304,7 +2308,7 @@ reset_traffic() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 重置流量统计 ===${NC}\n"
+    echo -e "${CYAN}=== 重置流量统计 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     local i port
     for i in "${!ports[@]}"; do
         port=${ports[$i]}
@@ -2313,12 +2317,13 @@ reset_traffic() {
         local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
         echo "  $((i+1)). 端口 $port [$(format_bytes $used)]"
     done
-    echo "  0. 全部重置"
+    echo "  a. 全部重置"
     echo
 
     read -p "选择端口: " sel
+    [ "$sel" = "0" ] && return
 
-    if [ "$sel" = "0" ]; then
+    if [[ "$sel" =~ ^[aA]$ ]]; then
         read -p "确认重置所有端口? [y/N]: " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && return
         for port in "${ports[@]}"; do reset_port_traffic "$port"; done
@@ -2337,7 +2342,7 @@ set_remark() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 修改端口备注 ===${NC}\n"
+    echo -e "${CYAN}=== 修改端口备注 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     local i port
     for i in "${!ports[@]}"; do
         port=${ports[$i]}
@@ -2349,6 +2354,7 @@ set_remark() {
     echo
 
     read -p "选择端口: " sel
+    [ "$sel" = "0" ] && return
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
     port=${ports[$((sel-1))]}
@@ -2374,7 +2380,7 @@ setup_burst_protection() {
     local ports=($(get_active_ports))
     [ ${#ports[@]} -eq 0 ] && echo -e "${YELLOW}没有监控的端口${NC}" && sleep 1 && return
 
-    echo -e "${CYAN}=== 突发速率保护设置 ===${NC}\n"
+    echo -e "${CYAN}=== 突发速率保护设置 ===${NC}  ${YELLOW}(0=返回)${NC}\n"
     echo -e "${YELLOW}功能说明: 当端口持续高速率超过指定时间后，自动限速${NC}"
     echo
     
@@ -2399,6 +2405,7 @@ setup_burst_protection() {
     echo
 
     read -p "选择端口: " sel
+    [ "$sel" = "0" ] && return
     [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#ports[@]} ] && return
 
     port=${ports[$((sel-1))]}
