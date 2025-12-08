@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # VPS 代理统一管理平台
-# 整合 Snell、sing-box、port-manage 三个脚本
+# 整合 Snell、sing-box、port-monitor-v2 三个脚本
 # 提供统一入口和状态总览
 #
 # 使用方式:
@@ -18,12 +18,12 @@ set -euo pipefail
 # =====================================
 # 版本和配置
 # =====================================
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 SNELL_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
 SINGBOX_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
-PTM_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
+PTM_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-monitor-v2.sh"
 
 # =====================================
 # 颜色定义
@@ -102,35 +102,85 @@ clean_firewall_port() {
 install_component_safely() {
     local component_name=$1
     local download_url=$2
-    local temp_file=$(mktemp /tmp/"${component_name}"_install_XXXXXX.sh)
+
+    # 根据组件名称确定目标路径
+    local target_path
+    case "$component_name" in
+        "Snell")
+            target_path="/usr/local/bin/snell-manager.sh"
+            ;;
+        "sing-box")
+            target_path="/usr/local/bin/sing-box-manager.sh"
+            ;;
+        "port-monitor")
+            target_path="/usr/local/bin/port-monitor-v2.sh"
+            ;;
+        *)
+            error "未知组件: $component_name"
+            return 1
+            ;;
+    esac
 
     log "开始安装 $component_name..."
 
+    # 下载到临时文件
+    local temp_file=$(mktemp /tmp/"${component_name}"_download_XXXXXX.sh)
+
     if curl -fsSL "$download_url" -o "$temp_file" 2>/dev/null || \
        wget -q "$download_url" -O "$temp_file" 2>/dev/null; then
-        if bash -n "$temp_file" 2>/dev/null; then
-            # 复制到临时文件，避免执行过程中被删除
-            local persistent_file=$(mktemp /tmp/"${component_name}"_exec_XXXXXX.sh)
-            cp "$temp_file" "$persistent_file"
-            chmod +x "$persistent_file"
 
-            # 删除下载的临时文件
-            rm -f "$temp_file"
-
-            # 执行副本（脚本可以安全运行，即使是交互式的）
-            bash "$persistent_file"
-            local exit_code=$?
-
-            # 清理执行副本
-            rm -f "$persistent_file"
-            return $exit_code
-        else
-            error "下载的安装脚本语法错误"
+        # 验证语法
+        if ! bash -n "$temp_file" 2>/dev/null; then
+            error "下载的脚本语法错误"
             rm -f "$temp_file"
             return 1
         fi
+
+        # 直接安装到目标位置
+        mv "$temp_file" "$target_path"
+        chmod +x "$target_path"
+
+        success "脚本已安装到 $target_path"
+
+        # 创建快捷命令
+        local shortcut_name
+        case "$component_name" in
+            "Snell")
+                shortcut_name="snell"
+                ;;
+            "sing-box")
+                shortcut_name="sing-box"
+                ;;
+            "port-monitor")
+                shortcut_name="ptm"
+                ;;
+        esac
+
+        if [ -n "$shortcut_name" ] && [ ! -f "/usr/local/bin/$shortcut_name" ]; then
+            ln -sf "$target_path" "/usr/local/bin/$shortcut_name"
+            success "快捷命令已创建: $shortcut_name"
+        fi
+
+        # 执行安装（运行 install 命令或直接运行）
+        log "正在初始化 $component_name..."
+        case "$component_name" in
+            "Snell")
+                bash "$target_path" install
+                ;;
+            "sing-box")
+                bash "$target_path" install
+                ;;
+            "port-monitor")
+                # port-monitor-v2.sh 首次运行会自动初始化
+                # 直接执行脚本，不传递参数（进入交互式菜单）
+                bash "$target_path"
+                ;;
+        esac
+
+        return $?
     else
-        error "下载 $component_name 安装脚本失败，请检查网络连接"
+        error "下载 $component_name 失败"
+        echo "提示: 检查网络连接或尝试手动下载: $download_url"
         rm -f "$temp_file"
         return 1
     fi
@@ -139,9 +189,26 @@ install_component_safely() {
 # =====================================
 # 系统检查
 # =====================================
+
+# 检查操作是否需要 root 权限
+requires_root() {
+    local operation="${1:-menu}"
+
+    # 只读操作不需要 root
+    case "$operation" in
+        version|v|-v|--version|help|--help|-h|health|h)
+            return 1  # 不需要 root
+            ;;
+        *)
+            return 0  # 需要 root
+            ;;
+    esac
+}
+
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         error "请以 root 身份运行此脚本"
+        echo "提示: 使用 'sudo vps' 或切换到 root 用户"
         exit 1
     fi
 }
@@ -275,13 +342,14 @@ get_singbox_ports() {
     for conf in /etc/sing-box/conf/*.json; do
         [ -f "$conf" ] || continue
 
-        # 使用 // empty 避免 jq 输出 null
-        local port=$(jq -r '.inbounds[0].listen_port // empty' "$conf" 2>/dev/null)
-        local proto=$(jq -r '.inbounds[0].type // empty' "$conf" 2>/dev/null)
+        # 遍历所有 inbounds，而不仅仅是第一个
+        local port_proto_list
+        port_proto_list=$(jq -r '.inbounds[]? |
+            select(.listen_port != null and .type != null) |
+            "\(.listen_port)|\(.type)"' "$conf" 2>/dev/null)
 
-        # 验证端口和协议都存在
-        if [ -n "$port" ] && [ -n "$proto" ] && [[ "$port" =~ ^[0-9]+$ ]]; then
-            echo "$port|$proto"
+        if [ -n "$port_proto_list" ]; then
+            echo "$port_proto_list"
             found=1
         fi
     done
@@ -290,13 +358,11 @@ get_singbox_ports() {
 }
 
 is_ptm_installed() {
-    [ -f /etc/port-traffic-monitor/config.json ]
+    [ -f /etc/port-traffic-monitor/config.db ]
 }
 
 get_ptm_ports() {
-    if [ -f /etc/port-traffic-monitor/config.json ]; then
-        jq -r '.ports | keys[]' /etc/port-traffic-monitor/config.json 2>/dev/null || true
-    fi
+    sqlite3 /etc/port-traffic-monitor/config.db "SELECT port FROM ports ORDER BY port;" 2>/dev/null || true
 }
 
 # =====================================
@@ -304,25 +370,33 @@ get_ptm_ports() {
 # =====================================
 get_port_traffic() {
     local port=$1
-    local ptm_config="/etc/port-traffic-monitor/config.json"
+    local nft_table="port_traffic"
+    local nft_family="inet"
+    local port_safe=$(echo "$port" | tr '-:' '__')
 
-    if [ ! -f "$ptm_config" ]; then
-        echo "N/A"
-        return
-    fi
-
-    # 读取 nftables 配置
-    local nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
-    local nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
-    local port_safe=$(echo "$port" | tr '-' '_')
-
-    # 获取流量统计
+    # 获取流量统计（入站+出站）
+    local input_bytes=$(nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
     local output_bytes=$(nft list counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
 
-    if [ -z "$output_bytes" ] || [ "$output_bytes" -eq 0 ]; then
+    input_bytes=${input_bytes:-0}
+    output_bytes=${output_bytes:-0}
+
+    # 从 SQLite 读取计费模式
+    local billing=$(sqlite3 /etc/port-traffic-monitor/config.db \
+        "SELECT billing_mode FROM ports WHERE port='$port';" 2>/dev/null || echo "single")
+
+    # 根据计费模式计算总流量
+    local total_bytes
+    if [ "$billing" = "double" ]; then
+        total_bytes=$((input_bytes + output_bytes))
+    else
+        total_bytes=$output_bytes
+    fi
+
+    if [ "$total_bytes" -eq 0 ]; then
         echo "0B"
     else
-        format_bytes "$output_bytes"
+        format_bytes "$total_bytes"
     fi
 }
 
@@ -493,18 +567,22 @@ show_menu() {
 
     echo -e "${BOLD}主菜单${RESET}"
     echo ""
+    echo -e "${CYAN}📱 服务管理${RESET}"
     echo -e "  ${CYAN}[1]${RESET} Snell 管理"
     echo -e "  ${CYAN}[2]${RESET} sing-box 管理"
     echo -e "  ${CYAN}[3]${RESET} 流量监控"
     echo ""
+    echo -e "${CYAN}🔧 系统工具${RESET}"
     echo -e "  ${CYAN}[4]${RESET} 刷新状态"
     echo -e "  ${CYAN}[5]${RESET} 健康检查"
     echo -e "  ${CYAN}[6]${RESET} 安装缺失组件"
     echo ""
+    echo -e "${RED}⚠️  危险操作${RESET}"
     echo -e "  ${RED}[7]${RESET} 一键卸载所有组件"
     echo ""
     echo -e "  ${CYAN}[0]${RESET} 退出"
     echo ""
+    echo -e "${GRAY}💡 快捷命令: vps snell | vps sb | vps traffic | vps help${RESET}"
     echo -e "${CYAN}────────────────────────────────────────────────────────${RESET}"
     echo ""
 }
@@ -579,30 +657,36 @@ uninstall_singbox() {
     success "sing-box 已卸载"
 }
 
-# 卸载 port-manage
+# 卸载 port-monitor v2.0
 uninstall_ptm() {
     is_ptm_installed || return 0
 
     log "正在卸载流量监控..."
 
-    # 删除定时任务
-    crontab -l 2>/dev/null | grep -v port-traffic-monitor | crontab - 2>/dev/null || true
-
     # 删除 nftables 规则
-    nft delete table inet port_monitor 2>/dev/null || true
+    nft delete table inet port_traffic 2>/dev/null || true
+
+    # 删除 systemd timers
+    systemctl disable --now port-traffic-alert.timer 2>/dev/null || true
+    systemctl disable --now port-traffic-burst.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/port-traffic-*.{service,timer} 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
 
     # 删除 tc 规则
     local interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
     if [ -n "$interface" ]; then
+        tc qdisc del dev "$interface" root 2>/dev/null || true
         tc qdisc del dev "$interface" handle ffff: ingress 2>/dev/null || true
     fi
     tc qdisc del dev ifb0 root 2>/dev/null || true
     ip link set ifb0 down 2>/dev/null || true
 
-    # 删除文件
+    # 删除文件和目录
     rm -rf /etc/port-traffic-monitor
+    rm -rf /var/log/port-traffic-monitor
+    rm -f /var/run/port-traffic-monitor.lock
     rm -f /usr/local/bin/ptm
-    rm -f /usr/local/bin/port-traffic-monitor.sh
+    rm -f /usr/local/bin/port-monitor-v2.sh
 
     success "流量监控已卸载"
 }
@@ -651,7 +735,7 @@ uninstall_all() {
 
     is_snell_installed && { echo "  ✓ Snell Server"; to_uninstall+=("snell"); }
     is_singbox_installed && { echo "  ✓ sing-box"; to_uninstall+=("singbox"); }
-    is_ptm_installed && { echo "  ✓ 流量监控 (port-manage)"; to_uninstall+=("ptm"); }
+    is_ptm_installed && { echo "  ✓ 流量监控 (port-monitor v2.0)"; to_uninstall+=("ptm"); }
     echo "  ✓ VPS 统一管理平台"
 
     echo ""
@@ -813,7 +897,7 @@ install_component() {
     fi
 
     if ! is_ptm_installed; then
-        choices+=("3. 流量监控 (port-manage)")
+        choices+=("3. 流量监控 (port-monitor v2.0)")
         has_missing=1
     fi
 
@@ -853,7 +937,7 @@ install_component() {
             ;;
         3)
             if ! is_ptm_installed; then
-                install_component_safely "port-manage" "$PTM_SCRIPT_URL"
+                install_component_safely "port-monitor" "$PTM_SCRIPT_URL"
             fi
             ;;
         4)
@@ -931,7 +1015,7 @@ handle_command() {
             if is_ptm_installed; then
                 exec /usr/local/bin/ptm "$@"
             else
-                error "port-manage 未安装，请先安装"
+                error "流量监控 (port-monitor v2.0) 未安装，请先安装"
                 echo "运行: vps 并选择 [6] 安装缺失组件"
                 exit 1
             fi
@@ -1003,7 +1087,12 @@ EOF
 # 主循环
 # =====================================
 main() {
-    check_root
+    # 动态权限检查：只有需要 root 的操作才检查权限
+    local first_arg="${1:-}"
+    if requires_root "$first_arg"; then
+        check_root
+    fi
+
     check_dependencies
 
     # 创建快捷命令（如果不存在）
@@ -1047,6 +1136,17 @@ main() {
         show_menu
         read -rp "请选择 [0-7]: " choice
 
+        # 输入验证
+        if [[ ! "$choice" =~ ^[0-7]$ ]]; then
+            if [[ -z "$choice" ]]; then
+                warn "未输入任何选项，请输入 0-7 之间的数字"
+            else
+                warn "无效选择: '$choice'，请输入 0-7 之间的数字"
+            fi
+            sleep 1.5
+            continue
+        fi
+
         case "$choice" in
             1)
                 if is_snell_installed; then
@@ -1074,10 +1174,10 @@ main() {
                 if is_ptm_installed; then
                     /usr/local/bin/ptm || true
                 else
-                    error "port-manage 未安装"
+                    error "流量监控 (port-monitor v2.0) 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        install_component_safely "port-manage" "$PTM_SCRIPT_URL"
+                        install_component_safely "port-monitor" "$PTM_SCRIPT_URL"
                     fi
                 fi
                 ;;
@@ -1099,10 +1199,6 @@ main() {
                 echo ""
                 log "退出"
                 exit 0
-                ;;
-            *)
-                warn "无效选择"
-                sleep 1
                 ;;
         esac
     done

@@ -11,8 +11,8 @@ set -o pipefail
 readonly SCRIPT_VERSION="2.3.2"
 readonly SCRIPT_NAME="端口流量监控"
 
-# 处理通过 bash <(curl ...) 执行的情况
-if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]] || [[ "$0" == "bash" ]]; then
+# 处理通过 bash <(curl ...) 或临时文件执行的情况
+if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]] || [[ "$0" == "bash" ]] || [[ "$0" == /tmp/* ]]; then
     SCRIPT_PATH="/usr/local/bin/port-traffic-monitor.sh"
     REMOTE_INSTALL=true
 else
