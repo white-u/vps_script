@@ -257,19 +257,27 @@ EOF
 # 安全的数据库查询（返回 JSON）
 db_query() {
     local sql="$1"
-    sqlite3 -json "$DB_FILE" "$sql" 2>/dev/null || echo "[]"
+    sqlite3 -json "$DB_FILE" "PRAGMA foreign_keys=ON; $sql" 2>/dev/null || echo "[]"
 }
 
 # 执行 SQL 语句（无返回值）
 db_exec() {
     local sql="$1"
-    sqlite3 "$DB_FILE" "$sql" 2>/dev/null
+    sqlite3 "$DB_FILE" "PRAGMA foreign_keys=ON; $sql" 2>/dev/null
+}
+
+# SQL 字符串转义（防止 SQL 注入）
+sql_escape() {
+    local str="$1"
+    # 转义单引号
+    echo "${str//\'/\'\'}"
 }
 
 # 事务执行（多条 SQL）
 db_transaction() {
     local sql="$1"
     sqlite3 "$DB_FILE" <<EOF
+PRAGMA foreign_keys=ON;
 BEGIN TRANSACTION;
 $sql
 COMMIT;
@@ -288,7 +296,7 @@ db_port_exists() {
 
 db_port_add() {
     local port="$1"
-    local remark="${2:-}"
+    local remark=$(sql_escape "${2:-}")
     local billing="${3:-single}"
     local tc_class="${4}"
 
@@ -324,7 +332,7 @@ db_port_get_remark() {
 
 db_port_set_remark() {
     local port="$1"
-    local remark="$2"
+    local remark=$(sql_escape "$2")
     db_exec "UPDATE ports SET remark='$remark' WHERE port='$port';"
 }
 
@@ -465,7 +473,7 @@ db_config_get() {
 
 db_config_set() {
     local key="$1"
-    local value="$2"
+    local value=$(sql_escape "$2")
 
     db_exec "INSERT OR REPLACE INTO config (key, value) VALUES ('$key', '$value');"
 }
@@ -633,7 +641,29 @@ nft_remove_port() {
 
     log "删除 nftables 规则: $port"
 
-    # 删除计数器会自动删除相关规则
+    # 先删除引用计数器的规则
+    # 获取并删除 input 链中的规则
+    local handles=$(nft -a list chain $NFT_FAMILY $NFT_TABLE input 2>/dev/null | \
+        grep "port_${port_safe}_" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+    for handle in $handles; do
+        nft delete rule $NFT_FAMILY $NFT_TABLE input handle "$handle" 2>/dev/null || true
+    done
+
+    # 获取并删除 output 链中的规则
+    handles=$(nft -a list chain $NFT_FAMILY $NFT_TABLE output 2>/dev/null | \
+        grep "port_${port_safe}_" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+    for handle in $handles; do
+        nft delete rule $NFT_FAMILY $NFT_TABLE output handle "$handle" 2>/dev/null || true
+    done
+
+    # 获取并删除 forward 链中的规则
+    handles=$(nft -a list chain $NFT_FAMILY $NFT_TABLE forward 2>/dev/null | \
+        grep "port_${port_safe}_" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+    for handle in $handles; do
+        nft delete rule $NFT_FAMILY $NFT_TABLE forward handle "$handle" 2>/dev/null || true
+    done
+
+    # 最后删除计数器
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null || true
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 }
@@ -708,30 +738,29 @@ tc_add_limit() {
     tc class change dev "$interface" parent 1:1 classid "$class_id" htb \
         rate "$tc_rate" ceil "$tc_rate" burst "$burst" cburst "$burst"
 
-    # 添加过滤器（出站）
-    if is_port_range "$port"; then
-        local start="${port%-*}"
-        local end="${port#*-}"
-        tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 \
-            match ip sport "$start" 0xffff flowid "$class_id" 2>/dev/null || true
-    else
-        tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 \
-            match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null || true
-    fi
-
     # 入站限速（IFB）
     tc class add dev ifb0 parent 1:1 classid "$class_id" htb \
         rate "$tc_rate" ceil "$tc_rate" burst "$burst" cburst "$burst" 2>/dev/null || \
     tc class change dev ifb0 parent 1:1 classid "$class_id" htb \
         rate "$tc_rate" ceil "$tc_rate" burst "$burst" cburst "$burst"
 
-    # 添加过滤器（入站，使用 dport）
+    # 添加过滤器
     if is_port_range "$port"; then
+        # 端口范围：为范围内每个端口添加过滤器
         local start="${port%-*}"
         local end="${port#*-}"
-        tc filter add dev ifb0 protocol ip parent 1:0 prio 1 u32 \
-            match ip dport "$start" 0xffff flowid "$class_id" 2>/dev/null || true
+        for p in $(seq "$start" "$end"); do
+            # 出站
+            tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 \
+                match ip sport "$p" 0xffff flowid "$class_id" 2>/dev/null || true
+            # 入站
+            tc filter add dev ifb0 protocol ip parent 1:0 prio 1 u32 \
+                match ip dport "$p" 0xffff flowid "$class_id" 2>/dev/null || true
+        done
     else
+        # 单个端口
+        tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 \
+            match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null || true
         tc filter add dev ifb0 protocol ip parent 1:0 prio 1 u32 \
             match ip dport "$port" 0xffff flowid "$class_id" 2>/dev/null || true
     fi
@@ -1076,6 +1105,7 @@ burst_check_all_ports() {
     trap lock_release RETURN
 
     local ports=($(db_port_list))
+    [ ${#ports[@]} -eq 0 ] && return 0
 
     for port in "${ports[@]}"; do
         local config=$(db_burst_get_config "$port")
@@ -1137,35 +1167,36 @@ burst_calculate_high_rate_duration() {
 
     [ "$count" -lt 2 ] && echo "0" && return
 
+    # 使用进程替换避免子 shell 变量丢失问题
     local high_minutes=0
     local prev_timestamp=""
     local prev_input=0
     local prev_output=0
 
-    echo "$snapshots" | jq -c '.[]' | while read -r snap; do
+    while read -r snap; do
         local timestamp=$(echo "$snap" | jq -r '.timestamp')
         local input_bytes=$(echo "$snap" | jq -r '.input_bytes')
         local output_bytes=$(echo "$snap" | jq -r '.output_bytes')
 
         if [ -n "$prev_timestamp" ]; then
             local time_diff=$((prev_timestamp - timestamp))
-            [ "$time_diff" -eq 0 ] && continue
+            if [ "$time_diff" -gt 0 ]; then
+                local input_rate=$(( (prev_input - input_bytes) * 8 / time_diff ))
+                local output_rate=$(( (prev_output - output_bytes) * 8 / time_diff ))
+                local total_rate=$((input_rate + output_rate))
 
-            local input_rate=$(( (prev_input - input_bytes) * 8 / time_diff ))
-            local output_rate=$(( (prev_output - output_bytes) * 8 / time_diff ))
-            local total_rate=$((input_rate + output_rate))
-
-            if [ "$total_rate" -ge "$threshold_bps" ]; then
-                high_minutes=$((high_minutes + time_diff / 60))
+                if [ "$total_rate" -ge "$threshold_bps" ]; then
+                    high_minutes=$((high_minutes + time_diff / 60))
+                fi
             fi
         fi
 
         prev_timestamp="$timestamp"
         prev_input="$input_bytes"
         prev_output="$output_bytes"
-    done | tail -n1
+    done < <(echo "$snapshots" | jq -c '.[]')
 
-    echo "${high_minutes:-0}"
+    echo "$high_minutes"
 }
 
 burst_apply_throttle() {
@@ -1270,12 +1301,15 @@ telegram_check_alerts() {
     [ "$alert_enabled" != "true" ] && return
 
     local ports=($(db_port_list))
+    [ ${#ports[@]} -eq 0 ] && return
 
     for port in "${ports[@]}"; do
         local quota=$(db_quota_get "$port")
         [ "$quota" = "null" ] && continue
 
         local limit_bytes=$(echo "$quota" | jq -r '.limit_bytes')
+        [ "$limit_bytes" -le 0 ] && continue
+
         local billing=$(db_port_get_billing "$port")
 
         # 获取当前流量
@@ -1383,13 +1417,15 @@ ui_show_status() {
             local status=""
             if [ "$quota" != "null" ]; then
                 local limit_bytes=$(echo "$quota" | jq -r '.limit_bytes')
-                local percent=$((used_bytes * 100 / limit_bytes))
-                if [ $percent -ge 100 ]; then
-                    status+="${RED}${percent}%${NC} "
-                elif [ $percent -ge 80 ]; then
-                    status+="${YELLOW}${percent}%${NC} "
-                else
-                    status+="${GREEN}${percent}%${NC} "
+                if [ "$limit_bytes" -gt 0 ]; then
+                    local percent=$((used_bytes * 100 / limit_bytes))
+                    if [ $percent -ge 100 ]; then
+                        status+="${RED}${percent}%${NC} "
+                    elif [ $percent -ge 80 ]; then
+                        status+="${YELLOW}${percent}%${NC} "
+                    else
+                        status+="${GREEN}${percent}%${NC} "
+                    fi
                 fi
             fi
 
@@ -1941,23 +1977,30 @@ ui_uninstall() {
 
     log "正在卸载..."
 
-    # 删除所有端口
+    # 删除所有端口的 TC class（不删除根 qdisc）
     local ports=($(db_port_list))
     for port in "${ports[@]}"; do
-        port_remove "$port"
+        tc_remove_limit "$port"
+        nft_remove_port "$port"
+        systemd_remove_reset_timer "$port"
     done
+
+    # 从数据库删除所有端口
+    db_exec "DELETE FROM ports;"
 
     # 删除全局定时器
     systemd_remove_global_timers
 
-    # 删除 nftables 表
+    # 删除 nftables 表（只删除本脚本创建的表）
     nft delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
 
-    # 删除 TC 配置
-    local interface=$(tc_get_default_interface)
-    [ -n "$interface" ] && tc qdisc del dev "$interface" root 2>/dev/null || true
+    # 清理 IFB 设备上的 qdisc（安全操作）
     tc qdisc del dev ifb0 root 2>/dev/null || true
     ip link set ifb0 down 2>/dev/null || true
+
+    # 注意：不删除主网卡的根 qdisc，避免影响网络
+    # 只删除了各端口的 TC class，根 qdisc (HTB) 保留
+    # 如需完全清理，可手动执行: tc qdisc del dev <interface> root
 
     # 删除配置和日志
     rm -rf "$CONFIG_DIR"
@@ -1968,6 +2011,8 @@ ui_uninstall() {
     rm -f "/usr/local/bin/$SHORTCUT_COMMAND"
 
     log_success "✓ 卸载完成"
+    log "提示: 主网卡的 TC 根配置已保留，如需清理请手动执行:"
+    log "  tc qdisc del dev \$(ip route | grep default | awk '{print \$5}' | head -n1) root"
     exit 0
 }
 
