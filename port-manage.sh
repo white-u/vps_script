@@ -8,7 +8,7 @@
 # 错误处理 - 移除 set -e，改用显式错误检查
 set -o pipefail
 
-readonly SCRIPT_VERSION="2.3.2"
+readonly SCRIPT_VERSION="2.4.0"
 readonly SCRIPT_NAME="端口流量监控"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
@@ -61,6 +61,7 @@ readonly MAX_NFT_DELETE_ITERATIONS=50
 readonly BURST_CALC_DIVISOR=20
 readonly MIN_BURST_BYTES=3000
 readonly DEFAULT_INTERFACE="eth0"
+readonly TC_CLASS_ID_FILE="$CONFIG_DIR/tc_class_ids.json"
 
 # 流量历史常量
 readonly TRAFFIC_HISTORY_MAX_LINES=150
@@ -608,18 +609,80 @@ record_traffic_snapshot() {
     local port=$1
     local port_safe=$(get_port_safe "$port")
     local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
-    
+
     local traffic=($(get_port_traffic "$port"))
     local timestamp=$(get_timestamp)
     local total=$((${traffic[0]} + ${traffic[1]}))
-    
-    echo "$timestamp $total" >> "$history_file"
-    
+
+    # 检查数据有效性 - 避免记录异常数据
     if [ -f "$history_file" ]; then
-        local lines=$(wc -l < "$history_file" 2>/dev/null || echo "0")
-        if [ "$lines" -gt $TRAFFIC_HISTORY_MAX_LINES ]; then
-            tail -n $TRAFFIC_HISTORY_KEEP_LINES "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
+        local last_line
+        last_line=$(tail -n 1 "$history_file" 2>/dev/null)
+        if [ -n "$last_line" ]; then
+            local last_ts last_bytes
+            read -r last_ts last_bytes <<< "$last_line"
+            # 跳过时间回退或流量回退的异常情况 (流量重置除外)
+            if [ "$timestamp" -le "$last_ts" ]; then
+                return
+            fi
+            # 如果流量小于上次记录，说明可能是重置，清空历史
+            if [ "$total" -lt "$last_bytes" ]; then
+                echo "$timestamp $total" > "$history_file"
+                return
+            fi
         fi
+    fi
+
+    echo "$timestamp $total" >> "$history_file"
+
+    # 清理过旧的记录
+    if [ -f "$history_file" ]; then
+        local lines
+        lines=$(wc -l < "$history_file" 2>/dev/null || echo "0")
+        if [ "$lines" -gt $TRAFFIC_HISTORY_MAX_LINES ]; then
+            tail -n $TRAFFIC_HISTORY_KEEP_LINES "$history_file" > "${history_file}.tmp" && \
+                mv "${history_file}.tmp" "$history_file"
+        fi
+    fi
+}
+
+# 计算指定时间窗口内的平均速率 (Kbps)
+get_average_rate() {
+    local port=$1
+    local window_minutes=${2:-5}
+    local port_safe=$(get_port_safe "$port")
+    local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
+
+    [ ! -f "$history_file" ] && echo "0" && return
+
+    local now=$(get_timestamp)
+    local window_start=$((now - window_minutes * 60))
+    local first_ts=0 first_bytes=0 last_ts=0 last_bytes=0
+    local count=0
+
+    while read -r ts bytes; do
+        [ "$ts" -lt "$window_start" ] && continue
+        if [ $count -eq 0 ]; then
+            first_ts=$ts
+            first_bytes=$bytes
+        fi
+        last_ts=$ts
+        last_bytes=$bytes
+        count=$((count + 1))
+    done < "$history_file"
+
+    if [ $count -lt 2 ] || [ "$last_ts" -eq "$first_ts" ]; then
+        echo "0"
+        return
+    fi
+
+    local time_diff=$((last_ts - first_ts))
+    local bytes_diff=$((last_bytes - first_bytes))
+
+    if [ $time_diff -gt 0 ] && [ $bytes_diff -ge 0 ]; then
+        echo $((bytes_diff * 8 / time_diff / 1000))
+    else
+        echo "0"
     fi
 }
 
@@ -628,37 +691,63 @@ get_high_rate_duration() {
     local threshold_kbps=$2
     local port_safe=$(get_port_safe "$port")
     local history_file="$TRAFFIC_HISTORY_DIR/${port_safe}.log"
-    
+
     [ ! -f "$history_file" ] && echo "0" && return
-    
-    local line_count=$(wc -l < "$history_file" 2>/dev/null || echo "0")
+
+    local line_count
+    line_count=$(wc -l < "$history_file" 2>/dev/null || echo "0")
     [ "$line_count" -lt 2 ] && echo "0" && return
-    
+
     local prev_ts=0 prev_bytes=0
     local high_rate_start=0
+    local consecutive_high=0
     local now=$(get_timestamp)
-    
+
+    # 使用滑动窗口 (3 个采样点) 计算平均速率，减少瞬时峰值误判
+    local -a ts_history=() bytes_history=()
+
     while read -r ts bytes; do
-        if [ $prev_ts -gt 0 ]; then
-            local time_diff=$((ts - prev_ts))
-            local bytes_diff=$((bytes - prev_bytes))
-            
+        # 数据校验
+        [[ ! "$ts" =~ ^[0-9]+$ ]] && continue
+        [[ ! "$bytes" =~ ^[0-9]+$ ]] && continue
+
+        ts_history+=("$ts")
+        bytes_history+=("$bytes")
+
+        # 保持窗口大小为 3
+        if [ ${#ts_history[@]} -gt 3 ]; then
+            ts_history=("${ts_history[@]:1}")
+            bytes_history=("${bytes_history[@]:1}")
+        fi
+
+        if [ ${#ts_history[@]} -ge 2 ]; then
+            local window_start_ts=${ts_history[0]}
+            local window_start_bytes=${bytes_history[0]}
+            local window_end_ts=${ts_history[-1]}
+            local window_end_bytes=${bytes_history[-1]}
+
+            local time_diff=$((window_end_ts - window_start_ts))
+            local bytes_diff=$((window_end_bytes - window_start_bytes))
+
             if [ $time_diff -gt 0 ] && [ $bytes_diff -ge 0 ]; then
                 local rate_kbps=$((bytes_diff * 8 / time_diff / 1000))
-                
+
                 if [ $rate_kbps -ge $threshold_kbps ]; then
-                    [ $high_rate_start -eq 0 ] && high_rate_start=$prev_ts
+                    consecutive_high=$((consecutive_high + 1))
+                    # 需要连续 2 次超阈值才开始计时
+                    if [ $consecutive_high -ge 2 ] && [ $high_rate_start -eq 0 ]; then
+                        high_rate_start=$window_start_ts
+                    fi
                 else
+                    consecutive_high=0
                     high_rate_start=0
                 fi
-            else
-                high_rate_start=0
             fi
         fi
         prev_ts=$ts
         prev_bytes=$bytes
     done < "$history_file"
-    
+
     if [ $high_rate_start -gt 0 ]; then
         echo $(( (now - high_rate_start) / 60 ))
     else
@@ -692,18 +781,24 @@ remove_nftables_rules() {
     local port=$1
     local port_safe=$(get_port_safe "$port")
 
-    local deleted=0
-    while [ $deleted -lt $MAX_NFT_DELETE_ITERATIONS ]; do
-        local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
-            grep -E "port_${port_safe}_" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
-        [ -z "$handle" ] && break
-        local chain
-        for chain in input output forward; do
-            nft delete rule $NFT_FAMILY $NFT_TABLE $chain handle $handle 2>/dev/null && break
-        done
-        deleted=$((deleted + 1))
-    done
+    # 批量获取所有相关规则的 handle 和所属 chain
+    local nft_output
+    nft_output=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null) || return
 
+    local chain="" handle
+    while IFS= read -r line; do
+        # 检测 chain 声明
+        if [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+([a-zA-Z_]+) ]]; then
+            chain="${BASH_REMATCH[1]}"
+        # 检测包含端口计数器的规则
+        elif [[ "$line" =~ port_${port_safe}_ ]] && [[ "$line" =~ \#[[:space:]]*handle[[:space:]]+([0-9]+) ]]; then
+            handle="${BASH_REMATCH[1]}"
+            [ -n "$chain" ] && [ -n "$handle" ] && \
+                nft delete rule $NFT_FAMILY $NFT_TABLE "$chain" handle "$handle" 2>/dev/null || true
+        fi
+    done <<< "$nft_output"
+
+    # 删除计数器
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null || true
     nft delete counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null || true
 }
@@ -747,17 +842,24 @@ remove_quota() {
     local port_safe=$(get_port_safe "$port")
     local quota_name="port_${port_safe}_quota"
 
-    local deleted=0
-    while [ $deleted -lt $MAX_NFT_DELETE_ITERATIONS ]; do
-        local handle=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null | \
-            grep "quota name \"$quota_name\"" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
-        [ -z "$handle" ] && break
-        local chain
-        for chain in input output forward; do
-            nft delete rule $NFT_FAMILY $NFT_TABLE $chain handle $handle 2>/dev/null && break
-        done
-        deleted=$((deleted + 1))
-    done
+    # 批量获取所有配额规则的 handle 和所属 chain
+    local nft_output
+    nft_output=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null) || {
+        nft delete quota $NFT_FAMILY $NFT_TABLE "$quota_name" 2>/dev/null || true
+        return
+    }
+
+    local chain="" handle
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+([a-zA-Z_]+) ]]; then
+            chain="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ quota\ name\ \"$quota_name\" ]] && [[ "$line" =~ \#[[:space:]]*handle[[:space:]]+([0-9]+) ]]; then
+            handle="${BASH_REMATCH[1]}"
+            [ -n "$chain" ] && [ -n "$handle" ] && \
+                nft delete rule $NFT_FAMILY $NFT_TABLE "$chain" handle "$handle" 2>/dev/null || true
+        fi
+    done <<< "$nft_output"
+
     nft delete quota $NFT_FAMILY $NFT_TABLE "$quota_name" 2>/dev/null || true
 }
 
@@ -775,30 +877,84 @@ calculate_burst() {
     else echo "$burst_bytes"; fi
 }
 
+# TC class ID 管理 - 使用持久化映射避免碰撞
+init_tc_class_ids() {
+    [ ! -f "$TC_CLASS_ID_FILE" ] && echo '{"next_id": 256, "mappings": {}}' > "$TC_CLASS_ID_FILE"
+}
+
 get_tc_class_id() {
     local port=$1
-    local hash
-    
-    if is_port_range "$port"; then
-        local start=$(echo "$port" | cut -d'-' -f1)
-        local end=$(echo "$port" | cut -d'-' -f2)
-        hash=$(( (start * 65536 + end) % 0xFFF + 0x100 ))
-    else
-        hash=$(( port % 0xFFF + 0x100 ))
+    init_tc_class_ids
+
+    # 检查是否已有映射
+    local existing_id
+    existing_id=$(jq -r ".mappings.\"$port\" // empty" "$TC_CLASS_ID_FILE" 2>/dev/null)
+
+    if [ -n "$existing_id" ]; then
+        printf "1:%x" "$existing_id"
+        return
     fi
-    
-    printf "1:%x" $hash
+
+    # 分配新 ID (范围 0x100 - 0xFFFF)
+    local next_id
+    next_id=$(jq -r '.next_id' "$TC_CLASS_ID_FILE" 2>/dev/null)
+    [ -z "$next_id" ] || [ "$next_id" = "null" ] && next_id=256
+
+    # 更新映射文件
+    local tmp
+    tmp=$(mktemp "${TC_CLASS_ID_FILE}.XXXXXX")
+    if jq ".mappings.\"$port\" = $next_id | .next_id = $((next_id + 1))" "$TC_CLASS_ID_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$TC_CLASS_ID_FILE"
+    else
+        rm -f "$tmp"
+    fi
+
+    printf "1:%x" "$next_id"
+}
+
+release_tc_class_id() {
+    local port=$1
+    [ ! -f "$TC_CLASS_ID_FILE" ] && return
+
+    local tmp
+    tmp=$(mktemp "${TC_CLASS_ID_FILE}.XXXXXX")
+    if jq "del(.mappings.\"$port\")" "$TC_CLASS_ID_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$TC_CLASS_ID_FILE"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 setup_ifb() {
     local interface=$1
-    
+
     modprobe ifb numifbs=1 2>/dev/null || true
     ip link set ifb0 up 2>/dev/null || true
-    tc qdisc add dev $interface handle ffff: ingress 2>/dev/null || true
-    tc filter add dev $interface parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
+    tc qdisc add dev "$interface" handle ffff: ingress 2>/dev/null || true
     tc qdisc add dev ifb0 root handle 1: htb default 30 2>/dev/null || true
     tc class add dev ifb0 parent 1: classid 1:1 htb rate 10gbit 2>/dev/null || true
+}
+
+# 获取端口对应的 filter 优先级 (基于 class ID 确保唯一)
+get_tc_filter_prio() {
+    local port=$1
+    init_tc_class_ids
+
+    local class_id_num
+    class_id_num=$(jq -r ".mappings.\"$port\" // empty" "$TC_CLASS_ID_FILE" 2>/dev/null)
+
+    if [ -n "$class_id_num" ]; then
+        # 使用 class ID 作为优先级基础，确保唯一
+        echo "$class_id_num"
+    else
+        # 降级方案：使用端口号
+        if is_port_range "$port"; then
+            local start=$(echo "$port" | cut -d'-' -f1)
+            echo "$start"
+        else
+            echo "$port"
+        fi
+    fi
 }
 
 apply_tc_limit() {
@@ -814,40 +970,42 @@ apply_tc_limit() {
 
     local rate_kbps=$(parse_rate_to_kbps "$rate")
     [ "$rate_kbps" -eq 0 ] && return 1
-    
+
     local burst=$(calculate_burst $rate_kbps)
     local class_id=$(get_tc_class_id "$port")
+    local filter_prio=$(get_tc_filter_prio "$port")
 
-    tc qdisc add dev $interface root handle 1: htb default 30 2>/dev/null || true
-    tc class add dev $interface parent 1: classid 1:1 htb rate 10gbit 2>/dev/null || true
-    
-    tc class del dev $interface classid $class_id 2>/dev/null || true
-    tc class add dev $interface parent 1:1 classid $class_id htb rate $tc_rate ceil $tc_rate burst $burst cburst $burst
+    # 出站限速 (egress)
+    tc qdisc add dev "$interface" root handle 1: htb default 30 2>/dev/null || true
+    tc class add dev "$interface" parent 1: classid 1:1 htb rate 10gbit 2>/dev/null || true
 
-    local base_prio
-    if is_port_range "$port"; then
-        local start=$(echo "$port" | cut -d'-' -f1)
-        base_prio=$((start % 1000 + 100))
-    else
-        base_prio=$((port % 1000 + 100))
-    fi
+    tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
+    tc class add dev "$interface" parent 1:1 classid "$class_id" htb rate "$tc_rate" ceil "$tc_rate" burst "$burst" cburst "$burst"
 
     local proto_num
     for proto_num in 6 17; do
-        tc filter add dev $interface protocol ip parent 1:0 prio $base_prio u32 \
-            match ip protocol $proto_num 0xff match ip sport $port 0xffff flowid $class_id 2>/dev/null || true
+        tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip sport "$port" 0xffff flowid "$class_id" 2>/dev/null || true
     done
 
+    # 入站限速 (ingress via IFB) - 只重定向目标端口的流量
     setup_ifb "$interface"
-    
-    local ifb_class_id="1:$(printf '%x' $(( 0x${class_id#1:} + 0x1000 )))"
-    
-    tc class del dev ifb0 classid $ifb_class_id 2>/dev/null || true
-    tc class add dev ifb0 parent 1:1 classid $ifb_class_id htb rate $tc_rate ceil $tc_rate burst $burst cburst $burst 2>/dev/null || true
 
+    local ifb_class_id="1:$(printf '%x' $(( 0x${class_id#1:} + 0x1000 )))"
+    local ifb_prio=$((filter_prio + 10000))
+
+    tc class del dev ifb0 classid "$ifb_class_id" 2>/dev/null || true
+    tc class add dev ifb0 parent 1:1 classid "$ifb_class_id" htb rate "$tc_rate" ceil "$tc_rate" burst "$burst" cburst "$burst" 2>/dev/null || true
+
+    # 针对特定端口的流量重定向到 IFB 并分类
     for proto_num in 6 17; do
-        tc filter add dev ifb0 protocol ip parent 1:0 prio $base_prio u32 \
-            match ip protocol $proto_num 0xff match ip dport $port 0xffff flowid $ifb_class_id 2>/dev/null || true
+        # 先重定向匹配端口的流量到 IFB
+        tc filter add dev "$interface" parent ffff: protocol ip prio "$ifb_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip dport "$port" 0xffff \
+            action mirred egress redirect dev ifb0 2>/dev/null || true
+        # 在 IFB 上分类
+        tc filter add dev ifb0 protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip dport "$port" 0xffff flowid "$ifb_class_id" 2>/dev/null || true
     done
 }
 
@@ -857,29 +1015,29 @@ remove_tc_limit() {
     [ -z "$interface" ] && interface="$DEFAULT_INTERFACE"
 
     local class_id=$(get_tc_class_id "$port")
-    
-    local base_prio
-    if is_port_range "$port"; then
-        local start=$(echo "$port" | cut -d'-' -f1)
-        base_prio=$((start % 1000 + 100))
-    else
-        base_prio=$((port % 1000 + 100))
-    fi
+    local filter_prio=$(get_tc_filter_prio "$port")
+    local ifb_prio=$((filter_prio + 10000))
 
+    # 删除出站限速规则
     local proto_num
     for proto_num in 6 17; do
-        tc filter del dev $interface protocol ip parent 1:0 prio $base_prio u32 \
-            match ip protocol $proto_num 0xff match ip sport $port 0xffff 2>/dev/null || true
+        tc filter del dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip sport "$port" 0xffff 2>/dev/null || true
     done
-    tc class del dev $interface classid $class_id 2>/dev/null || true
+    tc class del dev "$interface" classid "$class_id" 2>/dev/null || true
 
+    # 删除入站限速规则
     local ifb_class_id="1:$(printf '%x' $(( 0x${class_id#1:} + 0x1000 )))"
-    
+
     for proto_num in 6 17; do
-        tc filter del dev ifb0 protocol ip parent 1:0 prio $base_prio u32 \
-            match ip protocol $proto_num 0xff match ip dport $port 0xffff 2>/dev/null || true
+        # 删除 ingress 重定向 filter
+        tc filter del dev "$interface" parent ffff: protocol ip prio "$ifb_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip dport "$port" 0xffff 2>/dev/null || true
+        # 删除 IFB 分类 filter
+        tc filter del dev ifb0 protocol ip parent 1:0 prio "$filter_prio" u32 \
+            match ip protocol "$proto_num" 0xff match ip dport "$port" 0xffff 2>/dev/null || true
     done
-    tc class del dev ifb0 classid $ifb_class_id 2>/dev/null || true
+    tc class del dev ifb0 classid "$ifb_class_id" 2>/dev/null || true
 }
 
 # ============================================================================
@@ -1140,23 +1298,27 @@ format_status_message() {
 
         local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
-        
-        local remark_display="" percent_display="" burst_display=""
+
+        local remark_display="" percent_display="" burst_display="" rate_display=""
         [ -n "$remark" ] && remark_display=" ($remark)"
 
         if [ "$limit" != "unlimited" ]; then
             local limit_bytes=$(parse_size_to_bytes "$limit")
             [ "$limit_bytes" -gt 0 ] && percent_display=" [$(( used * 100 / limit_bytes ))%]"
         fi
-        
+
         local burst_status=$(get_burst_status "$port")
         case "$burst_status" in
             throttled:*) burst_display=" 🔽限速中" ;;
             normal) burst_display=" ⚡保护中" ;;
         esac
 
+        # 获取实时速率
+        local current_rate_kbps=$(get_average_rate "$port" 5)
+        [ "$current_rate_kbps" -gt 0 ] && rate_display=" 📶$(format_rate $current_rate_kbps)"
+
         port_info+="
-📌 端口 ${port}${remark_display}${percent_display}${burst_display}
+📌 端口 ${port}${remark_display}${percent_display}${burst_display}${rate_display}
    ├ 入站: $(format_bytes ${traffic[0]})
    ├ 出站: $(format_bytes ${traffic[1]})
    └ 总计: $(format_bytes $used)"
@@ -1356,18 +1518,19 @@ remove_port() {
         remove_nftables_rules "$port"
         remove_quota "$port"
         remove_tc_limit "$port"
+        release_tc_class_id "$port"
         remove_reset_cron "$port"
         update_config "del(.ports.\"$port\")"
 
         update_json_file "$ALERT_STATE_FILE" "del(.\"$port\")" 2>/dev/null || true
         update_json_file "$BURST_STATE_FILE" "del(.\"$port\")" 2>/dev/null || true
-        
+
         local port_safe=$(get_port_safe "$port")
         rm -f "$TRAFFIC_HISTORY_DIR/${port_safe}.log"
 
         if command -v conntrack >/dev/null 2>&1; then
-            conntrack -D -p tcp --dport $port 2>/dev/null || true
-            conntrack -D -p udp --dport $port 2>/dev/null || true
+            conntrack -D -p tcp --dport "$port" 2>/dev/null || true
+            conntrack -D -p udp --dport "$port" 2>/dev/null || true
         fi
 
         echo -e "${GREEN}✓ 端口 $port 已删除${NC}"
@@ -1792,12 +1955,12 @@ show_status() {
     local ports=($(get_active_ports))
     local total=0
 
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}             ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}               ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}               ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}                   ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════╣${NC}"
 
     if [ ${#ports[@]} -eq 0 ]; then
-        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                            ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                                ${BLUE}║${NC}"
     else
         local port
         for port in "${ports[@]}"; do
@@ -1820,31 +1983,38 @@ show_status() {
                     else percent_display=" ${GREEN}[${percent}%]${NC}"; fi
                 fi
             fi
-            
+
             local burst_display=""
             local burst_status=$(get_burst_status "$port")
             case "$burst_status" in
-                throttled:*) 
+                throttled:*)
                     local remaining=$(echo "$burst_status" | cut -d: -f2)
                     burst_display=" ${RED}🔽${remaining}${NC}"
                     ;;
                 normal) burst_display=" ${GREEN}⚡${NC}" ;;
             esac
 
-            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b${BLUE}║${NC}\n" \
-                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display"
-            
+            # 获取实时速率 (基于最近 1 分钟)
+            local current_rate_kbps=$(get_average_rate "$port" 1)
+            local rate_display=""
+            if [ "$current_rate_kbps" -gt 0 ]; then
+                rate_display=" $(format_rate $current_rate_kbps)"
+            fi
+
+            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b%b${BLUE}║${NC}\n" \
+                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display" "$rate_display"
+
             local tags=""
             [ -n "$remark" ] && tags+="[$remark] "
             [ "$limit" != "unlimited" ] && tags+="配额:$limit "
             [ "$rate" != "unlimited" ] && tags+="限速:$rate"
-            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-56s${NC}${BLUE}║${NC}\n" "$tags"
+            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-60s${NC}${BLUE}║${NC}\n" "$tags"
         done
     fi
 
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════╣${NC}"
-    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}     ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════╣${NC}"
+    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}         ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo
     echo -e "  ${YELLOW}⚡=突发保护  🔽=限速中${NC}"
     echo
@@ -1883,7 +2053,10 @@ uninstall() {
     nft delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
 
     local interface=$(get_default_interface)
-    [ -n "$interface" ] && tc qdisc del dev $interface handle ffff: ingress 2>/dev/null || true
+    if [ -n "$interface" ]; then
+        tc qdisc del dev "$interface" handle ffff: ingress 2>/dev/null || true
+        tc qdisc del dev "$interface" root 2>/dev/null || true
+    fi
     tc qdisc del dev ifb0 root 2>/dev/null || true
     ip link set ifb0 down 2>/dev/null || true
 
