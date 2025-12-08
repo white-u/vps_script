@@ -2695,15 +2695,19 @@ show_status() {
     local ports=($(get_active_ports))
     local total=0
 
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}               ${CYAN}端口流量监控 v${SCRIPT_VERSION}${NC}                   ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════╣${NC}"
+    # 标题
+    echo -e "${BLUE}╭─────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${BLUE}│${NC}              ${CYAN}🔍 端口流量监控 v${SCRIPT_VERSION}${NC}"
+    echo -e "${BLUE}├─────────────────────────────────────────────────────────╯${NC}"
 
     if [ ${#ports[@]} -eq 0 ]; then
-        echo -e "${BLUE}║${NC}  ${YELLOW}暂无监控端口${NC}                                                ${BLUE}║${NC}"
+        echo -e "${BLUE}│${NC}"
+        echo -e "${BLUE}│${NC}  ${YELLOW}暂无监控端口${NC}"
     else
         local port
         for port in "${ports[@]}"; do
+            echo -e "${BLUE}│${NC}"
+            
             local traffic=($(get_port_traffic "$port"))
             local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
             local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
@@ -2713,49 +2717,46 @@ show_status() {
             local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
             local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
 
-            local percent_display=""
+            # 状态图标
+            local icons=""
+            local burst_status=$(get_burst_status "$port")
+            case "$burst_status" in
+                throttled:*) icons+=" ${RED}🔽限速中${NC}" ;;
+                normal) icons+=" ${GREEN}⚡保护${NC}" ;;
+            esac
+
             if [ "$limit" != "unlimited" ]; then
                 local limit_bytes=$(parse_size_to_bytes "$limit")
                 if [ "$limit_bytes" -gt 0 ]; then
-                    local percent=$((used * 100 / limit_bytes))
-                    if [ $percent -ge 100 ]; then percent_display=" ${RED}[${percent}%]${NC}"
-                    elif [ $percent -ge 80 ]; then percent_display=" ${YELLOW}[${percent}%]${NC}"
-                    else percent_display=" ${GREEN}[${percent}%]${NC}"; fi
+                    local pct=$((used * 100 / limit_bytes))
+                    if [ $pct -ge 100 ]; then icons+=" ${RED}[${pct}%]${NC}"
+                    elif [ $pct -ge 80 ]; then icons+=" ${YELLOW}[${pct}%]${NC}"
+                    else icons+=" ${GREEN}[${pct}%]${NC}"; fi
                 fi
             fi
 
-            local burst_display=""
-            local burst_status=$(get_burst_status "$port")
-            case "$burst_status" in
-                throttled:*)
-                    local remaining=$(echo "$burst_status" | cut -d: -f2)
-                    burst_display=" ${RED}🔽${remaining}${NC}"
-                    ;;
-                normal) burst_display=" ${GREEN}⚡${NC}" ;;
-            esac
+            # 端口行
+            local port_line="  ${GREEN}${port}${NC}"
+            [ -n "$remark" ] && port_line+=" ${YELLOW}($remark)${NC}"
+            [ -n "$icons" ] && port_line+="$icons"
+            echo -e "${BLUE}│${NC}${port_line}"
 
-            local current_rate_kbps=$(get_average_rate "$port" 1)
-            local rate_display=""
-            if [ "$current_rate_kbps" -gt 0 ]; then
-                rate_display=" $(format_rate $current_rate_kbps)"
-            fi
+            # 流量行
+            echo -e "${BLUE}│${NC}    ↑ $(format_bytes ${traffic[0]})   ↓ $(format_bytes ${traffic[1]})   计: ${CYAN}$(format_bytes $used)${NC}"
 
-            printf "${BLUE}║${NC}  ${GREEN}%-8s${NC} ↑%-8s ↓%-8s 计:%-8s%b%b%b${BLUE}║${NC}\n" \
-                "$port" "$(format_bytes ${traffic[0]})" "$(format_bytes ${traffic[1]})" "$(format_bytes $used)" "$percent_display" "$burst_display" "$rate_display"
-
-            local tags=""
-            [ -n "$remark" ] && tags+="[$remark] "
-            [ "$limit" != "unlimited" ] && tags+="配额:$limit "
-            [ "$rate" != "unlimited" ] && tags+="限速:$rate"
-            [ -n "$tags" ] && printf "${BLUE}║${NC}    ${YELLOW}%-60s${NC}${BLUE}║${NC}\n" "$tags"
+            # 配额/限速行
+            local extra=""
+            [ "$limit" != "unlimited" ] && extra+="配额:$limit  "
+            [ "$rate" != "unlimited" ] && extra+="限速:$rate"
+            [ -n "$extra" ] && echo -e "${BLUE}│${NC}    ${YELLOW}${extra}${NC}"
         done
     fi
 
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════╣${NC}"
-    printf "${BLUE}║${NC}  监控: ${GREEN}%-2d${NC} 个  总流量: ${GREEN}%-10s${NC}  快捷命令: ${CYAN}%-4s${NC}         ${BLUE}║${NC}\n" "${#ports[@]}" "$(format_bytes $total)" "$SHORTCUT_COMMAND"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
-    echo
-    echo -e "  ${YELLOW}⚡=突发保护  🔽=限速中${NC}"
+    # 底部
+    echo -e "${BLUE}│${NC}"
+    echo -e "${BLUE}├─────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${BLUE}│${NC}  📊 ${GREEN}${#ports[@]}${NC} 个端口   💾 总计 ${GREEN}$(format_bytes $total)${NC}   ⌨ ${CYAN}${SHORTCUT_COMMAND}${NC}"
+    echo -e "${BLUE}╰─────────────────────────────────────────────────────────╯${NC}"
     echo
 }
 
