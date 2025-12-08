@@ -172,6 +172,10 @@ install_component_safely() {
                 bash "$target_path" install
                 ;;
             "port-monitor")
+                # 先安装依赖
+                log "正在检查并安装依赖..."
+                install_ptm_dependencies
+
                 # port-monitor-v2.sh 首次运行会自动初始化
                 # 直接执行脚本，不传递参数（进入交互式菜单）
                 bash "$target_path"
@@ -305,6 +309,64 @@ check_dependencies() {
         fi
         echo ""
     fi
+}
+
+# 安装 port-monitor 专用依赖
+install_ptm_dependencies() {
+    local missing=()
+
+    # port-monitor-v2.sh 需要的依赖
+    command -v sqlite3 >/dev/null 2>&1 || missing+=("sqlite3")
+    command -v nft >/dev/null 2>&1 || missing+=("nftables")
+    command -v tc >/dev/null 2>&1 || missing+=("iproute2")
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+    command -v bc >/dev/null 2>&1 || missing+=("bc")
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        success "所有依赖已安装"
+        return 0
+    fi
+
+    log "需要安装以下依赖: ${missing[*]}"
+
+    # 检测包管理器并自动安装
+    if command -v apt >/dev/null 2>&1; then
+        apt update -qq && apt install -y ${missing[*]}
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y ${missing[*]}
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y ${missing[*]}
+    elif command -v apk >/dev/null 2>&1; then
+        apk add ${missing[*]}
+    elif command -v brew >/dev/null 2>&1; then
+        brew install ${missing[*]}
+    else
+        error "未检测到支持的包管理器"
+        echo ""
+        error "请手动安装缺失的工具："
+        echo "  Debian/Ubuntu: apt install ${missing[*]}"
+        echo "  CentOS/RHEL:   yum install ${missing[*]}"
+        echo "  Alpine:        apk add ${missing[*]}"
+        echo "  macOS:         brew install ${missing[*]}"
+        echo ""
+        return 1
+    fi
+
+    # 验证安装
+    local failed=()
+    for tool in sqlite3 nft tc jq bc; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            failed+=("$tool")
+        fi
+    done
+
+    if [ ${#failed[@]} -gt 0 ]; then
+        error "以下工具安装失败: ${failed[*]}"
+        return 1
+    fi
+
+    success "所有依赖安装成功"
+    return 0
 }
 
 # =====================================
