@@ -90,8 +90,77 @@ is_config_json=$is_core_dir/config.json
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
-is_version_cache="/tmp/singbox_version_cache"
+is_version_cache="/var/tmp/singbox_version_cache"
 is_sysctl_conf="/etc/sysctl.d/99-singbox.conf"
+
+# ==================== 常量定义 ====================
+readonly PORT_MIN=1
+readonly PORT_MAX=65535
+readonly RANDOM_PORT_MIN=10000
+readonly RANDOM_PORT_MAX=40000
+readonly CURL_MAX_RETRIES=3
+readonly CURL_RETRY_DELAY=2
+readonly WGET_MAX_RETRIES=3
+readonly WGET_RETRY_DELAY=2
+readonly VERSION_CACHE_TIME=3600
+readonly NFTABLES_DELETE_LIMIT=50
+readonly NETWORK_TIMEOUT=5
+readonly UPDATE_TIMEOUT=120
+
+# ==================== 网络请求重试 ====================
+curl_retry() {
+    local attempt=1
+
+    while [ $attempt -le "$CURL_MAX_RETRIES" ]; do
+        if curl "$@"; then
+            return 0
+        fi
+        if [ $attempt -lt "$CURL_MAX_RETRIES" ]; then
+            _yellow "curl 请求失败，${CURL_RETRY_DELAY}秒后重试 ($attempt/$CURL_MAX_RETRIES)..."
+            sleep "$CURL_RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+wget_retry() {
+    local attempt=1
+
+    while [ $attempt -le "$WGET_MAX_RETRIES" ]; do
+        if wget "$@"; then
+            return 0
+        fi
+        if [ $attempt -lt "$WGET_MAX_RETRIES" ]; then
+            _yellow "wget 请求失败，${WGET_RETRY_DELAY}秒后重试 ($attempt/$WGET_MAX_RETRIES)..."
+            sleep "$WGET_RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# ==================== IP 地址验证 ====================
+is_valid_ip() {
+    local ip="$1"
+    local ipv4_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    local ipv6_regex='^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$'
+
+    if [[ "$ip" =~ $ipv4_regex ]]; then
+        local IFS='.'
+        local -a segments=($ip)
+        for seg in "${segments[@]}"; do
+            if [ "$seg" -gt 255 ] 2>/dev/null; then
+                return 1
+            fi
+        done
+        return 0
+    elif [[ "$ip" =~ $ipv6_regex ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
 
 # ==================== 状态检测 ====================
 refresh_status() {
@@ -106,10 +175,21 @@ refresh_status() {
 }
 
 get_ip() {
-    is_ipv4=$(curl -s4m5 ip.sb 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null)
-    is_ipv6=$(curl -s6m5 ip.sb 2>/dev/null)
-    is_addr=${is_ipv4:-$is_ipv6}
-    [[ -z $is_addr ]] && is_addr="<未知IP>"
+    local ipv4 ipv6
+    ipv4=$(curl_retry -s4m${NETWORK_TIMEOUT} ip.sb 2>/dev/null || curl_retry -s4m${NETWORK_TIMEOUT} api.ipify.org 2>/dev/null)
+    if [ -n "$ipv4" ] && is_valid_ip "$ipv4"; then
+        is_addr="$ipv4"
+        return 0
+    fi
+
+    ipv6=$(curl_retry -s6m${NETWORK_TIMEOUT} ip.sb 2>/dev/null)
+    if [ -n "$ipv6" ] && is_valid_ip "$ipv6"; then
+        is_addr="$ipv6"
+        return 0
+    fi
+
+    _yellow "无法获取有效的公网 IP 地址"
+    is_addr="<未知IP>"
 }
 
 # ==================== 安装功能 ====================
@@ -124,14 +204,15 @@ install_singbox() {
     
     # 获取版本
     echo ">>> 下载 $is_core 核心..."
-    local version=$(wget -qO- "https://api.github.com/repos/$is_core_repo/releases/latest" | grep tag_name | grep -oE "v[0-9.]+")
+    local version
+    version=$(wget_retry -qO- "https://api.github.com/repos/$is_core_repo/releases/latest" | grep tag_name | grep -oE "v[0-9.]+")
     [[ -z $version ]] && err "获取最新版本失败"
     echo "    版本: $version"
-    
+
     # 下载核心
-    local tmp_dir=$(mktemp -d)
+    local tmp_dir; tmp_dir=$(mktemp -d) || err "创建临时目录失败"
     local core_url="https://github.com/$is_core_repo/releases/download/$version/$is_core-${version#v}-linux-$is_arch.tar.gz"
-    wget --no-check-certificate -t 3 -q -O "$tmp_dir/core.tar.gz" "$core_url" || err "下载失败"
+    wget_retry --no-check-certificate -q -O "$tmp_dir/core.tar.gz" "$core_url" || err "下载失败"
     
     # 创建目录
     mkdir -p $is_core_dir/bin $is_conf_dir $is_log_dir
@@ -146,7 +227,7 @@ install_singbox() {
     
     # 如果是从 stdin 运行 (curl | bash)，则下载脚本
     if [[ ! -f "$script_path" || "$script_path" =~ bash$ || "$script_path" == "/dev/stdin" ]]; then
-        wget --no-check-certificate -q -O "$is_sh_bin" "$is_sh_url" || err "脚本下载失败"
+        wget_retry --no-check-certificate -q -O "$is_sh_bin" "$is_sh_url" || err "脚本下载失败"
     else
         cp "$script_path" "$is_sh_bin"
     fi
@@ -172,8 +253,8 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     
-    systemctl daemon-reload
-    systemctl enable $is_core &>/dev/null
+    singbox_service_control daemon-reload
+    singbox_service_control enable false
 
     # 启用网络优化
     echo ">>> 启用网络优化..."
@@ -205,8 +286,10 @@ EOF
 }
 
 # ==================== 防火墙管理 ====================
-ufw_allow() {
-    local port=$1
+firewall_allow_port() {
+    local port="$1"
+
+    # UFW
     if command -v ufw >/dev/null 2>&1; then
         if ufw status 2>/dev/null | grep -q inactive; then
             : # UFW 未启用，跳过
@@ -216,10 +299,20 @@ ufw_allow() {
             _green "防火墙: ufw 已放行端口 $port"
         fi
     fi
+
+    # Firewalld
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        _green "防火墙: firewalld 已放行端口 $port"
+    fi
 }
 
-ufw_remove() {
-    local port=$1
+firewall_remove_port() {
+    local port="$1"
+
+    # UFW
     if command -v ufw >/dev/null 2>&1; then
         if ufw status 2>/dev/null | grep -q inactive; then
             : # UFW 未启用，跳过
@@ -229,26 +322,51 @@ ufw_remove() {
             _green "防火墙: ufw 已移除端口 $port"
         fi
     fi
-}
 
-firewalld_allow() {
-    local port=$1
+    # Firewalld
     if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port=${port}/tcp >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=${port}/udp >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        _green "防火墙: firewalld 已放行端口 $port"
-    fi
-}
-
-firewalld_remove() {
-    local port=$1
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --remove-port=${port}/tcp >/dev/null 2>&1 || true
-        firewall-cmd --permanent --remove-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         _green "防火墙: firewalld 已移除端口 $port"
     fi
+}
+
+# 向后兼容别名
+ufw_allow() { firewall_allow_port "$1"; }
+ufw_remove() { firewall_remove_port "$1"; }
+firewalld_allow() { firewall_allow_port "$1"; }
+firewalld_remove() { firewall_remove_port "$1"; }
+
+# ==================== 配置读取函数 ====================
+read_inbound_type() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].type' "$conf_path" 2>/dev/null
+}
+
+read_listen_port() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].listen_port' "$conf_path" 2>/dev/null
+}
+
+read_uuid() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].users[0].uuid' "$conf_path" 2>/dev/null
+}
+
+read_password() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].password' "$conf_path" 2>/dev/null
+}
+
+read_method() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].method' "$conf_path" 2>/dev/null
+}
+
+read_server_name() {
+    local conf_path="$1"
+    jq -r '.inbounds[0].tls.server_name // empty' "$conf_path" 2>/dev/null
 }
 
 # ==================== 配置管理 ====================
@@ -274,8 +392,9 @@ select_conf() {
     echo
     for i in "${!conf_list[@]}"; do
         local f=${conf_list[$i]}
-        local proto=$(jq -r '.inbounds[0].type' "$is_conf_dir/$f" 2>/dev/null)
-        local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$f" 2>/dev/null)
+        local conf_path="$is_conf_dir/$f"
+        local proto=$(read_inbound_type "$conf_path")
+        local port=$(read_listen_port "$conf_path")
         printf "  %2d. %-30s [%s:%s]\n" "$((i+1))" "$f" "$proto" "$port"
     done
     echo
@@ -300,7 +419,7 @@ is_port_used() {
 rand_port() {
     local port
     while :; do
-        port=$((RANDOM % 30000 + 10000))
+        port=$((RANDOM % (RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1) + RANDOM_PORT_MIN))
         is_port_used $port || break
     done
     echo $port
@@ -428,18 +547,17 @@ auto_remove_traffic_monitor() {
     nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
     local port_safe; port_safe=$(echo "$port" | tr '-' '_')
 
-    # 删除 nftables 规则
-    local deleted=0
-    while [ $deleted -lt 50 ]; do
-        local handle
-        handle=$(nft -a list table "$nft_family" "$nft_table" 2>/dev/null | \
-            grep -E "port_${port_safe}_" | head -n1 | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
-        [ -z "$handle" ] && break
-        local chain
-        for chain in input output forward; do
-            nft delete rule "$nft_family" "$nft_table" "$chain" handle "$handle" 2>/dev/null && break
-        done
-        deleted=$((deleted + 1))
+    # 删除 nftables 规则（批量处理优化）
+    local chain
+    for chain in input output forward; do
+        local handles
+        handles=$(nft -a list chain "$nft_family" "$nft_table" "$chain" 2>/dev/null | \
+                  grep -E "port_${port_safe}_" | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
+        if [ -n "$handles" ]; then
+            while IFS= read -r handle; do
+                [ -n "$handle" ] && nft delete rule "$nft_family" "$nft_table" "$chain" handle "$handle" 2>/dev/null || true
+            done <<< "$handles"
+        fi
     done
 
     # 删除计数器
@@ -462,7 +580,7 @@ input_port() {
     read -rp "端口 [$default_port]: " is_port
     is_port=${is_port:-$default_port}
     [[ ! $is_port =~ ^[0-9]+$ ]] && { _yellow "端口必须是数字"; input_port; return; }
-    [[ $is_port -lt 1 || $is_port -gt 65535 ]] && { _yellow "端口范围: 1-65535"; input_port; return; }
+    [[ $is_port -lt $PORT_MIN || $is_port -gt $PORT_MAX ]] && { _yellow "端口范围: $PORT_MIN-$PORT_MAX"; input_port; return; }
     is_port_used $is_port && { _yellow "端口 $is_port 已被占用"; input_port; return; }
 }
 
@@ -525,7 +643,7 @@ add() {
         ufw_allow "$is_port"
         firewalld_allow "$is_port"
 
-        systemctl restart $is_core &>/dev/null
+        singbox_service_control restart false
         is_conf_file=$is_conf_name.json
         info_show
 
@@ -648,8 +766,9 @@ list() {
     
     for i in "${!files[@]}"; do
         local f=${files[$i]}
-        local proto=$(jq -r '.inbounds[0].type' "$is_conf_dir/$f")
-        local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$f")
+        local conf_path="$is_conf_dir/$f"
+        local proto=$(read_inbound_type "$conf_path")
+        local port=$(read_listen_port "$conf_path")
         printf "%-3s %-30s %-12s %-6s\n" "$((i+1))" "$f" "$proto" "$port"
     done
     echo
@@ -666,9 +785,9 @@ change() {
     else
         select_conf || return 1
     fi
-    
+
     local conf_path="$is_conf_dir/$is_conf_file"
-    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
+    local proto=$(read_inbound_type "$conf_path")
 
     echo
     echo "修改: $is_conf_file ($proto)"
@@ -680,7 +799,7 @@ change() {
     # 检查是否支持 SNI（VLESS-Reality）
     local has_sni=false
     if [[ $proto == "vless" ]]; then
-        local server_name=$(jq -r '.inbounds[0].tls.server_name // empty' "$conf_path")
+        local server_name=$(read_server_name "$conf_path")
         if [[ -n $server_name ]]; then
             echo "  3. SNI (Server Name)"
             has_sni=true
@@ -709,14 +828,14 @@ change() {
 
 change_port() {
     local conf_path=$1
-    local old_port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
-    
+    local old_port=$(read_listen_port "$conf_path")
+
     echo "当前端口: $old_port"
     read -rp "新端口: " new_port
     
     [[ -z $new_port ]] && { echo "已取消"; return; }
     [[ ! $new_port =~ ^[0-9]+$ ]] && { _yellow "端口必须是数字"; return; }
-    [[ $new_port -lt 1 || $new_port -gt 65535 ]] && { _yellow "端口范围: 1-65535"; return; }
+    [[ $new_port -lt $PORT_MIN || $new_port -gt $PORT_MAX ]] && { _yellow "端口范围: $PORT_MIN-$PORT_MAX"; return; }
     is_port_used $new_port && { _yellow "端口 $new_port 已被占用"; return; }
     
     jq ".inbounds[0].listen_port = $new_port" "$conf_path" > "${conf_path}.tmp"
@@ -754,7 +873,7 @@ change_cred() {
 
     case $proto in
         vless)
-            local old_uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            local old_uuid=$(read_uuid "$conf_path")
             echo "当前 UUID: $old_uuid"
             local default_uuid=$(rand_uuid)
             read -rp "新 UUID [$default_uuid]: " new_uuid
@@ -764,8 +883,8 @@ change_cred() {
             restart_check
             ;;
         shadowsocks)
-            local old_pass=$(jq -r '.inbounds[0].password' "$conf_path")
-            local method=$(jq -r '.inbounds[0].method' "$conf_path")
+            local old_pass=$(read_password "$conf_path")
+            local method=$(read_method "$conf_path")
             echo "当前密码: $old_pass"
             echo "加密方式: $method"
             local key_len=16
@@ -792,13 +911,13 @@ change_sni() {
     fi
 
     # 检查是否有 TLS 配置
-    local has_tls=$(jq -r '.inbounds[0].tls.server_name // empty' "$conf_path")
+    local has_tls=$(read_server_name "$conf_path")
     if [[ -z $has_tls ]]; then
         _yellow "此配置未启用 Reality，不支持 SNI"
         return 1
     fi
 
-    local old_sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+    local old_sni=$(read_server_name "$conf_path")
     echo "当前 SNI: $old_sni"
     echo
     echo "常用 SNI 示例:"
@@ -839,7 +958,7 @@ del() {
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
 
     # 获取端口用于防火墙清理
-    local port=$(jq -r '.inbounds[0].listen_port' "$is_conf_dir/$is_conf_file" 2>/dev/null)
+    local port=$(read_listen_port "$is_conf_dir/$is_conf_file")
 
     rm -f "$is_conf_dir/$is_conf_file"
     _green "已删除: $is_conf_file"
@@ -853,7 +972,7 @@ del() {
         auto_remove_traffic_monitor "$port"
     fi
 
-    systemctl restart $is_core &>/dev/null
+    singbox_service_control restart false
 }
 
 # 查看配置
@@ -872,9 +991,9 @@ info() {
 
 info_show() {
     local conf_path="$is_conf_dir/$is_conf_file"
-    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
-    local port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
-    
+    local proto=$(read_inbound_type "$conf_path")
+    local port=$(read_listen_port "$conf_path")
+
     echo
     echo "============================================"
     echo "             配置信息"
@@ -888,13 +1007,13 @@ info_show() {
     
     case $proto in
         vless)
-            local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            local uuid=$(read_uuid "$conf_path")
             local flow=$(jq -r '.inbounds[0].users[0].flow // empty' "$conf_path")
             local reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' "$conf_path")
             echo "UUID: $uuid"
             [[ $flow ]] && echo "Flow: $flow"
             if [[ $reality == "true" ]]; then
-                local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+                local sni=$(read_server_name "$conf_path")
                 local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
                 local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
                 echo "SNI: $sni"
@@ -904,8 +1023,8 @@ info_show() {
             fi
             ;;
         shadowsocks)
-            local method=$(jq -r '.inbounds[0].method' "$conf_path")
-            local password=$(jq -r '.inbounds[0].password' "$conf_path")
+            local method=$(read_method "$conf_path")
+            local password=$(read_password "$conf_path")
             echo "加密方式: $method"
             echo "密码: $password"
             ;;
@@ -923,18 +1042,18 @@ info_show() {
 
 gen_link() {
     local conf_path="$is_conf_dir/$is_conf_file"
-    local proto=$(jq -r '.inbounds[0].type' "$conf_path")
-    local port=$(jq -r '.inbounds[0].listen_port' "$conf_path")
+    local proto=$(read_inbound_type "$conf_path")
+    local port=$(read_listen_port "$conf_path")
     local remark="${is_remark:-$(hostname)}"
-    
+
     case $proto in
         vless)
-            local uuid=$(jq -r '.inbounds[0].users[0].uuid' "$conf_path")
+            local uuid=$(read_uuid "$conf_path")
             local flow=$(jq -r '.inbounds[0].users[0].flow // empty' "$conf_path")
             local reality=$(jq -r '.inbounds[0].tls.reality.enabled // false' "$conf_path")
-            
+
             if [[ $reality == "true" ]]; then
-                local sni=$(jq -r '.inbounds[0].tls.server_name' "$conf_path")
+                local sni=$(read_server_name "$conf_path")
                 local pbk=$(jq -r '.outbounds[1].tag // empty' "$conf_path" | sed 's/public_key_//')
                 local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$conf_path")
                 local fp="chrome"
@@ -951,8 +1070,8 @@ gen_link() {
             fi
             ;;
         shadowsocks)
-            local method=$(jq -r '.inbounds[0].method' "$conf_path")
-            local password=$(jq -r '.inbounds[0].password' "$conf_path")
+            local method=$(read_method "$conf_path")
+            local password=$(read_password "$conf_path")
             local encoded=$(echo -n "${method}:${password}" | base64 -w 0)
             echo "ss://${encoded}@${is_addr}:${port}#${remark}"
             ;;
@@ -961,10 +1080,43 @@ gen_link() {
 }
 
 # ==================== 服务管理 ====================
+singbox_service_control() {
+    local action="$1"
+    local show_log="${2:-true}"
+
+    case "$action" in
+        start|stop|restart|enable|disable|reload)
+            if systemctl "$action" "$is_core" 2>&1; then
+                [ "$show_log" = "true" ] && _green "$is_core 服务 $action 成功"
+                return 0
+            else
+                [ "$show_log" = "true" ] && _red "$is_core 服务 $action 失败"
+                return 1
+            fi
+            ;;
+        status)
+            systemctl status "$is_core" --no-pager
+            return $?
+            ;;
+        is-active)
+            systemctl is-active --quiet "$is_core" 2>/dev/null
+            return $?
+            ;;
+        daemon-reload)
+            systemctl daemon-reload
+            return $?
+            ;;
+        *)
+            _red "未知的服务操作: $action"
+            return 1
+            ;;
+    esac
+}
+
 restart_check() {
-    systemctl restart $is_core
+    singbox_service_control restart false
     sleep 2
-    if systemctl is-active --quiet $is_core; then
+    if singbox_service_control is-active; then
         _green "$is_core 已成功启动"
         return 0
     else
@@ -979,19 +1131,16 @@ restart_check() {
 manage() {
     case $1 in
         start)
-            systemctl start $is_core
+            singbox_service_control start
             refresh_status
-            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已启动" || _red "启动失败"
             ;;
         stop)
-            systemctl stop $is_core
+            singbox_service_control stop
             refresh_status
-            [[ $is_core_stop -eq 1 ]] && _green "$is_core 已停止" || _red "停止失败"
             ;;
         restart)
-            systemctl restart $is_core
+            singbox_service_control restart
             refresh_status
-            [[ $is_core_stop -eq 0 ]] && _green "$is_core 已重启" || _red "重启失败"
             ;;
         status)
             refresh_status
@@ -1230,7 +1379,6 @@ disable_tcp_optimization() {
 # ==================== 更新管理 ====================
 get_latest_version() {
     local repo=$1
-    local cache_time=3600  # 1小时缓存
     local current_time=$(date +%s)
 
     # 检查缓存
@@ -1239,15 +1387,16 @@ get_latest_version() {
         local cached_version=$(sed -n '2p' "$is_version_cache" 2>/dev/null || echo "")
 
         if [ -n "$cache_timestamp" ] && [ -n "$cached_version" ]; then
-            if [ $((current_time - cache_timestamp)) -lt $cache_time ]; then
+            if [ $((current_time - cache_timestamp)) -lt $VERSION_CACHE_TIME ]; then
                 echo "$cached_version"
                 return 0
             fi
         fi
     fi
 
-    # 获取最新版本
-    local version=$(curl -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    # 获取最新版本（使用重试机制）
+    local version
+    version=$(curl_retry -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
 
     if [ -n "$version" ]; then
         # 更新缓存
@@ -1280,34 +1429,42 @@ update_core() {
     [[ $confirm =~ ^[Nn]$ ]] && { echo "已取消"; return 0; }
     
     local url="https://github.com/$is_core_repo/releases/download/v${latest}/sing-box-${latest}-linux-${is_arch}.tar.gz"
-    local tmp_file="/tmp/sing-box.tar.gz"
-    
+    local tmp_file; tmp_file=$(mktemp) || { _red "创建临时文件失败"; return 1; }
+    local tmp_dir; tmp_dir=$(mktemp -d) || { _red "创建临时目录失败"; rm -f "$tmp_file"; return 1; }
+
     echo "下载中..."
-    curl -fLm120 -o "$tmp_file" "$url"
-    [[ $? -ne 0 ]] && { _red "下载失败"; return 1; }
-    
-    systemctl stop $is_core
-    tar -xzf "$tmp_file" -C /tmp
-    cp "/tmp/sing-box-${latest}-linux-${is_arch}/sing-box" "$is_core_bin"
+    if ! curl_retry -fLm${UPDATE_TIMEOUT} -o "$tmp_file" "$url"; then
+        _red "下载失败"
+        rm -rf "$tmp_file" "$tmp_dir"
+        return 1
+    fi
+
+    singbox_service_control stop false
+    tar -xzf "$tmp_file" -C "$tmp_dir"
+    cp "$tmp_dir/sing-box-${latest}-linux-${is_arch}/sing-box" "$is_core_bin"
     chmod +x "$is_core_bin"
-    rm -rf "$tmp_file" "/tmp/sing-box-${latest}-linux-${is_arch}"
-    systemctl start $is_core
-    
+    rm -rf "$tmp_file" "$tmp_dir"
+    singbox_service_control start false
+
     _green "更新完成: $current -> $latest"
 }
 
 update_sh() {
     echo
     echo "更新脚本..."
-    
-    local tmp_file="/tmp/sing-box.sh"
-    curl -sfLm30 -o "$tmp_file" "$is_sh_url"
-    [[ $? -ne 0 ]] && { _red "下载失败"; return 1; }
-    
+
+    local tmp_file; tmp_file=$(mktemp) || { _red "创建临时文件失败"; return 1; }
+
+    if ! curl_retry -sfLm30 -o "$tmp_file" "$is_sh_url"; then
+        _red "下载失败"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
     cp "$tmp_file" "$is_sh_bin"
     chmod +x "$is_sh_bin"
     rm -f "$tmp_file"
-    
+
     _green "脚本更新完成"
 }
 
@@ -1349,13 +1506,13 @@ uninstall() {
     
     echo
     echo "正在卸载..."
-    
-    systemctl stop $is_core &>/dev/null
-    systemctl disable $is_core &>/dev/null
+
+    singbox_service_control stop false
+    singbox_service_control disable false
     rm -rf "$is_core_dir"
     rm -rf "$is_log_dir"
     rm -f /etc/systemd/system/${is_core}.service
-    systemctl daemon-reload
+    singbox_service_control daemon-reload
     rm -f /usr/local/bin/sb
     rm -f /usr/local/bin/$is_core
     rm -f /etc/resolv.conf.bak

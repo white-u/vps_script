@@ -558,7 +558,9 @@ uninstall_singbox() {
     rm -rf /etc/sing-box
     rm -rf /var/log/sing-box
     rm -f /usr/local/bin/sing-box
+    rm -f /usr/local/bin/sb
     rm -f /tmp/singbox_version_cache
+    rm -f /var/tmp/singbox_version_cache
 
     # 清理网络优化
     rm -f /etc/sysctl.d/99-singbox.conf
