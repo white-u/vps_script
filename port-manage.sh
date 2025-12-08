@@ -795,13 +795,14 @@ jq_safe() {
 get_active_ports() {
     [ ! -f "$CONFIG_FILE" ] && return
     jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | while read -r port; do
-        if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
-            local start=$(echo "$port" | cut -d'-' -f1)
-            printf "%05d-%s\n" "$start" "$port"
+        local sort_key
+        if [[ "$port" =~ ^([0-9]+)-[0-9]+$ ]]; then
+            sort_key=${BASH_REMATCH[1]}
         else
-            printf "%05d-%s\n" "$port" "$port"
+            sort_key=$port
         fi
-    done | sort -n | cut -d'-' -f2-
+        printf "%05d\t%s\n" "$sort_key" "$port"
+    done | sort -n | cut -f2
 }
 
 is_port_range() { [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; }
@@ -1763,7 +1764,7 @@ get_burst_status() {
 setup_reset_cron() {
     local port=$1
     # 转义端口中的特殊字符用于 grep
-    local port_escaped=$(echo "$port" | sed 's/[.[\*^$()+?{|]/\\&/g')
+    local port_escaped=$(echo "$port" | sed 's/[][.\\*^$()+?{|]/\\&/g')
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
 
@@ -1780,7 +1781,7 @@ setup_reset_cron() {
 remove_reset_cron() {
     local port=$1
     # 转义端口中的特殊字符用于 grep
-    local port_escaped=$(echo "$port" | sed 's/[.[\*^$()+?{|]/\\&/g')
+    local port_escaped=$(echo "$port" | sed 's/[][.\\*^$()+?{|]/\\&/g')
     local temp_cron=$(mktemp)
     crontab -l 2>/dev/null | grep -v "端口流量监控重置${port_escaped}\$" > "$temp_cron" || true
     crontab "$temp_cron" 2>/dev/null || true
