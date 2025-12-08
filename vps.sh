@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
-SNELL_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/Snell.sh"
+SNELL_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
 SINGBOX_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
 PTM_SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -523,6 +523,7 @@ uninstall_snell() {
     rm -f /usr/local/bin/snell-manager.sh
     rm -f /usr/local/bin/snell
     rm -f /tmp/snell_version_cache
+    rm -f /var/tmp/snell_version_cache
 
     # 清理防火墙
     [ -n "$snell_port" ] && clean_firewall_port "$snell_port"
