@@ -46,6 +46,86 @@ success() { echo -e "${GREEN}✓${RESET} $*"; }
 fail()    { echo -e "${RED}✗${RESET} $*"; }
 
 # =====================================
+# 通用工具函数
+# =====================================
+
+# 获取脚本绝对路径（兼容 Linux 和 macOS）
+get_script_path() {
+    if readlink -f "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+        readlink -f "${BASH_SOURCE[0]}"
+    else
+        # macOS 兼容性：readlink 不支持 -f
+        echo "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    fi
+}
+
+# 下载并验证脚本文件
+# 参数: $1=显示名称 $2=下载URL $3=输出路径
+download_and_verify_script() {
+    local name=$1
+    local url=$2
+    local output=$3
+
+    # 尝试下载
+    if curl -fsSL "$url" -o "$output" 2>/dev/null || \
+       wget -q "$url" -O "$output" 2>/dev/null; then
+        # 验证语法
+        if bash -n "$output" 2>/dev/null; then
+            chmod +x "$output"
+            success "$name 下载并验证成功"
+            return 0
+        else
+            rm -f "$output"
+            error "$name 语法错误，已删除"
+            return 1
+        fi
+    else
+        error "$name 下载失败"
+        return 1
+    fi
+}
+
+# 清理防火墙端口规则
+# 参数: $1=端口号
+clean_firewall_port() {
+    local port=$1
+    [ -z "$port" ] && return
+
+    ufw delete allow "$port"/tcp 2>/dev/null || true
+    ufw delete allow "$port"/udp 2>/dev/null || true
+    firewall-cmd --permanent --remove-port="${port}"/tcp 2>/dev/null || true
+    firewall-cmd --permanent --remove-port="${port}"/udp 2>/dev/null || true
+}
+
+# 安全地安装组件
+# 参数: $1=组件名称 $2=下载URL
+install_component_safely() {
+    local component_name=$1
+    local download_url=$2
+    local temp_file=$(mktemp /tmp/"${component_name}"_install_XXXXXX.sh)
+
+    log "开始安装 $component_name..."
+
+    if curl -fsSL "$download_url" -o "$temp_file" 2>/dev/null || \
+       wget -q "$download_url" -O "$temp_file" 2>/dev/null; then
+        if bash -n "$temp_file" 2>/dev/null; then
+            bash "$temp_file"
+            local exit_code=$?
+            rm -f "$temp_file"
+            return $exit_code
+        else
+            error "下载的安装脚本语法错误"
+            rm -f "$temp_file"
+            return 1
+        fi
+    else
+        error "下载 $component_name 安装脚本失败，请检查网络连接"
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
+# =====================================
 # 系统检查
 # =====================================
 check_root() {
@@ -161,7 +241,11 @@ is_snell_running() {
 
 get_snell_port() {
     if [ -f /etc/snell/snell-server.conf ]; then
-        grep -E '^listen' /etc/snell/snell-server.conf 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/' || echo ""
+        local port=$(grep -E '^listen' /etc/snell/snell-server.conf 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/')
+        # 验证端口号有效性
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+            echo "$port"
+        fi
     fi
 }
 
@@ -174,13 +258,24 @@ is_singbox_running() {
 }
 
 get_singbox_ports() {
-    if [ -d /etc/sing-box/conf ]; then
-        while read -r conf; do
-            local port=$(jq -r '.inbounds[0].listen_port' "$conf" 2>/dev/null)
-            local proto=$(jq -r '.inbounds[0].type' "$conf" 2>/dev/null)
-            [ -n "$port" ] && echo "$port|$proto"
-        done < <(find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null)
-    fi
+    [ ! -d /etc/sing-box/conf ] && return 1
+
+    local found=0
+    for conf in /etc/sing-box/conf/*.json; do
+        [ -f "$conf" ] || continue
+
+        # 使用 // empty 避免 jq 输出 null
+        local port=$(jq -r '.inbounds[0].listen_port // empty' "$conf" 2>/dev/null)
+        local proto=$(jq -r '.inbounds[0].type // empty' "$conf" 2>/dev/null)
+
+        # 验证端口和协议都存在
+        if [ -n "$port" ] && [ -n "$proto" ] && [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "$port|$proto"
+            found=1
+        fi
+    done
+
+    [ $found -eq 1 ] && return 0 || return 1
 }
 
 is_ptm_installed() {
@@ -222,14 +317,19 @@ get_port_traffic() {
 
 format_bytes() {
     local bytes=${1:-0}
-    if [ "$bytes" -ge 1099511627776 ]; then
-        awk "BEGIN {printf \"%.2fTB\", $bytes/1099511627776}"
-    elif [ "$bytes" -ge 1073741824 ]; then
-        awk "BEGIN {printf \"%.2fGB\", $bytes/1073741824}"
-    elif [ "$bytes" -ge 1048576 ]; then
-        awk "BEGIN {printf \"%.2fMB\", $bytes/1048576}"
-    elif [ "$bytes" -ge 1024 ]; then
-        awk "BEGIN {printf \"%.2fKB\", $bytes/1024}"
+    local KB=1024
+    local MB=$((KB * 1024))
+    local GB=$((MB * 1024))
+    local TB=$((GB * 1024))
+
+    if [ "$bytes" -ge $TB ]; then
+        awk "BEGIN {printf \"%.2fTB\", $bytes/$TB}"
+    elif [ "$bytes" -ge $GB ]; then
+        awk "BEGIN {printf \"%.2fGB\", $bytes/$GB}"
+    elif [ "$bytes" -ge $MB ]; then
+        awk "BEGIN {printf \"%.2fMB\", $bytes/$MB}"
+    elif [ "$bytes" -ge $KB ]; then
+        awk "BEGIN {printf \"%.2fKB\", $bytes/$KB}"
     else
         echo "${bytes}B"
     fi
@@ -401,6 +501,129 @@ show_menu() {
 # =====================================
 # 一键卸载所有组件
 # =====================================
+
+# 卸载 Snell Server
+uninstall_snell() {
+    is_snell_installed || return 0
+
+    log "正在卸载 Snell Server..."
+
+    # 停止服务
+    systemctl stop snell 2>/dev/null || true
+    systemctl disable snell 2>/dev/null || true
+
+    # 获取端口用于清理防火墙
+    local snell_port=$(get_snell_port)
+
+    # 删除文件
+    rm -f /etc/systemd/system/snell.service
+    rm -f /usr/local/bin/snell-server
+    rm -rf /etc/snell
+    rm -rf /var/backups/snell-manager
+    rm -f /usr/local/bin/snell-manager.sh
+    rm -f /usr/local/bin/snell
+    rm -f /tmp/snell_version_cache
+
+    # 清理防火墙
+    [ -n "$snell_port" ] && clean_firewall_port "$snell_port"
+
+    # 清理网络优化
+    rm -f /etc/sysctl.d/99-snell.conf
+
+    success "Snell Server 已卸载"
+}
+
+# 卸载 sing-box
+uninstall_singbox() {
+    is_singbox_installed || return 0
+
+    log "正在卸载 sing-box..."
+
+    # 停止服务
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
+
+    # 获取所有端口用于清理防火墙
+    if [ -d /etc/sing-box/conf ]; then
+        for conf in /etc/sing-box/conf/*.json; do
+            [ -f "$conf" ] || continue
+            local port=$(jq -r '.inbounds[0].listen_port // empty' "$conf" 2>/dev/null)
+            [ -n "$port" ] && clean_firewall_port "$port"
+        done
+    fi
+
+    # 删除文件
+    rm -f /etc/systemd/system/sing-box.service
+    rm -rf /etc/sing-box
+    rm -rf /var/log/sing-box
+    rm -f /usr/local/bin/sing-box
+    rm -f /tmp/singbox_version_cache
+
+    # 清理网络优化
+    rm -f /etc/sysctl.d/99-singbox.conf
+
+    success "sing-box 已卸载"
+}
+
+# 卸载 port-manage
+uninstall_ptm() {
+    is_ptm_installed || return 0
+
+    log "正在卸载流量监控..."
+
+    # 删除定时任务
+    crontab -l 2>/dev/null | grep -v port-traffic-monitor | crontab - 2>/dev/null || true
+
+    # 删除 nftables 规则
+    nft delete table inet port_monitor 2>/dev/null || true
+
+    # 删除 tc 规则
+    local interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    if [ -n "$interface" ]; then
+        tc qdisc del dev "$interface" handle ffff: ingress 2>/dev/null || true
+    fi
+    tc qdisc del dev ifb0 root 2>/dev/null || true
+    ip link set ifb0 down 2>/dev/null || true
+
+    # 删除文件
+    rm -rf /etc/port-traffic-monitor
+    rm -f /usr/local/bin/ptm
+    rm -f /usr/local/bin/port-traffic-monitor.sh
+
+    success "流量监控已卸载"
+}
+
+# 清理系统配置
+cleanup_system() {
+    # 重新加载 systemd
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 重新加载防火墙
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    # 重新加载 sysctl
+    sysctl -p 2>/dev/null || true
+}
+
+# 显示卸载总结
+show_uninstall_summary() {
+    echo ""
+    echo -e "${GREEN}${BOLD}✓ 所有组件已卸载完成！${RESET}"
+    echo ""
+    echo -e "${YELLOW}已清理的内容：${RESET}"
+    echo "  • 所有服务和二进制文件"
+    echo "  • 所有配置文件和数据"
+    echo "  • 防火墙规则"
+    echo "  • 网络优化设置"
+    echo "  • 定时任务"
+    echo "  • 流量统计规则"
+    echo ""
+    echo -e "${CYAN}感谢使用 VPS 代理管理平台！${RESET}"
+    echo ""
+}
+
 uninstall_all() {
     clear
     echo -e "${BOLD}${RED}════════════════════════════════════════════════════════${RESET}"
@@ -412,21 +635,9 @@ uninstall_all() {
 
     local to_uninstall=()
 
-    if is_snell_installed; then
-        echo "  ✓ Snell Server"
-        to_uninstall+=("snell")
-    fi
-
-    if is_singbox_installed; then
-        echo "  ✓ sing-box"
-        to_uninstall+=("singbox")
-    fi
-
-    if is_ptm_installed; then
-        echo "  ✓ 流量监控 (port-manage)"
-        to_uninstall+=("ptm")
-    fi
-
+    is_snell_installed && { echo "  ✓ Snell Server"; to_uninstall+=("snell"); }
+    is_singbox_installed && { echo "  ✓ sing-box"; to_uninstall+=("singbox"); }
+    is_ptm_installed && { echo "  ✓ 流量监控 (port-manage)"; to_uninstall+=("ptm"); }
     echo "  ✓ VPS 统一管理平台"
 
     echo ""
@@ -460,131 +671,21 @@ uninstall_all() {
     echo -e "${CYAN}开始卸载...${RESET}"
     echo ""
 
-    # 卸载 Snell
-    if is_snell_installed; then
-        log "正在卸载 Snell Server..."
-
-        # 停止服务
-        systemctl stop snell 2>/dev/null || true
-        systemctl disable snell 2>/dev/null || true
-
-        # 获取端口用于清理防火墙
-        local snell_port=""
-        if [ -f /etc/snell/snell-server.conf ]; then
-            snell_port=$(grep -E '^listen' /etc/snell/snell-server.conf 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/' || echo "")
-        fi
-
-        # 删除文件
-        rm -f /etc/systemd/system/snell.service
-        rm -f /usr/local/bin/snell-server
-        rm -rf /etc/snell
-        rm -rf /var/backups/snell-manager
-        rm -f /usr/local/bin/snell-manager.sh
-        rm -f /usr/local/bin/snell
-        rm -f /tmp/snell_version_cache
-
-        # 清理防火墙
-        if [ -n "$snell_port" ]; then
-            ufw delete allow "$snell_port"/tcp 2>/dev/null || true
-            ufw delete allow "$snell_port"/udp 2>/dev/null || true
-            firewall-cmd --permanent --remove-port="${snell_port}"/tcp 2>/dev/null || true
-            firewall-cmd --permanent --remove-port="${snell_port}"/udp 2>/dev/null || true
-        fi
-
-        # 清理网络优化
-        rm -f /etc/sysctl.d/99-snell.conf
-
-        systemctl daemon-reload 2>/dev/null || true
-        success "Snell Server 已卸载"
-    fi
-
-    # 卸载 sing-box
-    if is_singbox_installed; then
-        log "正在卸载 sing-box..."
-
-        # 停止服务
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-
-        # 获取所有端口用于清理防火墙
-        if [ -d /etc/sing-box/conf ]; then
-            while read -r conf; do
-                local port=$(jq -r '.inbounds[0].listen_port' "$conf" 2>/dev/null)
-                if [ -n "$port" ]; then
-                    ufw delete allow "$port"/tcp 2>/dev/null || true
-                    ufw delete allow "$port"/udp 2>/dev/null || true
-                    firewall-cmd --permanent --remove-port="${port}"/tcp 2>/dev/null || true
-                    firewall-cmd --permanent --remove-port="${port}"/udp 2>/dev/null || true
-                fi
-            done < <(find /etc/sing-box/conf -name "*.json" -type f 2>/dev/null)
-        fi
-
-        # 删除文件
-        rm -f /etc/systemd/system/sing-box.service
-        rm -rf /etc/sing-box
-        rm -rf /var/log/sing-box
-        rm -f /usr/local/bin/sing-box
-        rm -f /tmp/singbox_version_cache
-
-        # 清理网络优化
-        rm -f /etc/sysctl.d/99-singbox.conf
-
-        systemctl daemon-reload 2>/dev/null || true
-        success "sing-box 已卸载"
-    fi
-
-    # 卸载 port-manage
-    if is_ptm_installed; then
-        log "正在卸载流量监控..."
-
-        # 删除定时任务
-        crontab -l 2>/dev/null | grep -v port-traffic-monitor | crontab - 2>/dev/null || true
-
-        # 删除 nftables 规则
-        nft delete table inet port_monitor 2>/dev/null || true
-
-        # 删除 tc 规则
-        local interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-        if [ -n "$interface" ]; then
-            tc qdisc del dev "$interface" handle ffff: ingress 2>/dev/null || true
-        fi
-        tc qdisc del dev ifb0 root 2>/dev/null || true
-        ip link set ifb0 down 2>/dev/null || true
-
-        # 删除文件
-        rm -rf /etc/port-traffic-monitor
-        rm -f /usr/local/bin/ptm
-        rm -f /usr/local/bin/port-traffic-monitor.sh
-
-        success "流量监控已卸载"
-    fi
+    # 卸载各个组件
+    uninstall_snell
+    uninstall_singbox
+    uninstall_ptm
 
     # 卸载 VPS 统一管理平台
     log "正在卸载 VPS 统一管理平台..."
     rm -f /usr/local/bin/vps
     success "VPS 统一管理平台已卸载"
 
-    # 重新加载防火墙
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --reload 2>/dev/null || true
-    fi
+    # 清理系统配置
+    cleanup_system
 
-    # 重新加载 sysctl
-    sysctl -p 2>/dev/null || true
-
-    echo ""
-    echo -e "${GREEN}${BOLD}✓ 所有组件已卸载完成！${RESET}"
-    echo ""
-    echo -e "${YELLOW}已清理的内容：${RESET}"
-    echo "  • 所有服务和二进制文件"
-    echo "  • 所有配置文件和数据"
-    echo "  • 防火墙规则"
-    echo "  • 网络优化设置"
-    echo "  • 定时任务"
-    echo "  • 流量统计规则"
-    echo ""
-    echo -e "${CYAN}感谢使用 VPS 代理管理平台！${RESET}"
-    echo ""
+    # 显示总结
+    show_uninstall_summary
 
     read -rp "按回车退出..." _
     exit 0
@@ -597,16 +698,11 @@ update_self() {
     echo -e "\n${BOLD}${CYAN}🔄 检查 vps.sh 更新${RESET}\n"
 
     local current_version="$SCRIPT_VERSION"
-    local temp_file="/tmp/vps_new.sh"
-    local backup_file="/tmp/vps_backup_$(date +%Y%m%d_%H%M%S).sh"
+    local temp_file=$(mktemp /tmp/vps_new_XXXXXX.sh)
+    local backup_file=$(mktemp /tmp/vps_backup_XXXXXX.sh)
 
     # 备份当前脚本
-    local script_path
-    if readlink -f "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
-        script_path="$(readlink -f "${BASH_SOURCE[0]}")"
-    else
-        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    fi
+    local script_path=$(get_script_path)
 
     if [ -f "$script_path" ]; then
         cp "$script_path" "$backup_file"
@@ -733,20 +829,17 @@ install_component() {
     case "$pick" in
         1)
             if ! is_snell_installed; then
-                log "开始安装 Snell..."
-                bash <(curl -fsSL "$SNELL_SCRIPT_URL")
+                install_component_safely "Snell" "$SNELL_SCRIPT_URL"
             fi
             ;;
         2)
             if ! is_singbox_installed; then
-                log "开始安装 sing-box..."
-                bash <(curl -fsSL "$SINGBOX_SCRIPT_URL")
+                install_component_safely "sing-box" "$SINGBOX_SCRIPT_URL"
             fi
             ;;
         3)
             if ! is_ptm_installed; then
-                log "开始安装 port-manage..."
-                bash <(curl -fsSL "$PTM_SCRIPT_URL")
+                install_component_safely "port-manage" "$PTM_SCRIPT_URL"
             fi
             ;;
         4)
@@ -754,37 +847,20 @@ install_component() {
             local success_count=0
 
             # 下载 system-optimize.sh
-            if curl -fsSL "${SCRIPT_URL%/*}/system-optimize.sh" -o "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null || \
-               wget -q "${SCRIPT_URL%/*}/system-optimize.sh" -O "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null; then
-                # 验证语法
-                if bash -n "${SCRIPT_DIR}/system-optimize.sh" 2>/dev/null; then
-                    chmod +x "${SCRIPT_DIR}/system-optimize.sh"
-                    success "system-optimize.sh 下载并验证成功"
-                    ((success_count++))
-                else
-                    rm -f "${SCRIPT_DIR}/system-optimize.sh"
-                    error "system-optimize.sh 语法错误，已删除"
-                fi
-            else
-                error "system-optimize.sh 下载失败"
+            if download_and_verify_script "system-optimize.sh" \
+                "${SCRIPT_URL%/*}/system-optimize.sh" \
+                "${SCRIPT_DIR}/system-optimize.sh"; then
+                ((success_count++))
             fi
 
             # 下载 telegram-notify.sh
-            if curl -fsSL "${SCRIPT_URL%/*}/telegram-notify.sh" -o "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null || \
-               wget -q "${SCRIPT_URL%/*}/telegram-notify.sh" -O "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null; then
-                # 验证语法
-                if bash -n "${SCRIPT_DIR}/telegram-notify.sh" 2>/dev/null; then
-                    chmod +x "${SCRIPT_DIR}/telegram-notify.sh"
-                    success "telegram-notify.sh 下载并验证成功"
-                    ((success_count++))
-                else
-                    rm -f "${SCRIPT_DIR}/telegram-notify.sh"
-                    error "telegram-notify.sh 语法错误，已删除"
-                fi
-            else
-                error "telegram-notify.sh 下载失败"
+            if download_and_verify_script "telegram-notify.sh" \
+                "${SCRIPT_URL%/*}/telegram-notify.sh" \
+                "${SCRIPT_DIR}/telegram-notify.sh"; then
+                ((success_count++))
             fi
 
+            echo ""
             if [ $success_count -eq 2 ]; then
                 success "所有模块下载完成"
             elif [ $success_count -gt 0 ]; then
@@ -917,13 +993,7 @@ main() {
     check_dependencies
 
     # 创建快捷命令（如果不存在）
-    local script_path
-    if readlink -f "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
-        script_path="$(readlink -f "${BASH_SOURCE[0]}")"
-    else
-        # macOS 兼容性：readlink 不支持 -f
-        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    fi
+    local script_path=$(get_script_path)
 
     # 检查脚本是否在临时位置（通过 curl | bash 运行）
     if [[ "$script_path" =~ ^/tmp/|^/dev/fd/ ]] || [ ! -f "$script_path" ]; then
@@ -971,7 +1041,7 @@ main() {
                     error "Snell 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -fsSL "$SNELL_SCRIPT_URL")
+                        install_component_safely "Snell" "$SNELL_SCRIPT_URL"
                     fi
                 fi
                 ;;
@@ -982,7 +1052,7 @@ main() {
                     error "sing-box 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -fsSL "$SINGBOX_SCRIPT_URL")
+                        install_component_safely "sing-box" "$SINGBOX_SCRIPT_URL"
                     fi
                 fi
                 ;;
@@ -993,7 +1063,7 @@ main() {
                     error "port-manage 未安装"
                     read -rp "是否现在安装? [y/N]: " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        bash <(curl -fsSL "$PTM_SCRIPT_URL")
+                        install_component_safely "port-manage" "$PTM_SCRIPT_URL"
                     fi
                 fi
                 ;;
