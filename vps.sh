@@ -925,9 +925,31 @@ main() {
         script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     fi
 
-    if [ ! -L /usr/local/bin/vps ] && [ -f "$script_path" ]; then
-        ln -sf "$script_path" /usr/local/bin/vps 2>/dev/null && \
-            log "已创建快捷命令：vps" || true
+    # 检查脚本是否在临时位置（通过 curl | bash 运行）
+    if [[ "$script_path" =~ ^/tmp/|^/dev/fd/ ]] || [ ! -f "$script_path" ]; then
+        # 脚本在临时位置，需要下载到固定位置
+        if [ ! -f /usr/local/bin/vps ]; then
+            log "检测到首次运行，正在安装 vps 命令..."
+
+            # 下载脚本到 /usr/local/bin
+            if curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/vps 2>/dev/null || \
+               wget -q "$SCRIPT_URL" -O /usr/local/bin/vps 2>/dev/null; then
+                chmod +x /usr/local/bin/vps
+                success "vps 命令已安装到 /usr/local/bin/vps"
+                echo ""
+                log "现在可以直接使用 'vps' 命令了"
+                echo ""
+            else
+                warn "下载失败，本次将以临时模式运行"
+                echo ""
+            fi
+        fi
+    else
+        # 脚本在固定位置，创建符号链接
+        if [ ! -L /usr/local/bin/vps ] && [ -f "$script_path" ] && [ "$script_path" != "/usr/local/bin/vps" ]; then
+            ln -sf "$script_path" /usr/local/bin/vps 2>/dev/null && \
+                log "已创建快捷命令：vps" || true
+        fi
     fi
 
     # 处理命令行参数
