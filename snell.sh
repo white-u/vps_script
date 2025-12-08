@@ -674,6 +674,13 @@ EOF
   # 记录节点名称
   echo "$node_name" > "${SNELL_DIR}/node_name.txt"
 
+  # 设置正确的权限（如果 snell 用户存在）
+  if id -u snell >/dev/null 2>&1; then
+    chown -R snell:snell "$SNELL_DIR" 2>/dev/null || true
+    chmod 750 "$SNELL_DIR" 2>/dev/null || true
+    chmod 640 "$SNELL_CONF" 2>/dev/null || true
+  fi
+
   # 更新 Surge 配置文件
   update_config_txt "$port" "$psk" "$node_name"
 }
@@ -734,80 +741,59 @@ firewalld_allow() { firewall_allow_port "$1"; }
 firewalld_remove() { firewall_remove_port "$1"; }
 
 # =====================================
-# 自动流量监控 (port-manage.sh 集成)
+# 自动流量监控 (port-monitor-v2.sh 集成)
 # =====================================
 auto_add_traffic_monitor() {
   local port="$1"
   local remark="${2:-Snell Server}"
 
-  # 检查 port-manage.sh 是否已安装
-  local ptm_config="/etc/port-traffic-monitor/config.json"
-  if [[ ! -f "$ptm_config" ]]; then
+  # 检查 port-monitor-v2.sh (SQLite) 是否已安装
+  local ptm_db="/etc/port-traffic-monitor/config.db"
+  if [[ ! -f "$ptm_db" ]]; then
     return 0  # 未安装，静默跳过
   fi
 
-  # 检查 jq 是否可用
-  if ! command -v jq >/dev/null 2>&1; then
-    warn "缺少 jq 命令，无法自动添加流量监控"
+  # 检查 sqlite3 是否可用
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    warn "缺少 sqlite3 命令，无法自动添加流量监控"
     return 1
   fi
 
   # 检查端口是否已存在
-  if jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
+  local exists
+  exists=$(sqlite3 "$ptm_db" "SELECT COUNT(*) FROM ports WHERE port='$port';" 2>/dev/null || echo "0")
+  if [ "$exists" != "0" ]; then
     log "端口 $port 已在流量监控中"
     return 0
   fi
 
   log "自动添加端口 $port 到流量监控..."
 
-  # 读取 nftables 配置
-  local nft_table nft_family
-  nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
-  nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
+  # 使用 ptm 命令添加端口（如果存在）
+  if command -v ptm >/dev/null 2>&1; then
+    # 通过 ptm 脚本添加（推荐方式，会自动处理所有配置）
+    if /usr/local/bin/port-monitor-v2.sh --add-port "$port" "$remark" "single" 2>/dev/null; then
+      log "✓ 已自动添加端口 $port 到流量监控（仅统计，无限制）"
+      echo "  使用 'ptm' 命令查看流量统计"
+      return 0
+    fi
+  fi
 
-  # 构建配置 JSON
-  local timestamp; timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
-  local config_json
-  config_json=$(cat <<EOF
-{
-  "billing": "single",
-  "quota": {
-    "limit": "unlimited",
-    "reset_day": null
-  },
-  "bandwidth": {
-    "rate": "unlimited"
-  },
-  "remark": "$remark",
-  "created": "$timestamp"
-}
+  # 降级方案：直接操作数据库和 nftables（兼容性方案）
+  # 插入端口记录
+  if ! sqlite3 "$ptm_db" <<EOF 2>/dev/null
+INSERT INTO ports (port, billing_mode, remark, created_at)
+VALUES ('$port', 'single', '$remark', datetime('now'));
 EOF
-)
-
-  # 更新配置文件
-  local tmp_config
-  tmp_config=$(mktemp "${ptm_config}.XXXXXX") || {
-    warn "无法创建临时文件"
-    return 1
-  }
-
-  if jq ".ports.\"$port\" = $config_json" "$ptm_config" > "$tmp_config" 2>/dev/null; then
-    # 保持原文件权限
-    chmod --reference="$ptm_config" "$tmp_config" 2>/dev/null || chmod 644 "$tmp_config"
-    # 原子性移动
-    mv -f "$tmp_config" "$ptm_config" || {
-      rm -f "$tmp_config"
-      warn "更新流量监控配置失败"
-      return 1
-    }
-  else
-    rm -f "$tmp_config"
-    warn "生成流量监控配置失败"
+  then
+    warn "添加流量监控失败"
     return 1
   fi
 
   # 添加 nftables 规则
-  local port_safe; port_safe=$(echo "$port" | tr '-' '_')
+  local nft_table="port_traffic"
+  local nft_family="inet"
+  local port_safe; port_safe=$(echo "$port" | tr '-:' '__')
 
   # 创建计数器
   nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" >/dev/null 2>&1 || \
@@ -831,31 +817,35 @@ EOF
 auto_remove_traffic_monitor() {
   local port="$1"
 
-  # 检查 port-manage.sh 是否已安装
-  local ptm_config="/etc/port-traffic-monitor/config.json"
-  if [[ ! -f "$ptm_config" ]]; then
+  # 检查 port-monitor-v2.sh (SQLite) 是否已安装
+  local ptm_db="/etc/port-traffic-monitor/config.db"
+  if [[ ! -f "$ptm_db" ]]; then
     return 0  # 未安装，跳过
   fi
 
-  # 检查 jq 是否可用
-  if ! command -v jq >/dev/null 2>&1; then
+  # 检查 sqlite3 是否可用
+  if ! command -v sqlite3 >/dev/null 2>&1; then
     return 0
   fi
 
   # 检查端口是否存在
-  if ! jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
+  local exists
+  exists=$(sqlite3 "$ptm_db" "SELECT COUNT(*) FROM ports WHERE port='$port';" 2>/dev/null || echo "0")
+  if [ "$exists" = "0" ]; then
     return 0  # 端口不存在，跳过
   fi
 
   log "自动移除端口 $port 的流量监控..."
 
-  # 读取 nftables 配置
-  local nft_table nft_family
-  nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
-  nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
-  local port_safe; port_safe=$(echo "$port" | tr '-' '_')
+  # 删除端口记录（SQLite 的级联删除会自动清理相关配置）
+  sqlite3 "$ptm_db" "DELETE FROM ports WHERE port='$port';" 2>/dev/null || true
 
-  # 删除 nftables 规则（优化：批量获取所有 handle）
+  # 删除 nftables 规则
+  local nft_table="port_traffic"
+  local nft_family="inet"
+  local port_safe; port_safe=$(echo "$port" | tr '-:' '__')
+
+  # 删除 nftables 规则（批量获取所有 handle）
   local handles chain
   for chain in input output forward; do
     handles=$(nft -a list chain "$nft_family" "$nft_table" "$chain" 2>/dev/null | \
@@ -870,17 +860,6 @@ auto_remove_traffic_monitor() {
   # 删除计数器
   nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
   nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
-
-  # 更新配置文件
-  local tmp_config
-  tmp_config=$(mktemp "${ptm_config}.XXXXXX") || return 0
-
-  if jq "del(.ports.\"$port\")" "$ptm_config" > "$tmp_config" 2>/dev/null; then
-    chmod --reference="$ptm_config" "$tmp_config" 2>/dev/null || chmod 644 "$tmp_config"
-    mv -f "$tmp_config" "$ptm_config" || rm -f "$tmp_config"
-  else
-    rm -f "$tmp_config"
-  fi
 
   log "✓ 已移除端口 $port 的流量监控"
 }
@@ -1166,6 +1145,14 @@ install_snell() {
   # 创建用户
   if ! id -u snell >/dev/null 2>&1; then
     useradd -r -s /usr/sbin/nologin snell || warn "创建 snell 用户失败（非致命）"
+  fi
+
+  # 创建并设置日志目录权限
+  mkdir -p "$(dirname "$SNELL_LOG")"
+  touch "$SNELL_LOG"
+  if id -u snell >/dev/null 2>&1; then
+    chown snell:snell "$SNELL_LOG" 2>/dev/null || true
+    chown snell:snell "$(dirname "$SNELL_LOG")" 2>/dev/null || true
   fi
 
   local psk; psk=$(generate_psk)
