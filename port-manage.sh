@@ -666,6 +666,23 @@ init_nftables() {
     nft add chain $NFT_FAMILY $NFT_TABLE input "{ type filter hook input priority 0; }" 2>/dev/null || true
     nft add chain $NFT_FAMILY $NFT_TABLE output "{ type filter hook output priority 0; }" 2>/dev/null || true
     nft add chain $NFT_FAMILY $NFT_TABLE forward "{ type filter hook forward priority 0; }" 2>/dev/null || true
+    # 用于大端口范围的 mark (替代 iptables mangle)
+    nft add chain $NFT_FAMILY $NFT_TABLE prerouting "{ type filter hook prerouting priority mangle; }" 2>/dev/null || true
+    nft add chain $NFT_FAMILY $NFT_TABLE postrouting "{ type filter hook postrouting priority mangle; }" 2>/dev/null || true
+}
+
+# 删除 nftables mark 规则 (通过 comment 查找)
+_remove_nft_mark_rules() {
+    local chain=$1 mark_id=$2
+    local handle
+    
+    # 查找带有指定 comment 的规则 handle
+    nft -a list chain $NFT_FAMILY $NFT_TABLE "$chain" 2>/dev/null | \
+        grep "tc_mark_${mark_id}_" | \
+        grep -oE 'handle [0-9]+' | awk '{print $2}' | \
+    while read -r handle; do
+        [ -n "$handle" ] && nft delete rule $NFT_FAMILY $NFT_TABLE "$chain" handle "$handle" 2>/dev/null || true
+    done
 }
 
 # ============================================================================
@@ -1379,11 +1396,9 @@ _apply_tc_filter_range_via_mark() {
     
     mark_value=$start
     
-    local iptables_direction="--sport"
-    [ "$direction" = "dport" ] && iptables_direction="--dport"
-    
-    iptables -t mangle -A POSTROUTING -p tcp "$iptables_direction" "$start:$end" -j MARK --set-mark "$mark_value" 2>/dev/null || true
-    iptables -t mangle -A POSTROUTING -p udp "$iptables_direction" "$start:$end" -j MARK --set-mark "$mark_value" 2>/dev/null || true
+    # 使用 nftables 设置 mark (替代 iptables mangle)
+    nft add rule $NFT_FAMILY $NFT_TABLE postrouting tcp $direction $start-$end meta mark set $mark_value comment \"tc_mark_${start}_tcp\" 2>/dev/null || true
+    nft add rule $NFT_FAMILY $NFT_TABLE postrouting udp $direction $start-$end meta mark set $mark_value comment \"tc_mark_${start}_udp\" 2>/dev/null || true
     
     tc filter add dev "$interface" protocol ip parent 1:0 prio "$prio" handle "$mark_value" fw flowid "$class_id" 2>/dev/null || true
 }
@@ -1442,8 +1457,8 @@ _apply_tc_filter_range_ingress() {
         done
     else
         local mark_value=$start
-        iptables -t mangle -A PREROUTING -p tcp --dport "$start:$end" -j MARK --set-mark "$mark_value" 2>/dev/null || true
-        iptables -t mangle -A PREROUTING -p udp --dport "$start:$end" -j MARK --set-mark "$mark_value" 2>/dev/null || true
+        nft add rule $NFT_FAMILY $NFT_TABLE prerouting tcp dport $start-$end meta mark set $mark_value comment \"tc_mark_${start}_tcp\" 2>/dev/null || true
+        nft add rule $NFT_FAMILY $NFT_TABLE prerouting udp dport $start-$end meta mark set $mark_value comment \"tc_mark_${start}_udp\" 2>/dev/null || true
         
         tc filter add dev "$interface" parent ffff: protocol ip prio "$ifb_prio" handle "$mark_value" fw \
             action mirred egress redirect dev ifb0 2>/dev/null || true
@@ -1531,11 +1546,7 @@ _remove_tc_filter_range() {
             done
         done
     else
-        local iptables_direction="--sport"
-        [ "$direction" = "dport" ] && iptables_direction="--dport"
-        
-        iptables -t mangle -D POSTROUTING -p tcp "$iptables_direction" "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-        iptables -t mangle -D POSTROUTING -p udp "$iptables_direction" "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+        _remove_nft_mark_rules "postrouting" "$start"
         
         tc filter del dev "$interface" parent 1:0 prio "$prio" 2>/dev/null || true
     fi
@@ -1574,8 +1585,7 @@ _remove_tc_filter_range_ingress() {
             done
         done
     else
-        iptables -t mangle -D PREROUTING -p tcp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-        iptables -t mangle -D PREROUTING -p udp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
+        _remove_nft_mark_rules "prerouting" "$start"
         
         tc filter del dev "$interface" parent ffff: prio "$ifb_prio" 2>/dev/null || true
         tc filter del dev ifb0 parent 1:0 prio "$filter_prio" 2>/dev/null || true
@@ -2890,16 +2900,6 @@ uninstall() {
         remove_tc_limit "$port"
         remove_reset_cron "$port"
         
-        # 清理该端口相关的 iptables mark 规则
-        if is_port_range "$port"; then
-            local start end
-            start=$(get_port_range_start "$port")
-            end=$(get_port_range_end "$port")
-            iptables -t mangle -D PREROUTING -p tcp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-            iptables -t mangle -D PREROUTING -p udp --dport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-            iptables -t mangle -D POSTROUTING -p tcp --sport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-            iptables -t mangle -D POSTROUTING -p udp --sport "$start:$end" -j MARK --set-mark "$start" 2>/dev/null || true
-        fi
     done
 
     remove_notify_cron
