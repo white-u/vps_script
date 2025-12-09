@@ -1397,8 +1397,8 @@ _apply_tc_filter_range_via_mark() {
     mark_value=$start
     
     # 使用 nftables 设置 mark (替代 iptables mangle)
-    nft add rule $NFT_FAMILY $NFT_TABLE postrouting tcp $direction $start-$end meta mark set $mark_value comment \"tc_mark_${start}_tcp\" 2>/dev/null || true
-    nft add rule $NFT_FAMILY $NFT_TABLE postrouting udp $direction $start-$end meta mark set $mark_value comment \"tc_mark_${start}_udp\" 2>/dev/null || true
+    nft add rule $NFT_FAMILY $NFT_TABLE postrouting tcp $direction $start-$end meta mark set $mark_value comment "tc_mark_${start}_tcp" 2>/dev/null || true
+    nft add rule $NFT_FAMILY $NFT_TABLE postrouting udp $direction $start-$end meta mark set $mark_value comment "tc_mark_${start}_udp" 2>/dev/null || true
     
     tc filter add dev "$interface" protocol ip parent 1:0 prio "$prio" handle "$mark_value" fw flowid "$class_id" 2>/dev/null || true
 }
@@ -1457,8 +1457,8 @@ _apply_tc_filter_range_ingress() {
         done
     else
         local mark_value=$start
-        nft add rule $NFT_FAMILY $NFT_TABLE prerouting tcp dport $start-$end meta mark set $mark_value comment \"tc_mark_${start}_tcp\" 2>/dev/null || true
-        nft add rule $NFT_FAMILY $NFT_TABLE prerouting udp dport $start-$end meta mark set $mark_value comment \"tc_mark_${start}_udp\" 2>/dev/null || true
+        nft add rule $NFT_FAMILY $NFT_TABLE prerouting tcp dport $start-$end meta mark set $mark_value comment "tc_mark_${start}_tcp" 2>/dev/null || true
+        nft add rule $NFT_FAMILY $NFT_TABLE prerouting udp dport $start-$end meta mark set $mark_value comment "tc_mark_${start}_udp" 2>/dev/null || true
         
         tc filter add dev "$interface" parent ffff: protocol ip prio "$ifb_prio" handle "$mark_value" fw \
             action mirred egress redirect dev ifb0 2>/dev/null || true
