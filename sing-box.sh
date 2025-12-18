@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# sing-box 单文件管理脚本
+# sing-box 单文件管理脚本 (精简优化版)
 # https://github.com/white-u/vps_script
 # Usage: bash <(curl -sL url) [args]
 
-is_sh_ver=v2.0
+is_sh_ver=v2.1
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -19,54 +19,6 @@ err() {
 # ==================== 模块加载 ====================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_URL="https://raw.githubusercontent.com/white-u/vps_script/main"
-
-load_system_optimize_module() {
-    local module_file="${SCRIPT_DIR}/system-optimize.sh"
-
-    # 如果已经加载过，直接返回
-    if type enable_network_optimization >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # 本地存在，直接加载
-    if [ -f "$module_file" ]; then
-        if source "$module_file" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    # 本地不存在或加载失败，尝试下载
-    _yellow "system-optimize.sh 模块未找到，尝试自动下载..."
-
-    # 尝试使用 curl 下载
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "${REPO_URL}/system-optimize.sh" -o "$module_file" 2>/dev/null; then
-            chmod +x "$module_file"
-            if [ -s "$module_file" ] && source "$module_file" 2>/dev/null; then
-                _green "system-optimize.sh 模块下载并加载成功"
-                return 0
-            fi
-        fi
-    fi
-
-    # 尝试使用 wget 下载
-    if command -v wget >/dev/null 2>&1; then
-        if wget -q "${REPO_URL}/system-optimize.sh" -O "$module_file" 2>/dev/null; then
-            chmod +x "$module_file"
-            if [ -s "$module_file" ] && source "$module_file" 2>/dev/null; then
-                _green "system-optimize.sh 模块下载并加载成功"
-                return 0
-            fi
-        fi
-    fi
-
-    # 下载失败，清理并返回错误
-    [ -f "$module_file" ] && rm -f "$module_file"
-    _yellow "无法加载 system-optimize.sh 模块，将使用内置功能"
-    _yellow "提示：如需完整功能，请手动下载模块文件："
-    _yellow "  curl -O ${REPO_URL}/system-optimize.sh"
-    return 1
-}
 
 # ==================== 环境检测 ====================
 [[ $EUID != 0 ]] && err "请使用 root 用户运行此脚本"
@@ -91,7 +43,7 @@ is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
 is_version_cache="/var/tmp/singbox_version_cache"
-is_sysctl_conf="/etc/sysctl.d/99-singbox.conf"
+# 移除 sysctl 配置文件变量
 
 # ==================== 常量定义 ====================
 readonly PORT_MIN=1
@@ -110,11 +62,8 @@ readonly UPDATE_TIMEOUT=120
 # ==================== 网络请求重试 ====================
 curl_retry() {
     local attempt=1
-
     while [ $attempt -le "$CURL_MAX_RETRIES" ]; do
-        if curl "$@"; then
-            return 0
-        fi
+        if curl "$@"; then return 0; fi
         if [ $attempt -lt "$CURL_MAX_RETRIES" ]; then
             _yellow "curl 请求失败，${CURL_RETRY_DELAY}秒后重试 ($attempt/$CURL_MAX_RETRIES)..."
             sleep "$CURL_RETRY_DELAY"
@@ -126,11 +75,8 @@ curl_retry() {
 
 wget_retry() {
     local attempt=1
-
     while [ $attempt -le "$WGET_MAX_RETRIES" ]; do
-        if wget "$@"; then
-            return 0
-        fi
+        if wget "$@"; then return 0; fi
         if [ $attempt -lt "$WGET_MAX_RETRIES" ]; then
             _yellow "wget 请求失败，${WGET_RETRY_DELAY}秒后重试 ($attempt/$WGET_MAX_RETRIES)..."
             sleep "$WGET_RETRY_DELAY"
@@ -150,9 +96,7 @@ is_valid_ip() {
         local IFS='.'
         local -a segments=($ip)
         for seg in "${segments[@]}"; do
-            if [ "$seg" -gt 255 ] 2>/dev/null; then
-                return 1
-            fi
+            if [ "$seg" -gt 255 ] 2>/dev/null; then return 1; fi
         done
         return 0
     elif [[ "$ip" =~ $ipv6_regex ]]; then
@@ -214,6 +158,12 @@ install_singbox() {
     local core_url="https://github.com/$is_core_repo/releases/download/$version/$is_core-${version#v}-linux-$is_arch.tar.gz"
     wget_retry --no-check-certificate -q -O "$tmp_dir/core.tar.gz" "$core_url" || err "下载失败"
     
+    # 检查文件完整性 (简单 gzip 检查)
+    if ! gzip -t "$tmp_dir/core.tar.gz" &>/dev/null; then
+        rm -rf "$tmp_dir"
+        err "下载的文件损坏，请检查网络连接"
+    fi
+    
     # 创建目录
     mkdir -p $is_core_dir/bin $is_conf_dir $is_log_dir
     
@@ -256,10 +206,6 @@ EOF
     singbox_service_control daemon-reload
     singbox_service_control enable false
 
-    # 启用网络优化
-    echo ">>> 启用网络优化..."
-    enable_tcp_fastopen
-
     # 创建默认配置
     echo ">>> 创建配置..."
     cat > $is_config_json <<EOF
@@ -288,18 +234,14 @@ EOF
 # ==================== 防火墙管理 ====================
 firewall_allow_port() {
     local port="$1"
-
     # UFW
     if command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -q inactive; then
-            : # UFW 未启用，跳过
-        else
+        if ! ufw status 2>/dev/null | grep -q inactive; then
             ufw allow "$port"/tcp >/dev/null 2>&1 || true
             ufw allow "$port"/udp >/dev/null 2>&1 || true
             _green "防火墙: ufw 已放行端口 $port"
         fi
     fi
-
     # Firewalld
     if command -v firewall-cmd >/dev/null 2>&1; then
         firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
@@ -311,18 +253,14 @@ firewall_allow_port() {
 
 firewall_remove_port() {
     local port="$1"
-
     # UFW
     if command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -q inactive; then
-            : # UFW 未启用，跳过
-        else
+        if ! ufw status 2>/dev/null | grep -q inactive; then
             ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
             ufw delete allow "$port"/udp >/dev/null 2>&1 || true
             _green "防火墙: ufw 已移除端口 $port"
         fi
     fi
-
     # Firewalld
     if command -v firewall-cmd >/dev/null 2>&1; then
         firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
@@ -339,35 +277,12 @@ firewalld_allow() { firewall_allow_port "$1"; }
 firewalld_remove() { firewall_remove_port "$1"; }
 
 # ==================== 配置读取函数 ====================
-read_inbound_type() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].type' "$conf_path" 2>/dev/null
-}
-
-read_listen_port() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].listen_port' "$conf_path" 2>/dev/null
-}
-
-read_uuid() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].users[0].uuid' "$conf_path" 2>/dev/null
-}
-
-read_password() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].password' "$conf_path" 2>/dev/null
-}
-
-read_method() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].method' "$conf_path" 2>/dev/null
-}
-
-read_server_name() {
-    local conf_path="$1"
-    jq -r '.inbounds[0].tls.server_name // empty' "$conf_path" 2>/dev/null
-}
+read_inbound_type() { jq -r '.inbounds[0].type' "$1" 2>/dev/null; }
+read_listen_port() { jq -r '.inbounds[0].listen_port' "$1" 2>/dev/null; }
+read_uuid() { jq -r '.inbounds[0].users[0].uuid' "$1" 2>/dev/null; }
+read_password() { jq -r '.inbounds[0].password' "$1" 2>/dev/null; }
+read_method() { jq -r '.inbounds[0].method' "$1" 2>/dev/null; }
+read_server_name() { jq -r '.inbounds[0].tls.server_name // empty' "$1" 2>/dev/null; }
 
 # ==================== 配置管理 ====================
 get_conf_list() {
@@ -413,7 +328,14 @@ protocols=("VLESS-Reality" "Shadowsocks")
 
 # 检查端口是否被占用
 is_port_used() {
-    ss -tuln | grep -qE "(:|])$1\b"
+    # 优先使用 ss，如果没有则尝试 lsof，都没有则认为未占用（有风险但兼容性好）
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | grep -qE "(:|])$1\b"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -i :"$1" >/dev/null 2>&1
+    else
+        return 1
+    fi
 }
 
 rand_port() {
@@ -426,152 +348,71 @@ rand_port() {
 }
 
 rand_uuid() { cat /proc/sys/kernel/random/uuid; }
-
 gen_reality_keys() {
     local keys=$($is_core_bin generate reality-keypair 2>/dev/null)
     is_private_key=$(echo "$keys" | grep PrivateKey | awk '{print $2}')
     is_public_key=$(echo "$keys" | grep PublicKey | awk '{print $2}')
 }
-
 gen_short_id() { openssl rand -hex 8; }
 
-# ==================== 自动流量监控 (port-manage.sh 集成) ====================
+# ==================== 自动流量监控 ====================
 auto_add_traffic_monitor() {
     local port="$1"
     local remark="${2:-sing-box}"
-
-    # 检查 port-manage.sh 是否已安装
     local ptm_config="/etc/port-traffic-monitor/config.json"
-    if [[ ! -f "$ptm_config" ]]; then
-        return 0  # 未安装，静默跳过
-    fi
-
-    # 检查 jq 是否可用
-    if ! command -v jq >/dev/null 2>&1; then
-        _yellow "缺少 jq 命令，无法自动添加流量监控"
-        return 1
-    fi
-
-    # 检查端口是否已存在
-    if jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
-        _green "端口 $port 已在流量监控中"
-        return 0
-    fi
+    
+    [[ ! -f "$ptm_config" ]] && return 0
+    ! command -v jq >/dev/null 2>&1 && { _yellow "缺少 jq，跳过监控添加"; return 1; }
+    jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1 && { _green "端口 $port 已在监控中"; return 0; }
 
     _green "自动添加端口 $port 到流量监控..."
-
-    # 读取 nftables 配置
-    local nft_table nft_family
-    nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
-    nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
-
-    # 构建配置 JSON
-    local timestamp; timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    local nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
+    local nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
+    local timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     local config_json
     config_json=$(cat <<EOF
 {
   "billing": "single",
-  "quota": {
-    "limit": "unlimited",
-    "reset_day": null
-  },
-  "bandwidth": {
-    "rate": "unlimited"
-  },
+  "quota": { "limit": "unlimited", "reset_day": null },
+  "bandwidth": { "rate": "unlimited" },
   "remark": "$remark",
   "created": "$timestamp"
 }
 EOF
 )
-
-    # 更新配置文件
     local tmp_config="${ptm_config}.tmp.$$"
     if jq ".ports.\"$port\" = $config_json" "$ptm_config" > "$tmp_config" 2>/dev/null; then
-        mv "$tmp_config" "$ptm_config" || {
-            rm -f "$tmp_config"
-            _yellow "更新流量监控配置失败"
-            return 1
-        }
+        mv "$tmp_config" "$ptm_config" || rm -f "$tmp_config"
     else
         rm -f "$tmp_config"
-        _yellow "生成流量监控配置失败"
         return 1
     fi
 
-    # 添加 nftables 规则
-    local port_safe; port_safe=$(echo "$port" | tr '-' '_')
-
-    # 创建计数器
-    nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" >/dev/null 2>&1 || \
-        nft add counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
-    nft list counter "$nft_family" "$nft_table" "port_${port_safe}_out" >/dev/null 2>&1 || \
-        nft add counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
-
-    # 添加规则
-    local proto
+    local port_safe=$(echo "$port" | tr '-' '_')
+    # 添加 nftables 规则 (简化版)
+    nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" >/dev/null 2>&1 || nft add counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
+    nft list counter "$nft_family" "$nft_table" "port_${port_safe}_out" >/dev/null 2>&1 || nft add counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
     for proto in tcp udp; do
         nft add rule "$nft_family" "$nft_table" input "$proto" dport "$port" counter name "port_${port_safe}_in" 2>/dev/null || true
-        nft add rule "$nft_family" "$nft_table" forward "$proto" dport "$port" counter name "port_${port_safe}_in" 2>/dev/null || true
         nft add rule "$nft_family" "$nft_table" output "$proto" sport "$port" counter name "port_${port_safe}_out" 2>/dev/null || true
-        nft add rule "$nft_family" "$nft_table" forward "$proto" sport "$port" counter name "port_${port_safe}_out" 2>/dev/null || true
     done
-
-    _green "✓ 已自动添加端口 $port 到流量监控（仅统计，无限制）"
-    echo "  使用 'ptm' 命令查看流量统计"
+    _green "✓ 已自动添加端口 $port 到流量监控"
 }
 
 auto_remove_traffic_monitor() {
     local port="$1"
-
-    # 检查 port-manage.sh 是否已安装
     local ptm_config="/etc/port-traffic-monitor/config.json"
-    if [[ ! -f "$ptm_config" ]]; then
-        return 0  # 未安装，跳过
-    fi
-
-    # 检查 jq 是否可用
-    if ! command -v jq >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # 检查端口是否存在
-    if ! jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1; then
-        return 0  # 端口不存在，跳过
-    fi
+    [[ ! -f "$ptm_config" ]] && return 0
+    ! command -v jq >/dev/null 2>&1 && return 0
+    ! jq -e ".ports.\"$port\"" "$ptm_config" >/dev/null 2>&1 && return 0
 
     _green "自动移除端口 $port 的流量监控..."
-
-    # 读取 nftables 配置
-    local nft_table nft_family
-    nft_table=$(jq -r '.nftables.table_name // "port_monitor"' "$ptm_config")
-    nft_family=$(jq -r '.nftables.family // "inet"' "$ptm_config")
-    local port_safe; port_safe=$(echo "$port" | tr '-' '_')
-
-    # 删除 nftables 规则（批量处理优化）
-    local chain
-    for chain in input output forward; do
-        local handles
-        handles=$(nft -a list chain "$nft_family" "$nft_table" "$chain" 2>/dev/null | \
-                  grep -E "port_${port_safe}_" | sed -n 's/.*# handle \([0-9]\+\)$/\1/p')
-        if [ -n "$handles" ]; then
-            while IFS= read -r handle; do
-                [ -n "$handle" ] && nft delete rule "$nft_family" "$nft_table" "$chain" handle "$handle" 2>/dev/null || true
-            done <<< "$handles"
-        fi
-    done
-
-    # 删除计数器
-    nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
-    nft delete counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
-
-    # 更新配置文件
     local tmp_config="${ptm_config}.tmp.$$"
     if jq "del(.ports.\"$port\")" "$ptm_config" > "$tmp_config" 2>/dev/null; then
         mv "$tmp_config" "$ptm_config" || rm -f "$tmp_config"
     else
         rm -f "$tmp_config"
     fi
-
     _green "✓ 已移除端口 $port 的流量监控"
 }
 
@@ -597,7 +438,7 @@ input_sni() {
 }
 
 input_remark() {
-    local default_remark=$(hostname)  # 主机名
+    local default_remark=$(hostname)
     read -rp "备注 [$default_remark]: " is_remark
     is_remark=${is_remark:-$default_remark}
 }
@@ -608,7 +449,7 @@ add() {
         case ${1,,} in
             r|reality|vless|vless-reality) is_protocol="VLESS-Reality" ;;
             ss|shadowsocks) is_protocol="Shadowsocks" ;;
-            *) _yellow "未找到匹配的协议: $1"; _yellow "可用: r (Reality), ss (Shadowsocks)"; return 1 ;;
+            *) _yellow "未找到匹配的协议: $1"; return 1 ;;
         esac
     else
         echo
@@ -639,15 +480,11 @@ add() {
     esac
     
     if save_conf; then
-        # 防火墙放行
         ufw_allow "$is_port"
         firewalld_allow "$is_port"
-
         singbox_service_control restart false
         is_conf_file=$is_conf_name.json
         info_show
-
-        # 自动添加流量监控
         echo
         auto_add_traffic_monitor "$is_port" "sing-box ($is_protocol)"
     fi
@@ -752,8 +589,8 @@ save_conf() {
 
 # 列出配置
 list() {
-    local files=($(ls $is_conf_dir 2>/dev/null | grep '\.json$'))
-    if [[ ${#files[@]} -eq 0 ]]; then
+    get_conf_list
+    if [[ ${#conf_list[@]} -eq 0 ]]; then
         echo
         _yellow "暂无配置"
         echo
@@ -764,8 +601,8 @@ list() {
     printf "%-3s %-30s %-12s %-6s\n" "#" "名称" "协议" "端口"
     echo "------------------------------------------------------"
     
-    for i in "${!files[@]}"; do
-        local f=${files[$i]}
+    for i in "${!conf_list[@]}"; do
+        local f=${conf_list[$i]}
         local conf_path="$is_conf_dir/$f"
         local proto=$(read_inbound_type "$conf_path")
         local port=$(read_listen_port "$conf_path")
@@ -796,7 +633,6 @@ change() {
     echo "  1. 端口"
     echo "  2. 主要凭证 (UUID/密码)"
 
-    # 检查是否支持 SNI（VLESS-Reality）
     local has_sni=false
     if [[ $proto == "vless" ]]; then
         local server_name=$(read_server_name "$conf_path")
@@ -843,7 +679,6 @@ change_port() {
         mv "${conf_path}.tmp" "$conf_path"
         _green "端口已修改: $old_port -> $new_port"
 
-        # 防火墙调整
         if [ -n "$old_port" ]; then
             ufw_remove "$old_port"
             firewalld_remove "$old_port"
@@ -851,9 +686,7 @@ change_port() {
         ufw_allow "$new_port"
         firewalld_allow "$new_port"
 
-        # 重启验证
         if restart_check; then
-            # 更新流量监控
             if [ -n "$old_port" ]; then
                 auto_remove_traffic_monitor "$old_port"
             fi
@@ -903,41 +736,21 @@ change_cred() {
 change_sni() {
     local conf_path=$1
     local proto=$2
-
-    # 只有 VLESS-Reality 支持 SNI
-    if [[ $proto != "vless" ]]; then
-        _yellow "此协议不支持 SNI 配置"
-        return 1
-    fi
-
-    # 检查是否有 TLS 配置
-    local has_tls=$(read_server_name "$conf_path")
-    if [[ -z $has_tls ]]; then
-        _yellow "此配置未启用 Reality，不支持 SNI"
-        return 1
-    fi
+    [[ $proto != "vless" ]] && return 1
 
     local old_sni=$(read_server_name "$conf_path")
     echo "当前 SNI: $old_sni"
-    echo
-    echo "常用 SNI 示例:"
-    echo "  - www.microsoft.com"
-    echo "  - www.cloudflare.com"
-    echo "  - www.apple.com"
-    echo "  - www.google.com"
-    echo
     read -rp "新 SNI: " new_sni
-
     [[ -z $new_sni ]] && { echo "已取消"; return; }
 
     jq ".inbounds[0].tls.server_name = \"$new_sni\"" "$conf_path" > "${conf_path}.tmp"
     if $is_core_bin check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
         mv "${conf_path}.tmp" "$conf_path"
-        _green "SNI 已修改: $old_sni -> $new_sni"
+        _green "SNI 已修改"
         restart_check
     else
         rm -f "${conf_path}.tmp"
-        _red "配置验证失败，请检查 SNI 格式"
+        _red "配置验证失败"
     fi
 }
 
@@ -957,21 +770,15 @@ del() {
     read -rp "确认删除 $is_conf_file? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
 
-    # 获取端口用于防火墙清理
     local port=$(read_listen_port "$is_conf_dir/$is_conf_file")
-
     rm -f "$is_conf_dir/$is_conf_file"
     _green "已删除: $is_conf_file"
 
-    # 清理防火墙规则
     if [ -n "$port" ]; then
         ufw_remove "$port"
         firewalld_remove "$port"
-
-        # 移除流量监控
         auto_remove_traffic_monitor "$port"
     fi
-
     singbox_service_control restart false
 }
 
@@ -1130,16 +937,8 @@ restart_check() {
 
 manage() {
     case $1 in
-        start)
-            singbox_service_control start
-            refresh_status
-            ;;
-        stop)
-            singbox_service_control stop
-            refresh_status
-            ;;
-        restart)
-            singbox_service_control restart
+        start|stop|restart)
+            singbox_service_control $1
             refresh_status
             ;;
         status)
@@ -1221,171 +1020,13 @@ EOF
     _green "DNS 已设置: $dns1, $dns2"
 }
 
-# ==================== BBR 管理（使用统一模块）====================
-check_bbr() {
-    # 尝试使用统一模块
-    if load_system_optimize_module; then
-        check_bbr_status
-        return $?
-    fi
-
-    # 模块加载失败，使用内置实现
-    local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    local available=$(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | awk '{print $3}')
-
-    echo
-    echo "BBR 状态:"
-    echo "  当前算法: ${current:-未知}"
-    echo "  可用算法: ${available:-未知}"
-
-    if [[ $current == "bbr" ]]; then
-        echo
-        _green "BBR 已启用"
-    else
-        echo
-        _yellow "BBR 未启用"
-    fi
-    echo
-}
-
-enable_bbr() {
-    # 尝试使用统一模块
-    if load_system_optimize_module; then
-        enable_bbr /etc/sysctl.conf
-        return $?
-    fi
-
-    # 模块加载失败，使用内置实现
-    # 检查内核版本 (需要 4.9+)
-    local kernel_major=$(uname -r | cut -d. -f1)
-    local kernel_minor=$(uname -r | cut -d. -f2)
-    if [[ $kernel_major -lt 4 ]] || [[ $kernel_major -eq 4 && $kernel_minor -lt 9 ]]; then
-        _red "BBR 需要 Linux 4.9+ 内核，当前: $(uname -r)"
-        return 1
-    fi
-
-    local current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    if [[ $current == "bbr" ]]; then
-        _green "BBR 已经启用"
-        return 0
-    fi
-
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-
-    cat >> /etc/sysctl.conf <<EOF
-
-# BBR
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    sysctl -p &>/dev/null
-
-    current=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    if [[ $current == "bbr" ]]; then
-        _green "BBR 启用成功"
-    else
-        _red "BBR 启用失败"
-    fi
-}
-
-# ==================== TCP Fast Open（使用统一模块）====================
-enable_tcp_fastopen() {
-    # 尝试使用统一模块
-    if load_system_optimize_module; then
-        enable_network_optimization "$is_sysctl_conf" true true
-        return $?
-    fi
-
-    # 模块加载失败，使用内置实现
-    local kernel_major=$(uname -r | cut -d. -f1)
-    local kernel_minor=$(uname -r | cut -d. -f2)
-
-    if [[ $kernel_major -lt 3 ]]; then
-        _yellow "内核版本过低 (${kernel_major}.x)，无法支持 TCP Fast Open"
-        return 1
-    fi
-
-    # 检查 BBR 支持
-    local bbr_supported="false"
-    if [[ $kernel_major -gt 4 ]] || { [[ $kernel_major -eq 4 ]] && [[ $kernel_minor -ge 9 ]]; }; then
-        if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-            bbr_supported="true"
-        fi
-    fi
-
-    echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || true
-
-    # 创建网络优化配置文件
-    cat > "$is_sysctl_conf" << 'SYSCTL_EOF'
-# sing-box 网络优化配置
-
-fs.file-max = 51200
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 65536
-net.core.wmem_default = 65536
-net.core.netdev_max_backlog = 4096
-net.core.somaxconn = 4096
-
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 1200
-net.ipv4.ip_local_port_range = 10000 65000
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_max_tw_buckets = 5000
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.tcp_mtu_probing = 1
-SYSCTL_EOF
-
-    # 如果支持 BBR，添加 BBR 配置
-    if [[ $bbr_supported == "true" ]]; then
-        cat >> "$is_sysctl_conf" << 'BBR_EOF'
-
-# BBR 拥塞控制
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-BBR_EOF
-        _green "TCP Fast Open 和 BBR 已启用"
-    else
-        _green "TCP Fast Open 已启用 (BBR 需要内核 >= 4.9)"
-    fi
-
-    # 应用配置
-    sysctl --system >/dev/null 2>&1 || true
-}
-
-disable_tcp_optimization() {
-    # 尝试使用统一模块
-    if load_system_optimize_module; then
-        remove_network_optimization "$is_sysctl_conf"
-        return $?
-    fi
-
-    # 模块加载失败，使用内置实现
-    if [ -f "$is_sysctl_conf" ]; then
-        rm -f "$is_sysctl_conf"
-        sysctl --system >/dev/null 2>&1 || true
-        _green "已移除网络优化配置"
-    else
-        _yellow "网络优化未启用"
-    fi
-}
-
 # ==================== 更新管理 ====================
 get_latest_version() {
     local repo=$1
     local current_time=$(date +%s)
-
-    # 检查缓存
     if [ -f "$is_version_cache" ]; then
         local cache_timestamp=$(head -1 "$is_version_cache" 2>/dev/null || echo "0")
         local cached_version=$(sed -n '2p' "$is_version_cache" 2>/dev/null || echo "")
-
         if [ -n "$cache_timestamp" ] && [ -n "$cached_version" ]; then
             if [ $((current_time - cache_timestamp)) -lt $VERSION_CACHE_TIME ]; then
                 echo "$cached_version"
@@ -1393,37 +1034,27 @@ get_latest_version() {
             fi
         fi
     fi
-
-    # 获取最新版本（使用重试机制）
     local version
     version=$(curl_retry -sfm10 "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-
     if [ -n "$version" ]; then
-        # 更新缓存
         echo "$current_time" > "$is_version_cache"
         echo "$version" >> "$is_version_cache"
     fi
-
     echo "$version"
 }
 
 update_core() {
     echo
     echo "检查 sing-box 更新..."
-    
     local latest=$(get_latest_version $is_core_repo)
     [[ -z $latest ]] && { _red "无法获取最新版本"; return 1; }
-    
     local current=${is_core_ver:-未安装}
-    
     echo "当前版本: $current"
     echo "最新版本: $latest"
-    
     if [[ $current == $latest ]]; then
         _green "已是最新版本"
         return 0
     fi
-    
     echo
     read -rp "是否更新? [Y/n]: " confirm
     [[ $confirm =~ ^[Nn]$ ]] && { echo "已取消"; return 0; }
@@ -1438,6 +1069,11 @@ update_core() {
         rm -rf "$tmp_file" "$tmp_dir"
         return 1
     fi
+    if ! gzip -t "$tmp_file" &>/dev/null; then
+         rm -rf "$tmp_file" "$tmp_dir"
+         _red "下载文件损坏"
+         return 1
+    fi
 
     singbox_service_control stop false
     tar -xzf "$tmp_file" -C "$tmp_dir"
@@ -1445,26 +1081,21 @@ update_core() {
     chmod +x "$is_core_bin"
     rm -rf "$tmp_file" "$tmp_dir"
     singbox_service_control start false
-
     _green "更新完成: $current -> $latest"
 }
 
 update_sh() {
     echo
     echo "更新脚本..."
-
     local tmp_file; tmp_file=$(mktemp) || { _red "创建临时文件失败"; return 1; }
-
     if ! curl_retry -sfLm30 -o "$tmp_file" "$is_sh_url"; then
         _red "下载失败"
         rm -f "$tmp_file"
         return 1
     fi
-
     cp "$tmp_file" "$is_sh_bin"
     chmod +x "$is_sh_bin"
     rm -f "$tmp_file"
-
     _green "脚本更新完成"
 }
 
@@ -1479,34 +1110,11 @@ uninstall() {
     echo "  - /etc/systemd/system/${is_core}.service"
     echo "  - /usr/local/bin/sb, /usr/local/bin/$is_core"
     echo
-    
     read -rp "确认卸载? [y/N]: " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
     
-    # 清理网络优化配置
-    if [ -f "$is_sysctl_conf" ]; then
-        echo
-        read -rp "是否清理网络优化设置 (TCP Fast Open + BBR)? [y/N]: " opt_confirm
-        if [[ $opt_confirm =~ ^[Yy]$ ]]; then
-            rm -f "$is_sysctl_conf"
-            sysctl --system &>/dev/null
-            _green "网络优化设置已清理"
-        fi
-    elif grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-        echo
-        read -rp "是否清理 BBR 设置? [y/N]: " bbr_confirm
-        if [[ $bbr_confirm =~ ^[Yy]$ ]]; then
-            sed -i '/# BBR/d' /etc/sysctl.conf
-            sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-            sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-            sysctl -p &>/dev/null
-            _green "BBR 设置已清理"
-        fi
-    fi
-    
     echo
     echo "正在卸载..."
-
     singbox_service_control stop false
     singbox_service_control disable false
     rm -rf "$is_core_dir"
@@ -1516,7 +1124,6 @@ uninstall() {
     rm -f /usr/local/bin/sb
     rm -f /usr/local/bin/$is_core
     rm -f /etc/resolv.conf.bak
-    
     echo
     _green "sing-box 已完全卸载"
 }
@@ -1547,10 +1154,6 @@ show_help() {
     echo "系统优化:"
     echo "  dns         查看 DNS"
     echo "  set-dns     设置 DNS"
-    echo "  bbr         查看 BBR 状态"
-    echo "  set-bbr     启用 BBR"
-    echo "  tfo         启用 TCP Fast Open + BBR"
-    echo "  tfo-off     禁用网络优化"
     echo
     echo "更新管理:"
     echo "  update      更新核心"
@@ -1572,6 +1175,16 @@ pause_return() {
 show_menu() {
     while true; do
         refresh_status
+        get_conf_list
+        local count=${#conf_list[@]}
+        local names=""
+        if [[ $count -gt 0 ]]; then
+            # names=$(IFS=,; echo "${conf_list[*]}") # 简单的数组转字符串
+            names="${conf_list[*]}"
+        else
+            names="暂无"
+        fi
+        
         clear
         echo
         echo "============================================"
@@ -1579,6 +1192,7 @@ show_menu() {
         echo "============================================"
         echo
         echo "  状态: $is_core_status    版本: ${is_core_ver:-未安装}"
+        echo "  配置: $count 个      列表: $names"
         echo "  地址: $is_addr"
         echo
         echo "--------------------------------------------"
@@ -1589,7 +1203,7 @@ show_menu() {
         echo
         echo "  6. 启动服务       7. 停止服务       8. 重启服务"
         echo
-        echo "  9. 查看日志      10. BBR 优化"
+        echo "  9. 查看日志      10. 设置 DNS"
         echo " 11. 更新核心      12. 更新脚本"
         echo " 13. 卸载"
         echo
@@ -1609,7 +1223,7 @@ show_menu() {
             7) manage stop; pause_return ;;
             8) manage restart; pause_return ;;
             9) show_log; pause_return ;;
-            10) enable_bbr; pause_return ;;
+            10) set_dns; pause_return ;;
             11) update_core; pause_return ;;
             12) update_sh; pause_return ;;
             13) uninstall; break ;;
@@ -1636,13 +1250,9 @@ main() {
         log) show_log ${2:-50} ;;
         log-f|logf) follow_log ;;
         log-clear) clear_log ;;
-        # DNS/BBR/TFO
+        # DNS
         dns) show_dns ;;
         set-dns) set_dns ;;
-        bbr) check_bbr ;;
-        set-bbr) enable_bbr ;;
-        tfo) enable_tcp_fastopen ;;
-        tfo-off) disable_tcp_optimization ;;
         # 更新管理
         update)
             case $2 in
