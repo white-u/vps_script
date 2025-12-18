@@ -1,15 +1,17 @@
 #!/bin/bash
 
-# sing-box 单文件管理脚本 (精简版 v2.2)
+# sing-box 单文件管理脚本 (UI美化版 v2.3)
 # https://github.com/white-u/vps_script
 # Usage: bash <(curl -sL url) [args]
 
-is_sh_ver=v2.2
+is_sh_ver=v2.3
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
 _green() { echo -e "\e[32m$@\e[0m"; }
 _yellow() { echo -e "\e[33m$@\e[0m"; }
+_blue_bg() { echo -e "\033[44;37m$@\033[0m"; }
+_gray() { echo -e "\033[90m$@\033[0m"; }
 
 err() {
     echo -e "\n\e[41m 错误 \e[0m $@\n"
@@ -130,7 +132,7 @@ get_ip() {
         return 0
     fi
 
-    _yellow "无法获取有效的公网 IP 地址"
+    # 静默处理，不再报错，用于生成链接
     is_addr="<未知IP>"
 }
 
@@ -156,7 +158,7 @@ install_singbox() {
     local core_url="https://github.com/$is_core_repo/releases/download/$version/$is_core-${version#v}-linux-$is_arch.tar.gz"
     wget_retry --no-check-certificate -q -O "$tmp_dir/core.tar.gz" "$core_url" || err "下载失败"
     
-    # 检查文件完整性 (简单 gzip 检查)
+    # 检查文件完整性
     if ! gzip -t "$tmp_dir/core.tar.gz" &>/dev/null; then
         rm -rf "$tmp_dir"
         err "下载的文件损坏，请检查网络连接"
@@ -1130,30 +1132,43 @@ show_menu() {
         
         clear
         echo
-        echo "============================================"
-        echo "          sing-box 管理脚本 $is_sh_ver"
-        echo "============================================"
+        echo -e " $(_blue_bg "          Sing-box 管理面板 $is_sh_ver           ")"
         echo
-        echo "  状态: $is_core_status    版本: ${is_core_ver:-未安装}"
-        echo "  配置: $count 个"
+        
+        # 状态区
+        echo -e " 🟢 运行状态"
+        echo " ------------------------------------------------"
+        echo -e "  服务状态: $is_core_status      核心版本: ${is_core_ver:-$(_red "未安装")}"
+        echo -e "  配置数量: $(_green "$count 个")"
         echo
-        echo "--------------------------------------------"
+
+        # 配置管理区
+        echo -e " ⚙️  配置管理"
+        echo " ------------------------------------------------"
+        echo -e "  1. 添加配置 $(_green "+")        2. 修改配置 📝"
+        echo -e "     $(_gray "(Reality/Shadowsocks)")"
+        echo -e "  3. 删除配置 🗑️         4. 查看详情 👁️"
+        echo -e "  5. 配置列表 📋"
         echo
-        echo "  1. 添加配置       2. 修改配置"
-        echo "  3. 删除配置       4. 查看配置"
-        echo "  5. 配置列表"
+
+        # 服务控制区
+        echo -e " 🚀 服务控制"
+        echo " ------------------------------------------------"
+        echo -e "  6. 启动服务 ▶️         7. 停止服务 ⏹️"
+        echo -e "  8. 重启服务 🔄"
         echo
-        echo "  6. 启动服务       7. 停止服务       8. 重启服务"
+
+        # 维护更新区
+        echo -e " 📦 维护与更新"
+        echo " ------------------------------------------------"
+        echo -e "  9. 实时日志 📜"
+        echo -e " 10. 更新核心 🆙        11. 更新脚本 🔄"
+        echo -e " 12. 卸载脚本 ❌"
         echo
-        echo "  9. 查看日志"
-        echo " 10. 更新核心      11. 更新脚本"
-        echo " 12. 卸载"
-        echo
+        echo " ------------------------------------------------"
         echo "  0. 退出"
         echo
-        echo "============================================"
-        echo
-        read -rp "请选择: " menu_pick
+        read -rp " 请输入序号: " menu_pick
         
         case $menu_pick in
             1) add; pause_return ;;
