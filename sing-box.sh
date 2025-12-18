@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# sing-box 单文件管理脚本 (精简优化版)
+# sing-box 单文件管理脚本 (精简版 v2.2)
 # https://github.com/white-u/vps_script
 # Usage: bash <(curl -sL url) [args]
 
-is_sh_ver=v2.1
+is_sh_ver=v2.2
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -43,7 +43,6 @@ is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_url="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
 is_version_cache="/var/tmp/singbox_version_cache"
-# 移除 sysctl 配置文件变量
 
 # ==================== 常量定义 ====================
 readonly PORT_MIN=1
@@ -55,7 +54,6 @@ readonly CURL_RETRY_DELAY=2
 readonly WGET_MAX_RETRIES=3
 readonly WGET_RETRY_DELAY=2
 readonly VERSION_CACHE_TIME=3600
-readonly NFTABLES_DELETE_LIMIT=50
 readonly NETWORK_TIMEOUT=5
 readonly UPDATE_TIMEOUT=120
 
@@ -328,7 +326,6 @@ protocols=("VLESS-Reality" "Shadowsocks")
 
 # 检查端口是否被占用
 is_port_used() {
-    # 优先使用 ss，如果没有则尝试 lsof，都没有则认为未占用（有风险但兼容性好）
     if command -v ss >/dev/null 2>&1; then
         ss -tuln | grep -qE "(:|])$1\b"
     elif command -v lsof >/dev/null 2>&1; then
@@ -389,7 +386,6 @@ EOF
     fi
 
     local port_safe=$(echo "$port" | tr '-' '_')
-    # 添加 nftables 规则 (简化版)
     nft list counter "$nft_family" "$nft_table" "port_${port_safe}_in" >/dev/null 2>&1 || nft add counter "$nft_family" "$nft_table" "port_${port_safe}_in" 2>/dev/null || true
     nft list counter "$nft_family" "$nft_table" "port_${port_safe}_out" >/dev/null 2>&1 || nft add counter "$nft_family" "$nft_table" "port_${port_safe}_out" 2>/dev/null || true
     for proto in tcp udp; do
@@ -978,48 +974,6 @@ clear_log() {
     _green "日志已清空"
 }
 
-# ==================== DNS 管理 ====================
-show_dns() {
-    echo
-    echo "当前 DNS 配置:"
-    echo
-    cat /etc/resolv.conf | grep nameserver
-    echo
-}
-
-set_dns() {
-    echo
-    echo "设置 DNS 服务器"
-    echo
-    echo "  1. Cloudflare (1.1.1.1)"
-    echo "  2. Google (8.8.8.8)"
-    echo "  3. 阿里云 (223.5.5.5)"
-    echo "  4. 自定义"
-    echo "  0. 取消"
-    echo
-    read -rp "请选择: " dns_pick
-    
-    case $dns_pick in
-        1) dns1="1.1.1.1"; dns2="1.0.0.1" ;;
-        2) dns1="8.8.8.8"; dns2="8.8.4.4" ;;
-        3) dns1="223.5.5.5"; dns2="223.6.6.6" ;;
-        4)
-            read -rp "主 DNS: " dns1
-            read -rp "备 DNS: " dns2
-            [[ -z $dns1 ]] && { _yellow "DNS 不能为空"; return; }
-            ;;
-        0) echo "已取消"; return ;;
-        *) _yellow "无效选择"; return ;;
-    esac
-    
-    [[ -f /etc/resolv.conf ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
-    cat > /etc/resolv.conf <<EOF
-nameserver $dns1
-nameserver $dns2
-EOF
-    _green "DNS 已设置: $dns1, $dns2"
-}
-
 # ==================== 更新管理 ====================
 get_latest_version() {
     local repo=$1
@@ -1151,10 +1105,6 @@ show_help() {
     echo "  log-f       实时查看日志"
     echo "  log-clear   清空日志"
     echo
-    echo "系统优化:"
-    echo "  dns         查看 DNS"
-    echo "  set-dns     设置 DNS"
-    echo
     echo "更新管理:"
     echo "  update      更新核心"
     echo "  update sh   更新脚本"
@@ -1177,13 +1127,6 @@ show_menu() {
         refresh_status
         get_conf_list
         local count=${#conf_list[@]}
-        local names=""
-        if [[ $count -gt 0 ]]; then
-            # names=$(IFS=,; echo "${conf_list[*]}") # 简单的数组转字符串
-            names="${conf_list[*]}"
-        else
-            names="暂无"
-        fi
         
         clear
         echo
@@ -1192,8 +1135,7 @@ show_menu() {
         echo "============================================"
         echo
         echo "  状态: $is_core_status    版本: ${is_core_ver:-未安装}"
-        echo "  配置: $count 个      列表: $names"
-        echo "  地址: $is_addr"
+        echo "  配置: $count 个"
         echo
         echo "--------------------------------------------"
         echo
@@ -1203,9 +1145,9 @@ show_menu() {
         echo
         echo "  6. 启动服务       7. 停止服务       8. 重启服务"
         echo
-        echo "  9. 查看日志      10. 设置 DNS"
-        echo " 11. 更新核心      12. 更新脚本"
-        echo " 13. 卸载"
+        echo "  9. 查看日志"
+        echo " 10. 更新核心      11. 更新脚本"
+        echo " 12. 卸载"
         echo
         echo "  0. 退出"
         echo
@@ -1223,10 +1165,9 @@ show_menu() {
             7) manage stop; pause_return ;;
             8) manage restart; pause_return ;;
             9) show_log; pause_return ;;
-            10) set_dns; pause_return ;;
-            11) update_core; pause_return ;;
-            12) update_sh; pause_return ;;
-            13) uninstall; break ;;
+            10) update_core; pause_return ;;
+            11) update_sh; pause_return ;;
+            12) uninstall; break ;;
             0) echo; echo "再见!"; echo; exit 0 ;;
             "") ;;
             *) _yellow "无效选择"; sleep 1 ;;
@@ -1250,9 +1191,6 @@ main() {
         log) show_log ${2:-50} ;;
         log-f|logf) follow_log ;;
         log-clear) clear_log ;;
-        # DNS
-        dns) show_dns ;;
-        set-dns) set_dns ;;
         # 更新管理
         update)
             case $2 in
