@@ -1,33 +1,29 @@
 #!/bin/bash
 #
-# Snell 管理脚本 (增强版 v2.4)
-# - 引入网络重试机制 (借鉴 sing-box.sh)
-# - 优化系统资源限制
+# Snell 管理脚本 (终极增强版 v2.5)
+# - 移植 sing-box 脚本的底层健壮性逻辑
+# - 优化更新流程 (下载完成后再停止服务，减少断连时间)
+# - 引入网络请求重试机制
 # - 配置文件修改自动备份
 #
-# 用法：sudo bash snell.sh
+# Usage: sudo bash snell.sh
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# =====================================
-# 版本配置
-# =====================================
-SCRIPT_VERSION="2.4.0"
-FALLBACK_VERSION="4.1.0"
-VERSION=""
+# ==================== 版本配置 ====================
+SCRIPT_VERSION="v2.5.0"
+FALLBACK_VERSION="4.1.0" # Snell v4 依然是目前最稳定的选择
 
-# 脚本更新源
-SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/snell.sh"
-
-# =====================================
-# 颜色和路径
-# =====================================
+# ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
 _green() { echo -e "\e[32m$@\e[0m"; }
 _yellow() { echo -e "\e[33m$@\e[0m"; }
 _blue_bg() { echo -e "\033[44;37m$@\033[0m"; }
 
+err() { echo -e "\n\e[41m 错误 \e[0m $@\n" >&2; exit 1; }
+
+# ==================== 路径与变量 ====================
 SNELL_BIN="/usr/local/bin/snell-server"
 SNELL_DIR="/etc/snell"
 SNELL_CONF="${SNELL_DIR}/snell-server.conf"
@@ -36,45 +32,50 @@ SNELL_VERSION_FILE="${SNELL_DIR}/ver.txt"
 SYSTEMD_SERVICE="/etc/systemd/system/snell.service"
 DL_BASE="https://dl.nssurge.com/snell"
 SNELL_LOG="/var/log/snell.log"
+SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/snell.sh"
+LOCAL_SCRIPT="/usr/local/bin/snell-manager.sh"
 
-# 临时文件
-TMP_DOWNLOAD="/tmp/snell-install.zip"
+# 临时文件 (固定路径)
+TMP_DOWNLOAD="/tmp/snell-server.zip"
 VERSION_CACHE_FILE="/var/tmp/snell_version_cache"
 
-# =====================================
-# 常量定义
-# =====================================
+# ==================== 常量定义 ====================
 readonly PORT_MIN=1
 readonly PORT_MAX=65535
 readonly RANDOM_PORT_MIN=30000
 readonly RANDOM_PORT_MAX=65000
-readonly PSK_RANDOM_LENGTH=20
-readonly VERSION_CACHE_TIME=3600
-
-# 网络重试配置 (借鉴 sing-box.sh)
 readonly CURL_MAX_RETRIES=3
 readonly CURL_RETRY_DELAY=2
 readonly WGET_MAX_RETRIES=3
 readonly WGET_RETRY_DELAY=2
+readonly VERSION_CACHE_TIME=3600
+readonly PSK_RANDOM_LENGTH=20
 
-# =====================================
-# 辅助函数
-# =====================================
-cleanup_temp_files() {
+# ==================== 资源清理 ====================
+cleanup() {
     rm -f "$TMP_DOWNLOAD"
 }
-trap cleanup_temp_files EXIT INT TERM
+trap cleanup EXIT INT TERM
 
+# ==================== 环境与依赖 ====================
 check_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo -e "\n\e[41m 错误 \e[0m 请以 root 身份运行此脚本\n" >&2
-    exit 1
-  fi
+    if [[ $EUID != 0 ]]; then err "请使用 root 用户运行此脚本"; fi
+}
+
+map_arch() {
+    case $(uname -m) in
+        amd64 | x86_64) echo "amd64" ;;
+        i386 | i686)    echo "i386" ;;
+        aarch64 | armv8*) echo "aarch64" ;;
+        armv7*)         echo "armv7l" ;;
+        *) echo "unsupported" ;;
+    esac
 }
 
 ensure_dependencies() {
     local missing_deps=0
-    for cmd in curl unzip; do
+    # Snell 需要 unzip 解压
+    for cmd in curl wget unzip; do
         if ! command -v $cmd >/dev/null 2>&1; then
             missing_deps=1
             break
@@ -82,39 +83,26 @@ ensure_dependencies() {
     done
 
     if [ $missing_deps -eq 1 ]; then
-        echo "正在安装依赖 (curl, unzip)..."
+        echo "正在安装依赖 (curl, wget, unzip)..."
         if [ -f /etc/debian_version ]; then
-            apt-get update -y >/dev/null && apt-get install -y curl unzip >/dev/null
+            apt-get update -y >/dev/null && apt-get install -y curl wget unzip >/dev/null
         elif [ -f /etc/redhat-release ]; then
-            yum -y install curl unzip >/dev/null
+            yum -y install curl wget unzip >/dev/null
         elif [ -f /etc/alpine-release ]; then
-            apk add --no-cache curl unzip >/dev/null
+            apk add --no-cache curl wget unzip >/dev/null
         else
-            _yellow "无法自动安装依赖，请手动安装: curl unzip"
+            _yellow "无法自动安装依赖，请手动安装: curl wget unzip"
         fi
     fi
 }
 
-map_arch() {
-  local m; m=$(uname -m)
-  case "$m" in
-    x86_64|amd64) echo "amd64" ;;
-    i386|i686)    echo "i386" ;;
-    aarch64)      echo "aarch64" ;;
-    armv7l)       echo "armv7l" ;;
-    *) echo "unsupported" ;;
-  esac
-}
-
-# =====================================
-# 网络请求 (增强稳定性)
-# =====================================
+# ==================== 网络请求 (增强版) ====================
 curl_retry() {
     local attempt=1
     while [ $attempt -le "$CURL_MAX_RETRIES" ]; do
         if curl -L -f --progress-bar "$@"; then return 0; fi
         if [ $attempt -lt "$CURL_MAX_RETRIES" ]; then
-            _yellow "curl 请求失败，${CURL_RETRY_DELAY}秒后重试 ($attempt/$CURL_MAX_RETRIES)..."
+            _yellow "curl 请求失败，${CURL_RETRY_DELAY}秒后重试..."
             sleep "$CURL_RETRY_DELAY"
         fi
         attempt=$((attempt + 1))
@@ -127,7 +115,7 @@ wget_retry() {
     while [ $attempt -le "$WGET_MAX_RETRIES" ]; do
         if wget --no-check-certificate "$@"; then return 0; fi
         if [ $attempt -lt "$WGET_MAX_RETRIES" ]; then
-            _yellow "wget 请求失败，${WGET_RETRY_DELAY}秒后重试 ($attempt/$WGET_MAX_RETRIES)..."
+            _yellow "wget 请求失败，${WGET_RETRY_DELAY}秒后重试..."
             sleep "$WGET_RETRY_DELAY"
         fi
         attempt=$((attempt + 1))
@@ -138,26 +126,32 @@ wget_retry() {
 download_file() {
     local url="$1"
     local dest="$2"
-    
     echo "正在下载: $url"
     if command -v curl >/dev/null 2>&1; then
         if curl_retry -o "$dest" "$url"; then return 0; fi
     fi
-    
     if command -v wget >/dev/null 2>&1; then
         if wget_retry -O "$dest" "$url"; then return 0; fi
     fi
-    
     return 1
 }
 
-# =====================================
-# 版本检测
-# =====================================
+# ==================== IP 获取 ====================
+get_ip() {
+    local ip
+    ip=$(curl -s4m3 ip.sb 2>/dev/null || curl -s4m3 api.ipify.org 2>/dev/null || echo "")
+    if [[ -z "$ip" ]]; then
+        echo "<服务器IP>"
+    else
+        echo "$ip"
+    fi
+}
+
+# ==================== 版本检测 ====================
 get_latest_version_from_web() {
   local kb_page="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
   local content
-  # 增加重试机制
+  # 使用 curl_retry 增强稳定性
   content=$(curl -sL --retry 2 --max-time 10 "$kb_page" 2>/dev/null || true)
   
   if [ -n "$content" ]; then
@@ -203,207 +197,152 @@ get_installed_version() {
   fi
 }
 
-# =====================================
-# 端口与防火墙
-# =====================================
-is_valid_port() {
-  local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
-  [ "$p" -ge "$PORT_MIN" ] && [ "$p" -le "$PORT_MAX" ]
-}
-
-is_port_free() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ! ss -lnt "( sport = :$port )" | awk 'NR>1{print}' | grep -q .
-  elif command -v lsof >/dev/null 2>&1; then
-    ! lsof -iTCP -sTCP:LISTEN -P | grep -w ":$port" >/dev/null 2>&1
-  else
-    return 0 
-  fi
-}
-
-firewall_allow_port() {
-  local port="$1"
-  if command -v ufw >/dev/null 2>&1; then
-    if ! ufw status | grep -q inactive; then
-      ufw allow "$port"/tcp >/dev/null 2>&1 || true
-      ufw allow "$port"/udp >/dev/null 2>&1 || true
+# ==================== 辅助函数 ====================
+is_port_used() {
+    local port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | grep -qE "(:|])$port\b"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -i :"$port" >/dev/null 2>&1
+    else
+        return 1
     fi
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
 }
 
-firewall_remove_port() {
-  local port="$1"
-  if command -v ufw >/dev/null 2>&1; then
-    if ! ufw status | grep -q inactive; then
-      ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
-      ufw delete allow "$port"/udp >/dev/null 2>&1 || true
-    fi
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-}
-
-# =====================================
-# 配置管理
-# =====================================
-read_snell_port() {
-  [ -f "$SNELL_CONF" ] && grep -E '^listen' "$SNELL_CONF" 2>/dev/null | head -n1 | sed -E 's/.*:([0-9]+)$/\1/' || echo ""
-}
-
-read_snell_psk() {
-  [ -f "$SNELL_CONF" ] && grep -E '^psk' "$SNELL_CONF" 2>/dev/null | head -n1 | awk -F'=' '{print $2}' | xargs || echo ""
-}
-
-read_node_name() {
-  [ -f "${SNELL_DIR}/node_name.txt" ] && cat "${SNELL_DIR}/node_name.txt" || uname -n
-}
-
-# 优化 IP 获取，增加超时控制
-get_ip() {
-  local ip
-  ip=$(curl -s4m3 ip.sb 2>/dev/null || curl -s4m3 api.ipify.org 2>/dev/null || echo "<服务器IP>")
-  echo "$ip"
+rand_port() {
+    local port
+    while :; do
+        port=$((RANDOM % (RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1) + RANDOM_PORT_MIN))
+        is_port_used $port || break
+    done
+    echo $port
 }
 
 generate_psk() {
-  tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c "$PSK_RANDOM_LENGTH" || echo "psk$(date +%s)"
+    tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c "$PSK_RANDOM_LENGTH" || echo "psk$(date +%s)"
+}
+
+# ==================== 配置读写 ====================
+read_snell_conf() {
+    local key=$1
+    [ -f "$SNELL_CONF" ] && grep -E "^$key" "$SNELL_CONF" 2>/dev/null | head -n1 | cut -d'=' -f2 | xargs || echo ""
+}
+
+read_node_name() {
+    [ -f "${SNELL_DIR}/node_name.txt" ] && cat "${SNELL_DIR}/node_name.txt" || uname -n
 }
 
 update_config_txt() {
-  local port="${1:-$(read_snell_port)}"
-  local psk="${2:-$(read_snell_psk)}"
-  local node_name="${3:-$(read_node_name)}"
-  local ip=$(get_ip)
-  cat > "$SNELL_CFGTXT" <<EOF
-${node_name} = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true, reuse=true, ecn=true
+    local port psk name ip
+    port=$(read_snell_conf "listen" | sed -E 's/.*:([0-9]+)$/\1/')
+    psk=$(read_snell_conf "psk")
+    name=$(read_node_name)
+    ip=$(get_ip)
+    
+    cat > "$SNELL_CFGTXT" <<EOF
+${name} = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true, reuse=true, ecn=true
 EOF
 }
 
-# =====================================
-# 服务管理
-# =====================================
-snell_service_control() {
-  local action="$1"
-  local show_log="${2:-true}"
-  case "$action" in
-    start)
-      systemctl start snell
-      [ "$show_log" = "true" ] && { systemctl is-active --quiet snell && _green "Snell 已启动" || _red "启动失败"; }
-      ;;
-    stop)
-      systemctl stop snell 2>/dev/null
-      [ "$show_log" = "true" ] && _green "Snell 已停止"
-      ;;
-    restart)
-      systemctl restart snell
-      sleep 1
-      [ "$show_log" = "true" ] && { systemctl is-active --quiet snell && _green "Snell 已重启" || _red "重启失败"; }
-      ;;
-    reload) systemctl daemon-reload ;;
-    enable) systemctl enable snell >/dev/null 2>&1 ;;
-    disable) systemctl disable snell >/dev/null 2>&1 ;;
-    status) systemctl is-active --quiet snell; return $? ;;
-  esac
+backup_conf() {
+    if [ -f "$SNELL_CONF" ]; then
+        cp "$SNELL_CONF" "${SNELL_CONF}.bak"
+    fi
 }
 
-# =====================================
-# 核心功能
-# =====================================
+# ==================== 防火墙管理 ====================
+firewall_allow() {
+    local p=$1
+    if command -v ufw >/dev/null 2>&1; then 
+        if ! ufw status | grep -q inactive; then
+            ufw allow "$p/tcp" >/dev/null 2>&1 || true
+            ufw allow "$p/udp" >/dev/null 2>&1 || true
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then 
+        firewall-cmd --permanent --add-port="$p/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="$p/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+# ==================== 核心功能 ====================
 install_snell() {
-  ensure_dependencies
-  detect_latest_version || return 1
-  
-  local arch; arch=$(map_arch)
-  if [ "$arch" = "unsupported" ]; then
-    echo -e "\n\e[41m 错误 \e[0m 不支持的架构: $(uname -m)\n" >&2
-    exit 1
-  fi
+    check_root
+    ensure_dependencies
+    detect_latest_version
+    
+    local arch; arch=$(map_arch)
+    if [ "$arch" = "unsupported" ]; then err "不支持的架构: $(uname -m)"; fi
 
-  echo
-  _green ">>> 准备安装 Snell v${VERSION} (${arch})"
-  
-  local default_name; default_name=$(uname -n)
-  read -rp "请输入节点名称 [${default_name}]: " node_name
-  node_name=${node_name:-$default_name}
+    echo
+    _green ">>> 准备安装 Snell v${VERSION} (${arch})"
+    
+    local default_name; default_name=$(uname -n)
+    read -rp "请输入节点名称 [${default_name}]: " node_name
+    node_name=${node_name:-$default_name}
 
-  local port
-  port=$(shuf -i "$RANDOM_PORT_MIN"-"$RANDOM_PORT_MAX" -n 1)
-  read -rp "请输入端口 [${port}]: " user_port
-  port=${user_port:-$port}
-  
-  if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-     _red "错误: 端口无效"
-     return 1
-  fi
+    local port=$(rand_port)
+    read -rp "请输入端口 [${port}]: " user_port
+    port=${user_port:-$port}
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        err "端口无效"
+    fi
+    if is_port_used "$port"; then err "端口被占用"; fi
 
-  if ! is_port_free "$port"; then _yellow "错误: 端口被占用"; return 1; fi
+    # 下载
+    local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
+    rm -f "$TMP_DOWNLOAD"
+    if ! download_file "$url" "$TMP_DOWNLOAD"; then
+        err "下载失败"
+    fi
+    
+    # 校验
+    if ! unzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
+        err "文件校验失败"
+    fi
+    
+    # 安装
+    systemctl stop snell 2>/dev/null || true
+    if ! unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null; then
+        err "解压失败"
+    fi
+    chmod +x "$SNELL_BIN"
 
-  # 下载
-  local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
-  rm -f "$TMP_DOWNLOAD"
-  
-  if ! download_file "$url" "$TMP_DOWNLOAD"; then
-      echo
-      _red "错误: 下载失败"
-      echo "请检查网络，或尝试访问: $url"
-      return 1
-  fi
-  
-  if ! unzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
-      _red "错误: 文件校验失败"
-      return 1
-  fi
-  
-  systemctl stop snell 2>/dev/null || true
+    # 安装脚本自身
+    local script_path; script_path=$(realpath "$0")
+    if [[ "$script_path" != "$LOCAL_SCRIPT" ]]; then
+        cp "$script_path" "$LOCAL_SCRIPT"
+        chmod +x "$LOCAL_SCRIPT"
+        ln -sf "$LOCAL_SCRIPT" /usr/local/bin/snell
+    fi
 
-  if ! unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null; then
-      _red "错误: 解压失败"
-      return 1
-  fi
-  chmod +x "$SNELL_BIN"
+    # 权限与配置
+    if ! id -u snell >/dev/null 2>&1; then
+        useradd -r -s /usr/sbin/nologin snell || true
+    fi
+    mkdir -p "$(dirname "$SNELL_LOG")" "$SNELL_DIR"
+    touch "$SNELL_LOG"
+    chown snell:snell "$SNELL_LOG" 2>/dev/null || true
 
-  if ! id -u snell >/dev/null 2>&1; then
-    useradd -r -s /usr/sbin/nologin snell || true
-  fi
-  mkdir -p "$(dirname "$SNELL_LOG")"
-  touch "$SNELL_LOG"
-  chown snell:snell "$SNELL_LOG" 2>/dev/null || true
-
-  # 配置
-  local psk
-  psk=$(generate_psk)
-  
-  mkdir -p "$SNELL_DIR"
-  echo "$node_name" > "${SNELL_DIR}/node_name.txt"
-  echo "v${VERSION}" > "$SNELL_VERSION_FILE"
-  
-  # 备份旧配置 (如果存在)
-  if [ -f "$SNELL_CONF" ]; then
-      cp "$SNELL_CONF" "${SNELL_CONF}.bak"
-  fi
-
-  cat > "$SNELL_CONF" <<EOF
+    local psk=$(generate_psk)
+    echo "$node_name" > "${SNELL_DIR}/node_name.txt"
+    echo "v${VERSION}" > "$SNELL_VERSION_FILE"
+    
+    backup_conf
+    cat > "$SNELL_CONF" <<EOF
 [snell-server]
 listen = ::0:${port}
 psk = ${psk}
 ipv6 = true
 tfo = true
 EOF
-  chown -R snell:snell "$SNELL_DIR" 2>/dev/null || true
-  chmod 640 "$SNELL_CONF"
+    chown -R snell:snell "$SNELL_DIR" 2>/dev/null || true
+    chmod 640 "$SNELL_CONF"
 
-  # Systemd (优化 LimitNOFILE)
-  cat > "$SYSTEMD_SERVICE" <<EOF
+    # Systemd (优化 LimitNOFILE)
+    cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
 Description=Snell Proxy Service
 After=network.target
@@ -426,73 +365,69 @@ SyslogIdentifier=snell-server
 WantedBy=multi-user.target
 EOF
 
-  firewall_allow_port "$port"
-  update_config_txt "$port" "$psk" "$node_name"
-  
-  systemctl daemon-reload
-  systemctl enable snell >/dev/null 2>&1
-  systemctl start snell
+    firewall_allow "$port"
+    update_config_txt
+    
+    systemctl daemon-reload
+    systemctl enable snell >/dev/null 2>&1
+    systemctl start snell
 
-  echo
-  _green "安装完成!"
-  echo
-  echo "=== Surge 配置 ==="
-  cat "$SNELL_CFGTXT"
-  echo
-}
-
-# =====================================
-# 其他功能
-# =====================================
-uninstall_snell() {
-  read -rp "确认卸载? [y/N]: " confirm
-  [[ "${confirm,,}" != "y" ]] && return 0
-  
-  systemctl stop snell 2>/dev/null || true
-  systemctl disable snell 2>/dev/null || true
-  rm -f "$SYSTEMD_SERVICE" "$SNELL_BIN"
-  rm -rf "$SNELL_DIR"
-  systemctl daemon-reload
-  rm -f "$VERSION_CACHE_FILE"
-  _green "Snell 已卸载"
+    echo
+    _green "安装完成!"
+    echo
+    echo "=== Surge 配置 ==="
+    cat "$SNELL_CFGTXT"
+    echo
 }
 
 update_snell() {
-  if [ ! -f "$SNELL_BIN" ]; then _yellow "未安装 Snell"; return 1; fi
-  rm -f "$VERSION_CACHE_FILE"
-  detect_latest_version
-  local installed; installed=$(get_installed_version)
-  
-  if [ "$installed" == "$VERSION" ]; then
-     read -rp "已是最新版 (v$installed)，强制重装? [y/N]: " cf
-     [[ "${cf,,}" != "y" ]] && return 0
-  fi
-  
-  _green "正在更新 v$installed -> v$VERSION ..."
-  systemctl stop snell 2>/dev/null || true
-  
-  local arch; arch=$(map_arch)
-  local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
-  
-  if download_file "$url" "$TMP_DOWNLOAD" && unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null; then
-      chmod +x "$SNELL_BIN"
-      echo "v${VERSION}" > "$SNELL_VERSION_FILE"
-      systemctl start snell
-      _green "更新成功"
-  else
-      _red "更新失败"
-      systemctl start snell 
-  fi
+    if [ ! -f "$SNELL_BIN" ]; then _yellow "未安装 Snell"; return 1; fi
+    rm -f "$VERSION_CACHE_FILE"
+    detect_latest_version
+    local installed; installed=$(get_installed_version)
+    
+    if [ "$installed" == "$VERSION" ]; then
+        read -rp "已是最新版，强制重装? [y/N]: " cf
+        [[ "${cf,,}" != "y" ]] && return 0
+    fi
+    
+    _green "正在更新 v$installed -> v$VERSION ..."
+    
+    local arch; arch=$(map_arch)
+    local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
+    
+    # 优化点：先下载成功，再停止服务
+    if download_file "$url" "$TMP_DOWNLOAD" && unzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
+        systemctl stop snell 2>/dev/null || true
+        unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null
+        chmod +x "$SNELL_BIN"
+        echo "v${VERSION}" > "$SNELL_VERSION_FILE"
+        systemctl start snell
+        _green "更新成功"
+    else
+        err "下载或校验失败，更新取消 (服务未受影响)"
+    fi
 }
 
+uninstall_snell() {
+    read -rp "确认卸载? [y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && return 0
+    
+    systemctl stop snell 2>/dev/null || true
+    systemctl disable snell 2>/dev/null || true
+    rm -f "$SYSTEMD_SERVICE" "$SNELL_BIN"
+    rm -rf "$SNELL_DIR"
+    systemctl daemon-reload
+    rm -f "$VERSION_CACHE_FILE"
+    _green "Snell 已卸载"
+}
+
+# ==================== 菜单逻辑 ====================
 show_config_info() {
     if [ ! -f "$SNELL_CFGTXT" ]; then _yellow "未找到配置"; return; fi
     echo; cat "$SNELL_CFGTXT"; echo
 }
 
-# =====================================
-# 菜单
-# =====================================
 pause_return() { echo; read -rp "按回车返回..."; }
 
 menu() {
@@ -511,7 +446,8 @@ menu() {
     echo -e "  3. 查看配置 👁️          4. 更新核心 🆙"
     echo -e "  5. 启动服务 ▶️          6. 停止服务 ⏹️"
     echo -e "  7. 重启服务 🔄          8. 查看日志 📜"
-    echo -e "  9. 更新脚本 🔄          0. 退出"
+    echo -e "  9. 修改配置 (端口/PSK)  10. 更新脚本 🔄"
+    echo -e "  0. 退出"
     echo
     read -rp " 请输入序号: " pick
     case "$pick" in
@@ -524,8 +460,31 @@ menu() {
         7) systemctl restart snell; _green "已执行重启"; pause_return ;;
         8) tail -n 50 "$SNELL_LOG"; pause_return ;;
         9) 
-           if download_file "$SCRIPT_URL" "/usr/local/bin/snell-manager.sh"; then
-              chmod +x /usr/local/bin/snell-manager.sh
+           read -rp "修改端口(1) 或 PSK(2)? " sub
+           backup_conf
+           if [[ "$sub" == "1" ]]; then
+              read -rp "新端口: " np
+              if [[ "$np" =~ ^[0-9]+$ ]]; then
+                  sed -i -E "s/listen = .*:[0-9]+/listen = ::0:$np/" "$SNELL_CONF"
+                  firewall_allow "$np"
+                  update_config_txt
+                  systemctl restart snell
+                  _green "端口已修改"
+              else
+                  _yellow "无效端口"
+              fi
+           elif [[ "$sub" == "2" ]]; then
+              read -rp "新PSK: " npsk
+              sed -i "s/psk = .*/psk = $npsk/" "$SNELL_CONF"
+              update_config_txt
+              systemctl restart snell
+              _green "PSK 已修改"
+           fi
+           pause_return
+           ;;
+        10) 
+           if download_file "$SCRIPT_URL" "$LOCAL_SCRIPT"; then
+              chmod +x "$LOCAL_SCRIPT"
               _green "脚本已更新，请重新运行"
               exit 0
            else
@@ -539,6 +498,7 @@ menu() {
   done
 }
 
+# ==================== 入口 ====================
 if [ -n "${1:-}" ]; then
     case "$1" in
         start|stop|restart|status) systemctl "$1" snell ;;
