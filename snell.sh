@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Snell 管理脚本 (修复版 v2.6)
-# - 修复 curl | bash 运行时 "cp: cannot stat pipe" 的错误
-# - 优化脚本自身的安装逻辑 (管道运行改为自动下载)
-# - 保持 v2.5 的所有健壮性特性
+# Snell 管理脚本 (完美版 v2.7)
+# - 修复: 彻底的卸载功能 (清理脚本、用户、日志)
+# - 修复: 版本检测在无匹配时可能导致的脚本崩溃
+# - 继承: 管道运行修复、配置备份、网络重试
 #
 # Usage: sudo bash snell.sh
 
@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.6.0"
+SCRIPT_VERSION="v2.7.0"
 FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
@@ -31,9 +31,11 @@ SNELL_VERSION_FILE="${SNELL_DIR}/ver.txt"
 SYSTEMD_SERVICE="/etc/systemd/system/snell.service"
 DL_BASE="https://dl.nssurge.com/snell"
 SNELL_LOG="/var/log/snell.log"
-# 脚本托管地址 (用于管道运行时下载自身)
+
+# 脚本相关路径
 SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
-LOCAL_SCRIPT="/usr/local/bin/snell-manager.sh"
+LOCAL_SCRIPT="/usr/local/bin/snell-manager.sh" # 主脚本文件
+LINK_BIN="/usr/local/bin/snell"                # 快捷指令
 
 # 临时文件
 TMP_DOWNLOAD="/tmp/snell-server.zip"
@@ -95,7 +97,7 @@ ensure_dependencies() {
     fi
 }
 
-# ==================== 网络请求 (增强版) ====================
+# ==================== 网络请求 ====================
 curl_retry() {
     local attempt=1
     while [ $attempt -le "$CURL_MAX_RETRIES" ]; do
@@ -150,11 +152,13 @@ get_ip() {
 get_latest_version_from_web() {
   local kb_page="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
   local content
+  # 增加 || true 防止 curl 失败导致脚本退出
   content=$(curl -sL --retry 2 --max-time 10 "$kb_page" 2>/dev/null || true)
   
   if [ -n "$content" ]; then
+    # 增加 || true 防止 grep 找不到匹配时导致脚本退出 (set -e)
     echo "$content" | grep -oE 'snell-server-v[0-9]+\.[0-9]+\.[0-9]+-linux' | \
-      sed 's/snell-server-v//g; s/-linux//g' | sort -V | tail -1
+      sed 's/snell-server-v//g; s/-linux//g' | sort -V | tail -1 || true
   fi
 }
 
@@ -171,6 +175,7 @@ detect_latest_version() {
   fi
 
   echo "正在检测最新版本..."
+  # 即使 web 获取失败，由于上面的容错处理，这里不会崩溃
   local web_ver
   web_ver=$(get_latest_version_from_web)
   
@@ -223,6 +228,7 @@ generate_psk() {
 # ==================== 配置读写 ====================
 read_snell_conf() {
     local key=$1
+    # 增加 || true 防止 grep 无匹配时退出
     [ -f "$SNELL_CONF" ] && grep -E "^$key" "$SNELL_CONF" 2>/dev/null | head -n1 | cut -d'=' -f2 | xargs || echo ""
 }
 
@@ -308,24 +314,24 @@ install_snell() {
     fi
     chmod +x "$SNELL_BIN"
 
-    # --- 脚本自身安装逻辑修复 (适配管道运行) ---
+    # --- 脚本自身安装逻辑 ---
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
-        # 管道/远程运行：下载脚本保存
+        # 管道/远程运行
         echo "正在下载管理脚本..."
         if download_file "$SCRIPT_URL" "$LOCAL_SCRIPT"; then
             chmod +x "$LOCAL_SCRIPT"
-            ln -sf "$LOCAL_SCRIPT" /usr/local/bin/snell
+            ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
         else
             _yellow "脚本下载失败，无法创建快捷命令 'snell'，但服务安装不受影响。"
         fi
     elif [[ "$current_path" != "$LOCAL_SCRIPT" ]]; then
-        # 本地文件运行：直接复制
+        # 本地文件运行
         cp "$current_path" "$LOCAL_SCRIPT"
         chmod +x "$LOCAL_SCRIPT"
-        ln -sf "$LOCAL_SCRIPT" /usr/local/bin/snell
+        ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
     fi
-    # ---------------------------------------------
+    # ------------------------
 
     # 权限与配置
     if ! id -u snell >/dev/null 2>&1; then
@@ -417,17 +423,41 @@ update_snell() {
     fi
 }
 
+# ==================== 卸载功能 (全面增强版) ====================
 uninstall_snell() {
+    echo
+    _yellow "警告: 即将卸载 Snell"
     read -rp "确认卸载? [y/N]: " confirm
-    [[ "${confirm,,}" != "y" ]] && return 0
-    
-    systemctl stop snell 2>/dev/null || true
-    systemctl disable snell 2>/dev/null || true
-    rm -f "$SYSTEMD_SERVICE" "$SNELL_BIN"
-    rm -rf "$SNELL_DIR"
-    systemctl daemon-reload
-    rm -f "$VERSION_CACHE_FILE"
-    _green "Snell 已卸载"
+    if [[ "${confirm,,}" == "y" ]]; then
+        # 1. 停止服务
+        systemctl stop snell 2>/dev/null || true
+        systemctl disable snell 2>/dev/null || true
+        
+        # 2. 删除服务文件
+        rm -f "$SYSTEMD_SERVICE"
+        systemctl daemon-reload
+        
+        # 3. 删除程序文件与配置
+        rm -f "$SNELL_BIN"
+        rm -rf "$SNELL_DIR"
+        
+        # 4. 删除日志 (补全)
+        rm -f "$SNELL_LOG"
+        
+        # 5. 删除脚本自身和缓存 (补全)
+        rm -f "$LOCAL_SCRIPT" "$LINK_BIN"
+        rm -f "$VERSION_CACHE_FILE"
+        
+        # 6. 删除用户 (补全)
+        if id -u snell >/dev/null 2>&1; then
+            userdel snell 2>/dev/null || true
+        fi
+        
+        _green "Snell 已彻底卸载 (脚本已自毁)"
+        exit 0
+    else
+        echo "已取消"
+    fi
 }
 
 # ==================== 菜单逻辑 ====================
