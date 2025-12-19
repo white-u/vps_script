@@ -1,10 +1,9 @@
 #!/bin/bash
 #
-# Snell 管理脚本 (终极增强版 v2.5)
-# - 移植 sing-box 脚本的底层健壮性逻辑
-# - 优化更新流程 (下载完成后再停止服务，减少断连时间)
-# - 引入网络请求重试机制
-# - 配置文件修改自动备份
+# Snell 管理脚本 (修复版 v2.6)
+# - 修复 curl | bash 运行时 "cp: cannot stat pipe" 的错误
+# - 优化脚本自身的安装逻辑 (管道运行改为自动下载)
+# - 保持 v2.5 的所有健壮性特性
 #
 # Usage: sudo bash snell.sh
 
@@ -12,8 +11,8 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.5.0"
-FALLBACK_VERSION="4.1.0" # Snell v4 依然是目前最稳定的选择
+SCRIPT_VERSION="v2.6.0"
+FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -32,10 +31,11 @@ SNELL_VERSION_FILE="${SNELL_DIR}/ver.txt"
 SYSTEMD_SERVICE="/etc/systemd/system/snell.service"
 DL_BASE="https://dl.nssurge.com/snell"
 SNELL_LOG="/var/log/snell.log"
-SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main/snell.sh"
+# 脚本托管地址 (用于管道运行时下载自身)
+SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
 LOCAL_SCRIPT="/usr/local/bin/snell-manager.sh"
 
-# 临时文件 (固定路径)
+# 临时文件
 TMP_DOWNLOAD="/tmp/snell-server.zip"
 VERSION_CACHE_FILE="/var/tmp/snell_version_cache"
 
@@ -74,7 +74,6 @@ map_arch() {
 
 ensure_dependencies() {
     local missing_deps=0
-    # Snell 需要 unzip 解压
     for cmd in curl wget unzip; do
         if ! command -v $cmd >/dev/null 2>&1; then
             missing_deps=1
@@ -151,7 +150,6 @@ get_ip() {
 get_latest_version_from_web() {
   local kb_page="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
   local content
-  # 使用 curl_retry 增强稳定性
   content=$(curl -sL --retry 2 --max-time 10 "$kb_page" 2>/dev/null || true)
   
   if [ -n "$content" ]; then
@@ -310,13 +308,24 @@ install_snell() {
     fi
     chmod +x "$SNELL_BIN"
 
-    # 安装脚本自身
-    local script_path; script_path=$(realpath "$0")
-    if [[ "$script_path" != "$LOCAL_SCRIPT" ]]; then
-        cp "$script_path" "$LOCAL_SCRIPT"
+    # --- 脚本自身安装逻辑修复 (适配管道运行) ---
+    local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
+        # 管道/远程运行：下载脚本保存
+        echo "正在下载管理脚本..."
+        if download_file "$SCRIPT_URL" "$LOCAL_SCRIPT"; then
+            chmod +x "$LOCAL_SCRIPT"
+            ln -sf "$LOCAL_SCRIPT" /usr/local/bin/snell
+        else
+            _yellow "脚本下载失败，无法创建快捷命令 'snell'，但服务安装不受影响。"
+        fi
+    elif [[ "$current_path" != "$LOCAL_SCRIPT" ]]; then
+        # 本地文件运行：直接复制
+        cp "$current_path" "$LOCAL_SCRIPT"
         chmod +x "$LOCAL_SCRIPT"
         ln -sf "$LOCAL_SCRIPT" /usr/local/bin/snell
     fi
+    # ---------------------------------------------
 
     # 权限与配置
     if ! id -u snell >/dev/null 2>&1; then
@@ -396,7 +405,6 @@ update_snell() {
     local arch; arch=$(map_arch)
     local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
     
-    # 优化点：先下载成功，再停止服务
     if download_file "$url" "$TMP_DOWNLOAD" && unzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
         systemctl stop snell 2>/dev/null || true
         unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null

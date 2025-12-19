@@ -1,10 +1,9 @@
 #!/bin/bash
 #
-# Sing-box 管理脚本 (终极增强版 v2.5)
-# - 移植 Snell 脚本的底层健壮性逻辑
-# - 引入 set -euo pipefail 严格模式
-# - 增加配置修改自动备份功能
-# - 优化下载逻辑与进度显示
+# Sing-box 管理脚本 (修复版 v2.6)
+# - 修复 curl | bash 运行时 "cp: cannot stat pipe" 的错误
+# - 优化脚本自身的安装逻辑 (管道运行改为自动下载)
+# - 移植 Snell v2.6 的所有健壮性修复
 #
 # Usage: sudo bash sing-box.sh
 
@@ -12,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.5.0"
+SCRIPT_VERSION="v2.6.0"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -24,9 +23,6 @@ _gray() { echo -e "\033[90m$@\033[0m"; }
 err() { echo -e "\n\e[41m 错误 \e[0m $@\n" >&2; exit 1; }
 
 # ==================== 路径与变量 ====================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_URL="https://raw.githubusercontent.com/white-u/vps_script/main"
-
 IS_CORE=sing-box
 IS_CORE_DIR=/etc/$IS_CORE
 IS_CORE_BIN=$IS_CORE_DIR/bin/$IS_CORE
@@ -34,11 +30,13 @@ IS_CORE_REPO=SagerNet/$IS_CORE
 IS_CONF_DIR=$IS_CORE_DIR/conf
 IS_CONFIG_JSON=$IS_CORE_DIR/config.json
 IS_LOG_DIR=/var/log/$IS_CORE
-IS_SH_BIN=/usr/local/bin/sb # 统一脚本名
+# 脚本安装路径
+IS_SH_BIN=/usr/local/bin/sb 
+# 脚本托管地址 (用于管道运行时下载自身)
 IS_SH_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
 IS_VERSION_CACHE="/var/tmp/singbox_version_cache"
 
-# 临时文件 (固定路径，避免 mktemp 兼容性问题)
+# 临时文件 (固定路径)
 TMP_DOWNLOAD="/tmp/sing-box-core.tar.gz"
 TMP_DIR="/tmp/sing-box-extract"
 
@@ -199,7 +197,7 @@ install_singbox() {
     
     if [[ "$version" == "null" || -z "$version" ]]; then
         _yellow "获取版本失败，尝试使用 fallback 版本"
-        # 这里可以硬编码一个备用版本，防止 API 限制导致无法安装
+        # 备用版本
         version="v1.10.1" 
     fi
     
@@ -220,7 +218,6 @@ install_singbox() {
     
     # 解压安装
     mkdir -p "$TMP_DIR"
-    # --strip-components=1 去掉顶层目录
     tar -xzf "$TMP_DOWNLOAD" -C "$TMP_DIR" --strip-components=1
     
     mkdir -p $IS_CORE_DIR/bin $IS_CONF_DIR $IS_LOG_DIR
@@ -231,15 +228,24 @@ install_singbox() {
     cp "$TMP_DIR/sing-box" "$IS_CORE_BIN"
     chmod +x "$IS_CORE_BIN"
     
-    # 安装脚本自身
-    local script_path; script_path=$(realpath "$0")
-    # 只有当当前运行的脚本不是目标路径时才复制
-    if [[ "$script_path" != "$IS_SH_BIN" ]]; then
-        cp "$script_path" "$IS_SH_BIN"
+    # --- 脚本自身安装逻辑修复 (适配管道运行) ---
+    local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
+        # 管道/远程运行：下载脚本保存
+        echo "正在下载管理脚本..."
+        if download_file "$IS_SH_URL" "$IS_SH_BIN"; then
+            chmod +x "$IS_SH_BIN"
+            ln -sf "$IS_SH_BIN" /usr/local/bin/sb
+        else
+            _yellow "脚本下载失败，无法创建快捷命令 'sb'，但服务安装不受影响。"
+        fi
+    elif [[ "$current_path" != "$IS_SH_BIN" ]]; then
+        # 本地文件运行：直接复制
+        cp "$current_path" "$IS_SH_BIN"
         chmod +x "$IS_SH_BIN"
-        # 更新软链接，确保 sb 命令可用
         ln -sf "$IS_SH_BIN" /usr/local/bin/sb
     fi
+    # ---------------------------------------------
 
     # Systemd 服务配置 (优化资源限制 LimitNOFILE)
     cat > /etc/systemd/system/$IS_CORE.service <<EOF
@@ -333,19 +339,11 @@ save_conf() {
     fi
     
     # 2. 逻辑校验：使用 sing-box check 验证
-    # 注意：check 命令会检查所有配置，如果其他文件有错也会报错
     if ! $IS_CORE_BIN check -c "$IS_CONFIG_JSON" -C "$IS_CONF_DIR" >/dev/null 2>&1; then
-        # 尝试仅验证当前文件结构是否符合 sing-box 规范比较困难，
-        # 所以这里主要依赖 check 命令的整体校验
-        # 我们可以尝试临时改名验证，但这太复杂。
-        # 简单策略：如果整体校验失败，警告用户，但询问是否强制保存（因为可能是其他文件的问题）
         _yellow "警告: sing-box 配置校验未通过 (可能是与其他配置冲突)"
-        # 实际上为了安全，我们可以选择不保存，或者提示用户。
-        # 既然是脚本生成，格式通常是对的。这里我们假设是端口冲突等逻辑错误。
-        # 为简单起见，如果 jq 通过，我们通常认为可以写入。
     fi
 
-    # 3. 备份机制 (移植自 Snell 脚本)
+    # 3. 备份机制
     if [ -f "$target_file" ]; then
         cp "$target_file" "${target_file}.bak"
     fi
@@ -358,7 +356,6 @@ save_conf() {
 
 # ==================== 功能操作 ====================
 add() {
-    # 简化协议选择逻辑
     if [[ -z "${1:-}" ]]; then
         echo
         echo "请选择协议:"
@@ -392,7 +389,6 @@ add() {
     local uuid=$(cat /proc/sys/kernel/random/uuid)
     local sni="www.time.is"
     
-    # 生成配置 JSON
     if [[ "$is_protocol" == "VLESS-Reality" ]]; then
         read -rp "UUID [$uuid]: " u; uuid=${u:-$uuid}
         read -rp "SNI [$sni]: " s; sni=${s:-$sni}
@@ -435,7 +431,6 @@ add() {
                     ]
                   }')
     else
-        # Shadowsocks
         local method="2022-blake3-aes-128-gcm"
         local pass=$(openssl rand -base64 16)
         is_conf_name="ss-$is_port"
@@ -552,7 +547,6 @@ info() {
     get_conf_list
     if [[ ${#conf_list[@]} -eq 0 ]]; then _yellow "无配置"; return; fi
     
-    # 自动选择或列表选择逻辑
     if [[ ${#conf_list[@]} -eq 1 ]]; then
         is_conf_file="${conf_list[0]}"
     else
@@ -594,7 +588,7 @@ show_menu() {
             1) add; pause_return ;;
             2) del; pause_return ;;
             3) info; pause_return ;;
-            4) install_singbox; pause_return ;; # 复用安装逻辑即更新
+            4) install_singbox; pause_return ;; 
             5) systemctl start $IS_CORE; pause_return ;;
             6) systemctl stop $IS_CORE; pause_return ;;
             7) systemctl restart $IS_CORE; pause_return ;;
