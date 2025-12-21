@@ -1,8 +1,9 @@
 #!/bin/bash
 #
-# Sing-box 管理脚本 (v2.7.4)
-# - 修复: 脚本自我更新逻辑改为“原子操作” (下载到临时文件->验证->替换)，防止网络中断导致脚本损坏
-# - 继承: 自定义名称、卸载清理、API限流保护、管道运行支持
+# Sing-box 管理脚本 (完美命名版 v2.7.5)
+# - 优化: 配置文件名强制标准化 (vless-端口/ss-端口)
+# - 新增: 分享链接备注支持自定义 (默认为主机名)
+# - 继承: 卸载、更新修复、API保护等所有特性
 #
 # Usage: sudo bash sing-box.sh
 
@@ -10,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.4"
+SCRIPT_VERSION="v2.7.5"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -30,17 +31,14 @@ IS_CONF_DIR=$IS_CORE_DIR/conf
 IS_CONFIG_JSON=$IS_CORE_DIR/config.json
 IS_LOG_DIR=/var/log/$IS_CORE
 
-# 脚本安装路径
-IS_SH_BIN="/usr/local/bin/sing-box"  # 实体文件
-IS_LINK_BIN="/usr/local/bin/sb"      # 快捷软链
+IS_SH_BIN="/usr/local/bin/sing-box"
+IS_LINK_BIN="/usr/local/bin/sb"
 IS_SH_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sing-box.sh"
-
 IS_VERSION_CACHE="/var/tmp/singbox_version_cache"
 
-# 临时文件
 TMP_DOWNLOAD="/tmp/sing-box-core.tar.gz"
 TMP_DIR="/tmp/sing-box-extract"
-TMP_SCRIPT="/tmp/sing-box-script.sh" # 脚本更新临时文件
+TMP_SCRIPT="/tmp/sing-box-script-upd.sh"
 
 # ==================== 常量定义 ====================
 readonly PORT_MIN=1
@@ -83,7 +81,7 @@ ensure_dependencies() {
     done
 
     if [ $missing_deps -eq 1 ]; then
-        echo "正在安装依赖 (curl, wget, jq, openssl, tar)..."
+        echo "正在安装依赖..."
         if [ -f /etc/debian_version ]; then
             apt-get update -y >/dev/null && apt-get install -y wget curl tar jq openssl >/dev/null
         elif [ -f /etc/redhat-release ]; then
@@ -102,7 +100,6 @@ curl_retry() {
     while [ $attempt -le "$CURL_MAX_RETRIES" ]; do
         if curl -L -f --progress-bar "$@"; then return 0; fi
         if [ $attempt -lt "$CURL_MAX_RETRIES" ]; then
-            _yellow "curl 请求失败，${CURL_RETRY_DELAY}秒后重试..."
             sleep "$CURL_RETRY_DELAY"
         fi
         attempt=$((attempt + 1))
@@ -115,7 +112,6 @@ wget_retry() {
     while [ $attempt -le "$WGET_MAX_RETRIES" ]; do
         if wget --no-check-certificate "$@"; then return 0; fi
         if [ $attempt -lt "$WGET_MAX_RETRIES" ]; then
-            _yellow "wget 请求失败，${WGET_RETRY_DELAY}秒后重试..."
             sleep "$WGET_RETRY_DELAY"
         fi
         attempt=$((attempt + 1))
@@ -195,13 +191,8 @@ install_singbox() {
 
     local core_url="https://github.com/$IS_CORE_REPO/releases/download/$version/$IS_CORE-${version#v}-linux-$arch.tar.gz"
     rm -f "$TMP_DOWNLOAD"
-    if ! download_file "$core_url" "$TMP_DOWNLOAD"; then
-        err "核心下载失败"
-    fi
-    
-    if ! gzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
-        err "文件校验失败"
-    fi
+    if ! download_file "$core_url" "$TMP_DOWNLOAD"; then err "核心下载失败"; fi
+    if ! gzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then err "文件校验失败"; fi
     
     mkdir -p "$TMP_DIR"
     tar -xzf "$TMP_DOWNLOAD" -C "$TMP_DIR" --strip-components=1
@@ -211,7 +202,7 @@ install_singbox() {
     cp "$TMP_DIR/sing-box" "$IS_CORE_BIN"
     chmod +x "$IS_CORE_BIN"
     
-    # 脚本安装 (原子更新逻辑)
+    # 脚本安装 (原子更新)
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
         echo "正在下载管理脚本..."
@@ -228,12 +219,10 @@ install_singbox() {
         ln -sf "$IS_SH_BIN" "$IS_LINK_BIN"
     fi
 
-    # Systemd
     cat > /etc/systemd/system/$IS_CORE.service <<EOF
 [Unit]
 Description=$IS_CORE Service
 After=network.target
-
 [Service]
 User=root
 ExecStart=$IS_CORE_BIN run -c $IS_CONFIG_JSON -C $IS_CONF_DIR
@@ -242,7 +231,6 @@ RestartSec=5s
 LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -250,26 +238,18 @@ EOF
     systemctl daemon-reload
     systemctl enable $IS_CORE >/dev/null 2>&1
 
-    # 默认配置
     if [ ! -f "$IS_CONFIG_JSON" ]; then
         cat > $IS_CONFIG_JSON <<EOF
 {
-    "log": {
-        "level": "info",
-        "output": "$IS_LOG_DIR/sing-box.log",
-        "timestamp": true
-    },
+    "log": {"level": "info", "output": "$IS_LOG_DIR/sing-box.log", "timestamp": true},
     "dns": {},
-    "outbounds": [
-        {"type": "direct", "tag": "direct"}
-    ]
+    "outbounds": [{"type": "direct", "tag": "direct"}]
 }
 EOF
     fi
     
     echo
-    _green "安装完成!"
-    echo "命令: sb"
+    _green "安装完成! 命令: sb"
     echo
 }
 
@@ -283,12 +263,8 @@ uninstall() {
         systemctl disable $IS_CORE 2>/dev/null || true
         rm -f /etc/systemd/system/$IS_CORE.service
         systemctl daemon-reload
-        
-        rm -rf $IS_CORE_DIR
-        rm -rf $IS_LOG_DIR
-        rm -f "$IS_SH_BIN" "$IS_LINK_BIN"
-        rm -f "$IS_VERSION_CACHE"
-        
+        rm -rf $IS_CORE_DIR $IS_LOG_DIR
+        rm -f "$IS_SH_BIN" "$IS_LINK_BIN" "$IS_VERSION_CACHE"
         _green "Sing-box 已彻底卸载"
         exit 0
     else
@@ -299,13 +275,9 @@ uninstall() {
 # ==================== 辅助函数 ====================
 is_port_used() {
     local port=$1
-    if command -v ss >/dev/null 2>&1; then
-        ss -tuln | grep -qE "(:|])$port\b"
-    elif command -v lsof >/dev/null 2>&1; then
-        lsof -i :"$port" >/dev/null 2>&1
-    else
-        return 1
-    fi
+    if command -v ss >/dev/null 2>&1; then ss -tuln | grep -qE "(:|])$port\b"
+    elif command -v lsof >/dev/null 2>&1; then lsof -i :"$port" >/dev/null 2>&1
+    else return 1; fi
 }
 
 rand_port() {
@@ -334,9 +306,7 @@ save_conf() {
     local tmp_file="${target_file}.tmp"
     
     if ! echo "$is_conf" | jq . > "$tmp_file" 2>/dev/null; then
-        rm -f "$tmp_file"
-        _red "JSON 格式错误"
-        return 1
+        rm -f "$tmp_file"; _red "JSON 格式错误"; return 1
     fi
     
     if ! $IS_CORE_BIN check -c "$IS_CONFIG_JSON" -C "$IS_CONF_DIR" >/dev/null 2>&1; then
@@ -383,18 +353,19 @@ add() {
     fi
     if is_port_used "$is_port"; then err "端口被占用"; fi
     
-    # 自定义名称
+    # === 关键修改：文件命名 与 分享备注 分离 ===
+    # 1. 配置文件名：强制标准化
     local def_prefix="vless"
     if [[ "$is_protocol" == "Shadowsocks" ]]; then def_prefix="ss"; fi
-    local def_name="${def_prefix}-${is_port}"
-    
-    read -rp "配置名称 (用于链接备注) [$def_name]: " input_name
-    is_conf_name=${input_name:-$def_name}
-    
-    if [[ ! "$is_conf_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        _yellow "名称包含非法字符，将使用默认名称: $def_name"
-        is_conf_name="$def_name"
-    fi
+    is_conf_name="${def_prefix}-${is_port}" 
+
+    # 2. 分享备注：用户输入，默认为主机名
+    local default_remark=$(uname -n)
+    read -rp "节点备注 (分享链接显示) [${default_remark}]: " input_remark
+    local is_remark=${input_remark:-$default_remark}
+    # 过滤非法字符，防止 JSON 破坏 (虽然 jq 会处理转义，但保持简单更好)
+    # is_remark=$(echo "$is_remark" | tr -cd '[:alnum:]_-') # 可选：严格过滤
+    # ============================================
 
     local uuid=$(cat /proc/sys/kernel/random/uuid)
     local sni="www.time.is"
@@ -410,12 +381,14 @@ add() {
         
         if [[ -z "$pk" || -z "$pub" ]]; then err "密钥生成失败"; fi
 
-        is_conf=$(jq -n --arg port "$is_port" --arg uuid "$uuid" --arg sni "$sni" --arg pk "$pk" --arg pub "$pub" --arg sid "$sid" --arg tag "$is_conf_name" \
+        # 注意：这里将 tag 设为用户输入的备注 is_remark
+        is_conf=$(jq -n --arg port "$is_port" --arg uuid "$uuid" --arg sni "$sni" --arg pk "$pk" --arg pub "$pub" --arg sid "$sid" --arg tag "$is_remark" \
                   '{inbounds: [{type: "vless", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{uuid: $uuid, flow: "xtls-rprx-vision"}], tls: {enabled: true, server_name: $sni, reality: {enabled: true, handshake: {server: $sni, server_port: 443}, private_key: $pk, short_id: [$sid]}}}], outbounds: [{type: "direct"}, {type: "direct", tag: ("public_key_"+$pub)}] }')
     else
         local method="2022-blake3-aes-128-gcm"
         local pass=$(openssl rand -base64 16)
-        is_conf=$(jq -n --arg port "$is_port" --arg pass "$pass" --arg method "$method" --arg tag "$is_conf_name" \
+        # 注意：这里将 tag 设为用户输入的备注 is_remark
+        is_conf=$(jq -n --arg port "$is_port" --arg pass "$pass" --arg method "$method" --arg tag "$is_remark" \
                   '{inbounds: [{type: "shadowsocks", tag: $tag, listen: "::", listen_port: ($port|tonumber), method: $method, password: $pass}]}')
     fi
 
@@ -477,14 +450,19 @@ info_show() {
     local type=$(read_json_val "$path" '.inbounds[0].type')
     local port=$(read_json_val "$path" '.inbounds[0].listen_port')
     local ip=$(get_ip)
-    local remark="${is_conf_file%.*}"
+    
+    # 优先从 JSON 的 tag 字段读取备注
+    local remark=$(read_json_val "$path" '.inbounds[0].tag')
+    # 兼容旧配置：如果 tag 为空，则回退使用文件名
+    if [[ -z "$remark" || "$remark" == "null" ]]; then remark="${is_conf_file%.*}"; fi
     
     echo
-    echo "=== 配置: $is_conf_file ==="
+    echo "=== 配置详情 ==="
+    echo "文件: $is_conf_file"
+    echo "备注: $remark"
     echo "类型: $type"
     echo "端口: $port"
     echo "IP  : $ip"
-    echo "备注: $remark"
     
     if [[ "$type" == "vless" ]]; then
         local uuid=$(read_json_val "$path" '.inbounds[0].users[0].uuid')
@@ -497,7 +475,7 @@ info_show() {
         echo "PBK : $pub"
         echo "SID : $sid"
         echo
-        echo "链接:"
+        echo "分享链接:"
         echo "vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub&sid=$sid&type=tcp#$remark"
     elif [[ "$type" == "shadowsocks" ]]; then
         local method=$(read_json_val "$path" '.inbounds[0].method')
@@ -506,7 +484,7 @@ info_show() {
         echo "Method: $method"
         echo "Pass  : $pass"
         echo
-        echo "链接:"
+        echo "分享链接:"
         echo "ss://$ss_str@$ip:$port#$remark"
     fi
     echo
@@ -564,7 +542,6 @@ show_menu() {
             7) systemctl restart $IS_CORE; pause_return ;;
             8) tail -n 50 "$IS_LOG_DIR/sing-box.log"; pause_return ;;
             9) 
-                # 原子更新逻辑
                 echo "正在获取最新脚本..."
                 if download_file "$IS_SH_URL" "$TMP_SCRIPT"; then
                     mv "$TMP_SCRIPT" "$IS_SH_BIN"
