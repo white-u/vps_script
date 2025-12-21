@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# Sing-box 管理脚本 (完美导出版 v2.7.3)
-# - 优化: 导出链接的备注 (Remark) 现在与配置名称保持一致，不再是死板的 "sing-box"
-# - 继承: 自定义名称、卸载清理、API限流保护、管道运行支持等所有特性
+# Sing-box 管理脚本 (v2.7.4)
+# - 修复: 脚本自我更新逻辑改为“原子操作” (下载到临时文件->验证->替换)，防止网络中断导致脚本损坏
+# - 继承: 自定义名称、卸载清理、API限流保护、管道运行支持
 #
 # Usage: sudo bash sing-box.sh
 
@@ -10,7 +10,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.3"
+SCRIPT_VERSION="v2.7.4"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -40,6 +40,7 @@ IS_VERSION_CACHE="/var/tmp/singbox_version_cache"
 # 临时文件
 TMP_DOWNLOAD="/tmp/sing-box-core.tar.gz"
 TMP_DIR="/tmp/sing-box-extract"
+TMP_SCRIPT="/tmp/sing-box-script.sh" # 脚本更新临时文件
 
 # ==================== 常量定义 ====================
 readonly PORT_MIN=1
@@ -54,7 +55,7 @@ readonly VERSION_CACHE_TIME=3600
 
 # ==================== 资源清理 ====================
 cleanup() {
-    rm -f "$TMP_DOWNLOAD"
+    rm -f "$TMP_DOWNLOAD" "$TMP_SCRIPT"
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
@@ -210,11 +211,12 @@ install_singbox() {
     cp "$TMP_DIR/sing-box" "$IS_CORE_BIN"
     chmod +x "$IS_CORE_BIN"
     
-    # 脚本安装
+    # 脚本安装 (原子更新逻辑)
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
         echo "正在下载管理脚本..."
-        if download_file "$IS_SH_URL" "$IS_SH_BIN"; then
+        if download_file "$IS_SH_URL" "$TMP_SCRIPT"; then
+            mv "$TMP_SCRIPT" "$IS_SH_BIN"
             chmod +x "$IS_SH_BIN"
             ln -sf "$IS_SH_BIN" "$IS_LINK_BIN"
         else
@@ -381,7 +383,7 @@ add() {
     fi
     if is_port_used "$is_port"; then err "端口被占用"; fi
     
-    # === 自定义名称逻辑 ===
+    # 自定义名称
     local def_prefix="vless"
     if [[ "$is_protocol" == "Shadowsocks" ]]; then def_prefix="ss"; fi
     local def_name="${def_prefix}-${is_port}"
@@ -393,7 +395,6 @@ add() {
         _yellow "名称包含非法字符，将使用默认名称: $def_name"
         is_conf_name="$def_name"
     fi
-    # ===============================
 
     local uuid=$(cat /proc/sys/kernel/random/uuid)
     local sni="www.time.is"
@@ -476,8 +477,6 @@ info_show() {
     local type=$(read_json_val "$path" '.inbounds[0].type')
     local port=$(read_json_val "$path" '.inbounds[0].listen_port')
     local ip=$(get_ip)
-    
-    # 提取备注名 (去掉 .json 后缀)
     local remark="${is_conf_file%.*}"
     
     echo
@@ -565,7 +564,10 @@ show_menu() {
             7) systemctl restart $IS_CORE; pause_return ;;
             8) tail -n 50 "$IS_LOG_DIR/sing-box.log"; pause_return ;;
             9) 
-                if download_file "$IS_SH_URL" "$IS_SH_BIN"; then
+                # 原子更新逻辑
+                echo "正在获取最新脚本..."
+                if download_file "$IS_SH_URL" "$TMP_SCRIPT"; then
+                    mv "$TMP_SCRIPT" "$IS_SH_BIN"
                     chmod +x "$IS_SH_BIN"
                     _green "脚本已更新，请重新运行"
                     exit 0
