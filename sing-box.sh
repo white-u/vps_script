@@ -1,10 +1,8 @@
 #!/bin/bash
 #
-# Sing-box 管理脚本 (最终完美版 v2.7.1)
-# - 新增: 彻底卸载功能 (清理服务、配置、日志、脚本自身)
-# - 修复: GitHub API 限流可能导致的 jq 崩溃问题
-# - 优化: 延迟获取 IP，提升脚本启动速度
-# - 完善: 管道运行支持、配置备份
+# Sing-box 管理脚本 (完美导出版 v2.7.3)
+# - 优化: 导出链接的备注 (Remark) 现在与配置名称保持一致，不再是死板的 "sing-box"
+# - 继承: 自定义名称、卸载清理、API限流保护、管道运行支持等所有特性
 #
 # Usage: sudo bash sing-box.sh
 
@@ -12,7 +10,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.1"
+SCRIPT_VERSION="v2.7.3"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -148,7 +146,6 @@ is_valid_ip() {
 }
 
 get_ip() {
-    # 增加超时控制，防止卡住
     local ip
     ip=$(curl -s4m3 ip.sb 2>/dev/null || curl -s4m3 api.ipify.org 2>/dev/null || echo "")
     if is_valid_ip "$ip"; then
@@ -184,58 +181,50 @@ install_singbox() {
     echo
     _green ">>> 准备安装 $IS_CORE ..."
 
-    # 获取版本 (修复: 增加 jq 容错)
     local version
     local api_json
     api_json=$(curl -sL --retry 2 "https://api.github.com/repos/$IS_CORE_REPO/releases/latest" || echo "{}")
     version=$(echo "$api_json" | jq -r .tag_name 2>/dev/null || echo "null")
     
     if [[ "$version" == "null" || -z "$version" ]]; then
-        _yellow "获取版本失败 (可能触发 API 限制)，使用后备版本 v1.10.1"
+        _yellow "获取版本失败，使用后备版本 v1.10.1"
         version="v1.10.1" 
     fi
     echo "    版本: $version"
 
-    # 下载
     local core_url="https://github.com/$IS_CORE_REPO/releases/download/$version/$IS_CORE-${version#v}-linux-$arch.tar.gz"
     rm -f "$TMP_DOWNLOAD"
     if ! download_file "$core_url" "$TMP_DOWNLOAD"; then
-        err "核心下载失败，请检查网络"
+        err "核心下载失败"
     fi
     
-    # 校验
     if ! gzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
-        err "文件校验失败 (非 gzip 格式)"
+        err "文件校验失败"
     fi
     
-    # 解压
     mkdir -p "$TMP_DIR"
     tar -xzf "$TMP_DOWNLOAD" -C "$TMP_DIR" --strip-components=1
-    
     mkdir -p $IS_CORE_DIR/bin $IS_CONF_DIR $IS_LOG_DIR
     
     systemctl stop $IS_CORE 2>/dev/null || true
     cp "$TMP_DIR/sing-box" "$IS_CORE_BIN"
     chmod +x "$IS_CORE_BIN"
     
-    # --- 脚本自身安装逻辑 (管道运行修复) ---
+    # 脚本安装
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
-        # 管道模式：下载脚本
         echo "正在下载管理脚本..."
         if download_file "$IS_SH_URL" "$IS_SH_BIN"; then
             chmod +x "$IS_SH_BIN"
             ln -sf "$IS_SH_BIN" "$IS_LINK_BIN"
         else
-            _yellow "脚本下载失败，'sb' 命令可能无法使用。"
+            _yellow "脚本下载失败"
         fi
     elif [[ "$current_path" != "$IS_SH_BIN" ]]; then
-        # 文件模式：复制脚本
         cp "$current_path" "$IS_SH_BIN"
         chmod +x "$IS_SH_BIN"
         ln -sf "$IS_SH_BIN" "$IS_LINK_BIN"
     fi
-    # ------------------------------------
 
     # Systemd
     cat > /etc/systemd/system/$IS_CORE.service <<EOF
@@ -278,36 +267,27 @@ EOF
     
     echo
     _green "安装完成!"
-    echo "版本: $version"
     echo "命令: sb"
     echo
 }
 
-# ==================== 卸载功能 (彻底清理) ====================
+# ==================== 卸载功能 ====================
 uninstall() {
     echo
     _yellow "警告: 即将卸载 Sing-box"
     read -rp "确认卸载? [y/N]: " confirm
     if [[ "${confirm,,}" == "y" ]]; then
-        # 1. 停止服务
         systemctl stop $IS_CORE 2>/dev/null || true
         systemctl disable $IS_CORE 2>/dev/null || true
-        
-        # 2. 删除服务文件
         rm -f /etc/systemd/system/$IS_CORE.service
         systemctl daemon-reload
         
-        # 3. 删除文件与配置
         rm -rf $IS_CORE_DIR
         rm -rf $IS_LOG_DIR
-        
-        # 4. 删除脚本与快捷指令
         rm -f "$IS_SH_BIN" "$IS_LINK_BIN"
-        
-        # 5. 删除缓存
         rm -f "$IS_VERSION_CACHE"
         
-        _green "Sing-box 已彻底卸载 (脚本已自毁)"
+        _green "Sing-box 已彻底卸载"
         exit 0
     else
         echo "已取消"
@@ -358,7 +338,7 @@ save_conf() {
     fi
     
     if ! $IS_CORE_BIN check -c "$IS_CONFIG_JSON" -C "$IS_CONF_DIR" >/dev/null 2>&1; then
-        _yellow "警告: sing-box 校验未通过 (可能是与其他配置端口冲突)"
+        _yellow "警告: 配置校验未通过 (可能是端口冲突)"
     fi
 
     if [ -f "$target_file" ]; then cp "$target_file" "${target_file}.bak"; fi
@@ -401,6 +381,20 @@ add() {
     fi
     if is_port_used "$is_port"; then err "端口被占用"; fi
     
+    # === 自定义名称逻辑 ===
+    local def_prefix="vless"
+    if [[ "$is_protocol" == "Shadowsocks" ]]; then def_prefix="ss"; fi
+    local def_name="${def_prefix}-${is_port}"
+    
+    read -rp "配置名称 (用于链接备注) [$def_name]: " input_name
+    is_conf_name=${input_name:-$def_name}
+    
+    if [[ ! "$is_conf_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _yellow "名称包含非法字符，将使用默认名称: $def_name"
+        is_conf_name="$def_name"
+    fi
+    # ===============================
+
     local uuid=$(cat /proc/sys/kernel/random/uuid)
     local sni="www.time.is"
     
@@ -408,7 +402,6 @@ add() {
         read -rp "UUID [$uuid]: " u; uuid=${u:-$uuid}
         read -rp "SNI [$sni]: " s; sni=${s:-$sni}
         
-        # 增加容错 || true
         local keys=$($IS_CORE_BIN generate reality-keypair)
         local pk=$(echo "$keys" | grep PrivateKey | awk '{print $2}' || true)
         local pub=$(echo "$keys" | grep PublicKey | awk '{print $2}' || true)
@@ -416,13 +409,11 @@ add() {
         
         if [[ -z "$pk" || -z "$pub" ]]; then err "密钥生成失败"; fi
 
-        is_conf_name="vless-$is_port"
         is_conf=$(jq -n --arg port "$is_port" --arg uuid "$uuid" --arg sni "$sni" --arg pk "$pk" --arg pub "$pub" --arg sid "$sid" --arg tag "$is_conf_name" \
                   '{inbounds: [{type: "vless", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{uuid: $uuid, flow: "xtls-rprx-vision"}], tls: {enabled: true, server_name: $sni, reality: {enabled: true, handshake: {server: $sni, server_port: 443}, private_key: $pk, short_id: [$sid]}}}], outbounds: [{type: "direct"}, {type: "direct", tag: ("public_key_"+$pub)}] }')
     else
         local method="2022-blake3-aes-128-gcm"
         local pass=$(openssl rand -base64 16)
-        is_conf_name="ss-$is_port"
         is_conf=$(jq -n --arg port "$is_port" --arg pass "$pass" --arg method "$method" --arg tag "$is_conf_name" \
                   '{inbounds: [{type: "shadowsocks", tag: $tag, listen: "::", listen_port: ($port|tonumber), method: $method, password: $pass}]}')
     fi
@@ -486,11 +477,15 @@ info_show() {
     local port=$(read_json_val "$path" '.inbounds[0].listen_port')
     local ip=$(get_ip)
     
+    # 提取备注名 (去掉 .json 后缀)
+    local remark="${is_conf_file%.*}"
+    
     echo
     echo "=== 配置: $is_conf_file ==="
     echo "类型: $type"
     echo "端口: $port"
     echo "IP  : $ip"
+    echo "备注: $remark"
     
     if [[ "$type" == "vless" ]]; then
         local uuid=$(read_json_val "$path" '.inbounds[0].users[0].uuid')
@@ -504,7 +499,7 @@ info_show() {
         echo "SID : $sid"
         echo
         echo "链接:"
-        echo "vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub&sid=$sid&type=tcp#sing-box"
+        echo "vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub&sid=$sid&type=tcp#$remark"
     elif [[ "$type" == "shadowsocks" ]]; then
         local method=$(read_json_val "$path" '.inbounds[0].method')
         local pass=$(read_json_val "$path" '.inbounds[0].password')
@@ -513,7 +508,7 @@ info_show() {
         echo "Pass  : $pass"
         echo
         echo "链接:"
-        echo "ss://$ss_str@$ip:$port#sing-box"
+        echo "ss://$ss_str@$ip:$port#$remark"
     fi
     echo
 }
@@ -589,7 +584,6 @@ show_menu() {
 # ==================== 入口 ====================
 if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
     check_root
-    # 移除启动时的 get_ip，改为需要时获取
     if [[ -n "${1:-}" ]]; then
         case "$1" in
             add) add ;;
