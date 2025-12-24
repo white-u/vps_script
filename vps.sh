@@ -13,7 +13,7 @@ _blue() { echo -e "\033[34m$@\033[0m"; }
 
 # 动态生成带时间戳的 URL，强制绕过 GitHub CDN 缓存
 # TS=$(date +%s)
-BASE_URL="https://raw.githubusercontent.com/white-u/vps_script/main"
+BASE_URL="https://raw.githubusercontent.com/white-u/vps_script/refs/heads/main"
 URL_PTM="${BASE_URL}/port-manage.sh"
 URL_SB="${BASE_URL}/sing-box.sh"
 URL_SNELL="${BASE_URL}/snell.sh"
