@@ -97,6 +97,37 @@ ensure_dependencies() {
     fi
 }
 
+# ==================== PTM 集成模块 ====================
+ptm_add_integration() {
+    local port=$1
+    local remark="Snell-Node"
+    if command -v ptm >/dev/null 2>&1; then
+        echo
+        echo -e "$(_blue_bg " 流量监控集成 ")"
+        read -rp "是否对 Snell 端口 ($port) 开启流量监控? [Y/n]: " enable_ptm
+        if [[ "${enable_ptm,,}" != "n" ]]; then
+             # Snell 比较简单，直接添加即可，或者也询问配额
+             read -rp "设置流量配额 (例如 100G, 留空不限): " quota
+             local cmd="ptm add $port --remark \"$remark\""
+             [ -n "$quota" ] && cmd+=" --quota $quota"
+             
+             if eval "$cmd" >/dev/null 2>&1; then
+                _green "✓ 已加入流量监控"
+             else
+                _yellow "⚠ 添加失败，请手动运行 ptm"
+             fi
+        fi
+    fi
+}
+
+ptm_del_integration() {
+    local port=$1
+    if command -v ptm >/dev/null 2>&1; then
+        ptm del "$port" >/dev/null 2>&1 || true
+    fi
+}
+# ====================================================
+
 # ==================== 网络请求 ====================
 curl_retry() {
     local attempt=1
@@ -389,6 +420,10 @@ EOF
 
     echo
     _green "安装完成!"
+
+    # [插入点] PTM 集成
+    ptm_add_integration "$port"
+
     echo
     echo "=== Surge 配置 ==="
     cat "$SNELL_CFGTXT"
@@ -423,12 +458,25 @@ update_snell() {
     fi
 }
 
-# ==================== 卸载功能 (全面增强版) ====================
+# ==================== 卸载功能 (集成 PTM 清理) ====================
 uninstall_snell() {
     echo
     _yellow "警告: 即将卸载 Snell"
     read -rp "确认卸载? [y/N]: " confirm
     if [[ "${confirm,,}" == "y" ]]; then
+        # === 新增: PTM 监控清理逻辑 (必须在删除配置前执行) ===
+        # 读取配置文件中的端口 (格式通常为 listen = ::0:12345)
+        if [ -f "$SNELL_CONF" ]; then
+            local port
+            port=$(grep -E '^listen' "$SNELL_CONF" 2>/dev/null | sed -E 's/.*:([0-9]+)$/\1/' || true)
+            
+            if [[ "$port" =~ ^[0-9]+$ ]] && command -v ptm >/dev/null 2>&1; then
+                echo "正在移除端口 $port 的监控..."
+                ptm del "$port" >/dev/null 2>&1 || true
+            fi
+        fi
+        # ====================================================
+
         # 1. 停止服务
         systemctl stop snell 2>/dev/null || true
         systemctl disable snell 2>/dev/null || true
@@ -441,19 +489,19 @@ uninstall_snell() {
         rm -f "$SNELL_BIN"
         rm -rf "$SNELL_DIR"
         
-        # 4. 删除日志 (补全)
+        # 4. 删除日志
         rm -f "$SNELL_LOG"
         
-        # 5. 删除脚本自身和缓存 (补全)
+        # 5. 删除脚本自身和缓存
         rm -f "$LOCAL_SCRIPT" "$LINK_BIN"
         rm -f "$VERSION_CACHE_FILE"
         
-        # 6. 删除用户 (补全)
+        # 6. 删除用户
         if id -u snell >/dev/null 2>&1; then
             userdel snell 2>/dev/null || true
         fi
         
-        _green "Snell 已彻底卸载 (脚本已自毁)"
+        _green "Snell 已彻底卸载 (监控规则已清理)"
         exit 0
     else
         echo "已取消"
@@ -507,6 +555,14 @@ menu() {
                   firewall_allow "$np"
                   update_config_txt
                   systemctl restart snell
+
+                  # [插入点] 
+                  ptm_del_integration "$old_port" # 删除旧监控
+                  firewall_allow "$np"
+                  update_config_txt
+                  systemctl restart snell
+                  ptm_add_integration "$np"       # 添加新监控 (会询问)
+
                   _green "端口已修改"
               else
                   _yellow "无效端口"

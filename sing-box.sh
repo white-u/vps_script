@@ -94,6 +94,42 @@ ensure_dependencies() {
     fi
 }
 
+# ==================== PTM 集成模块 ====================
+ptm_add_integration() {
+    local port=$1
+    local remark=$2
+    # 检测是否安装了 Port-Manage (ptm)
+    if command -v ptm >/dev/null 2>&1; then
+        echo
+        echo -e "$(_blue_bg " 流量监控集成 ")"
+        read -rp "是否将端口 $port 加入流量监控? [Y/n]: " enable_ptm
+        if [[ "${enable_ptm,,}" != "n" ]]; then
+            read -rp "设置流量配额 (例如 100G, 留空不限): " limit
+            read -rp "带宽限制 (例如 50Mbps, 留空不限): " rate
+            
+            local ptm_cmd="ptm add $port --remark \"$remark\""
+            [ -n "$limit" ] && ptm_cmd+=" --quota $limit"
+            [ -n "$rate" ] && ptm_cmd+=" --rate $rate"
+            
+            echo "正在应用监控规则..."
+            if eval "$ptm_cmd"; then
+                _green "✓ 已加入监控"
+            else
+                _yellow "⚠ 添加监控失败 (可能是 PTM 版本过旧)，请稍后手动运行 'ptm' 添加"
+            fi
+        fi
+    fi
+}
+
+ptm_del_integration() {
+    local port=$1
+    if command -v ptm >/dev/null 2>&1; then
+        ptm del "$port" >/dev/null 2>&1 || true
+    fi
+}
+# ====================================================
+
+
 # ==================== 网络请求 ====================
 curl_retry() {
     local attempt=1
@@ -253,19 +289,36 @@ EOF
     echo
 }
 
-# ==================== 卸载功能 ====================
+# ==================== 卸载功能 (集成 PTM 清理) ====================
 uninstall() {
     echo
     _yellow "警告: 即将卸载 Sing-box"
     read -rp "确认卸载? [y/N]: " confirm
     if [[ "${confirm,,}" == "y" ]]; then
+        # === 新增: PTM 监控清理逻辑 (必须在删除文件前执行) ===
+        if command -v ptm >/dev/null 2>&1 && [ -d "$IS_CONF_DIR" ]; then
+            # 提取所有配置文件中的端口号 (grep 查找 listen_port, awk 提取数字)
+            local ports
+            ports=$(grep -rh "listen_port" "$IS_CONF_DIR" 2>/dev/null | awk -F': ' '{print $2}' | tr -d ',' | tr -d '\r' || true)
+            
+            for p in $ports; do
+                if [[ "$p" =~ ^[0-9]+$ ]]; then
+                    echo "正在移除端口 $p 的监控..."
+                    ptm del "$p" >/dev/null 2>&1 || true
+                fi
+            done
+        fi
+        # ====================================================
+
         systemctl stop $IS_CORE 2>/dev/null || true
         systemctl disable $IS_CORE 2>/dev/null || true
         rm -f /etc/systemd/system/$IS_CORE.service
         systemctl daemon-reload
+        
         rm -rf $IS_CORE_DIR $IS_LOG_DIR
         rm -f "$IS_SH_BIN" "$IS_LINK_BIN" "$IS_VERSION_CACHE"
-        _green "Sing-box 已彻底卸载"
+        
+        _green "Sing-box 已彻底卸载 (监控规则已清理)"
         exit 0
     else
         echo "已取消"
@@ -395,6 +448,10 @@ add() {
     if save_conf; then
         firewall_allow "$is_port"
         systemctl restart $IS_CORE
+
+        # [插入点] PTM 集成：添加监控
+        ptm_add_integration "$is_port" "$is_conf_name"
+
         is_conf_file="$is_conf_name.json"
         info_show
     fi
@@ -437,7 +494,14 @@ del() {
         local port=$(read_json_val "$path" '.inbounds[0].listen_port')
         
         rm -f "$path"
-        if [ -n "$port" ] && [ "$port" != "null" ]; then firewall_remove "$port"; fi
+
+        if [ -n "$port" ] && [ "$port" != "null" ]; then 
+            firewall_remove "$port"
+            
+            # [插入点] PTM 集成：删除监控
+            ptm_del_integration "$port"
+        fi
+
         systemctl restart $IS_CORE
         _green "已删除: $file"
     else
