@@ -906,6 +906,42 @@ check_and_send_alerts() {
     done
 }
 
+# ==================== 卸载函数 (修复补充) ====================
+uninstall() {
+    echo -e "${YELLOW}正在卸载 Port-Manage...${NC}"
+    
+    # 1. 清理 TC 限制 (遍历所有已配置端口)
+    local ports=($(get_active_ports))
+    for port in "${ports[@]}"; do
+        remove_tc_limit "$port" 2>/dev/null || true
+    done
+
+    # 2. 清理 NFTables 规则
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
+    fi
+
+    # 3. 清理 Crontab 任务
+    # 移除所有包含当前脚本路径的任务
+    if command -v crontab >/dev/null 2>&1; then
+        local tmp=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "port-traffic-monitor.sh" | grep -v "ptm" > "$tmp" || true
+        # 如果文件不为空则导入，为空则清空
+        if [ -s "$tmp" ]; then
+            crontab "$tmp"
+        else
+            crontab -r 2>/dev/null || true
+        fi
+        rm -f "$tmp"
+    fi
+
+    # 4. 删除文件与配置
+    rm -f "/usr/local/bin/ptm" "/usr/local/bin/port-traffic-monitor.sh" "$SCRIPT_PATH"
+    rm -rf "$CONFIG_DIR"
+    
+    echo -e "${GREEN}Port-Manage 已彻底卸载。${NC}"
+}
+
 # ==================== CLI API 处理逻辑 (核心) ====================
 
 handle_cli_args() {
