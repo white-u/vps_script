@@ -956,9 +956,12 @@ handle_cli_args() {
             log_action "API" "del port $port"
             echo "Success: Port $port removed."
             exit 0 ;;
+        
+        # === 关键修复 ===
         uninstall)
             uninstall
             exit 0 ;;
+        # ================
     esac
 }
 
