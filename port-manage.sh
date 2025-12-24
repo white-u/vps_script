@@ -1,21 +1,20 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (全功能完整版 v3.0.0)
+# 端口流量监控脚本 (修复版 v3.0.1)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
-# 架构: 交互式菜单 + 命令行调用接口 (供Sing-box/Snell调用)
+# 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
 # ==================== 路径与常量配置 ====================
 
-# 自动识别运行方式
 if [[ "${0:-}" == "/dev/fd/"* ]] || [[ "${0:-}" == "/proc/"* ]] || [[ "${0:-}" == "bash" ]] || [[ "${0:-}" == /tmp/* ]]; then
     SCRIPT_PATH="/usr/local/bin/port-traffic-monitor.sh"
     REMOTE_INSTALL=true
@@ -49,6 +48,8 @@ readonly CONNECT_TIMEOUT=10
 readonly MAX_TIMEOUT=30
 readonly CURL_MAX_RETRIES=3
 readonly CURL_RETRY_DELAY=2
+readonly WGET_MAX_RETRIES=3
+readonly WGET_RETRY_DELAY=2
 
 # 流量单位
 readonly BYTES_PER_KB=1024
@@ -295,6 +296,8 @@ validate_remark() {
     return $VALID
 }
 
+# ==================== 网络请求 (修复: 补充download_file) ====================
+
 curl_with_retry() {
     local url=$1; shift; local count=0
     set +e
@@ -303,6 +306,31 @@ curl_with_retry() {
         count=$((count + 1)); [ $count -lt $CURL_MAX_RETRIES ] && sleep $CURL_RETRY_DELAY
     done
     set -e; return 1
+}
+
+wget_retry() {
+    local url=$1; shift; local count=0
+    set +e
+    while [ $count -lt $WGET_MAX_RETRIES ]; do
+        if wget --no-check-certificate --timeout=$CONNECT_TIMEOUT --tries=1 "$@" "$url"; then set -e; return 0; fi
+        count=$((count + 1)); [ $count -lt $WGET_MAX_RETRIES ] && sleep $WGET_RETRY_DELAY
+    done
+    set -e; return 1
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    
+    if command -v curl >/dev/null 2>&1; then
+        if curl_with_retry "$url" -o "$dest"; then return 0; fi
+    fi
+    
+    if command -v wget >/dev/null 2>&1; then
+        if wget_retry "$url" -O "$dest"; then return 0; fi
+    fi
+    
+    return 1
 }
 
 # ==================== 依赖与环境 ====================
@@ -1081,6 +1109,18 @@ check_update() {
         chmod +x "$TMP_SCRIPT"; mv "$TMP_SCRIPT" "$SCRIPT_PATH"
         echo "更新成功"; exit 0
     else echo "更新失败"; fi
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        if curl_with_retry "$url" -o "$dest"; then return 0; fi
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget_retry "$url" -O "$dest"; then return 0; fi
+    fi
+    return 1
 }
 
 create_shortcut() {
