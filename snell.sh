@@ -549,20 +549,23 @@ menu() {
            read -rp "修改端口(1) 或 PSK(2)? " sub
            backup_conf
            if [[ "$sub" == "1" ]]; then
+              # 1. 先获取旧端口 (用于解除监控)
+              local old_port=$(read_snell_conf "listen" | sed -E 's/.*:([0-9]+)$/\1/')
+              
               read -rp "新端口: " np
               if [[ "$np" =~ ^[0-9]+$ ]]; then
+                  # 2. 修改配置文件
                   sed -i -E "s/listen = .*:[0-9]+/listen = ::0:$np/" "$SNELL_CONF"
+                  
+                  # 3. 配置防火墙和系统服务
                   firewall_allow "$np"
                   update_config_txt
                   systemctl restart snell
-
-                  # [插入点] 
-                  ptm_del_integration "$old_port" # 删除旧监控
-                  firewall_allow "$np"
-                  update_config_txt
-                  systemctl restart snell
-                  ptm_add_integration "$np"       # 添加新监控 (会询问)
-
+                  
+                  # 4. PTM 集成：清理旧监控，添加新监控
+                  if [ -n "$old_port" ]; then ptm_del_integration "$old_port"; fi
+                  ptm_add_integration "$np"
+                  
                   _green "端口已修改"
               else
                   _yellow "无效端口"
