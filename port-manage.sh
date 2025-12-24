@@ -1172,18 +1172,6 @@ check_update() {
     else echo "更新失败"; fi
 }
 
-download_file() {
-    local url="$1"
-    local dest="$2"
-    if command -v curl >/dev/null 2>&1; then
-        if curl_with_retry "$url" -o "$dest"; then return 0; fi
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        if wget_retry "$url" -O "$dest"; then return 0; fi
-    fi
-    return 1
-}
-
 create_shortcut() {
     if [ ! -f "/usr/local/bin/$SHORTCUT_COMMAND" ] && [ -f "$SCRIPT_PATH" ]; then
         echo "#!/bin/bash" > "/usr/local/bin/$SHORTCUT_COMMAND"
