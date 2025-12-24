@@ -24,8 +24,8 @@ if command -v ptm >/dev/null 2>&1; then
     _green "✓ 端口流量监控已安装"
 else
     echo "正在安装 Port-Manage v3.0..."
-    # 调用远程脚本安装，带 --version 参数测试运行
-    bash <(curl -sL https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh) --version >/dev/null
+    # 移除 >/dev/null 以便在安装失败时看到报错
+    bash <(curl -sL https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh) --version
     
     if command -v ptm >/dev/null 2>&1; then
         _green "✓ Port-Manage 安装成功"
