@@ -40,7 +40,7 @@ else
     echo "下载地址: $URL_PTM"
     
     # 使用 -L (重定向) -f (失败报错) --progress-bar (进度条)
-    if bash <(curl -L -f --progress-bar "$URL_PTM") --version; then
+    if bash <(curl -L -f --progress-bar "$URL_PTM") install; then
         echo
         if command -v ptm >/dev/null 2>&1; then
             _green "✓ Port-Manage 安装成功"

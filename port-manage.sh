@@ -956,7 +956,26 @@ handle_cli_args() {
             log_action "API" "del port $port"
             echo "Success: Port $port removed."
             exit 0 ;;
-        
+        install)
+            check_root
+            check_dependencies
+            init_config
+            
+            echo "正在将 PTM 安装到系统路径..."
+            # 强制下载最新版到系统目录
+            if download_file "$UPDATE_URL" "/usr/local/bin/port-traffic-monitor.sh"; then
+                chmod +x "/usr/local/bin/port-traffic-monitor.sh"
+                ln -sf "/usr/local/bin/port-traffic-monitor.sh" "/usr/local/bin/ptm"
+                
+                # 创建必要的配置文件
+                [ ! -f "$CONFIG_FILE" ] && echo '{"ports":{},"nftables":{"table_name":"port_monitor","family":"inet"},"telegram":{"enabled":false},"logging":{"level":"info"}}' > "$CONFIG_FILE"
+                
+                log_success "PTM 安装成功！可以直接输入 'ptm' 使用。"
+            else
+                echo -e "${RED}下载失败，无法完成安装。${NC}"
+                exit 1
+            fi
+            exit 0 ;;
         # === 关键修复 ===
         uninstall)
             uninstall
