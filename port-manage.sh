@@ -1,19 +1,20 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 v2.5.5
+# 端口流量监控脚本 (健壮增强版 v2.6.0)
 # 功能: 流量监控、速率限制、流量配额、阈值告警、Telegram通知、突发速率保护
-# 改进: 并发安全、边界处理、日志系统、输入校验、在线更新
+# 改进: 引入 set -euo pipefail 严格模式、原子更新机制、增强 grep/jq 容错
 # ============================================================================
 
-set -o pipefail
+set -euo pipefail
+IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="2.5.5"
+readonly SCRIPT_VERSION="2.6.0"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
 # 处理通过 bash <(curl ...) 或临时文件执行的情况
-if [[ "$0" == "/dev/fd/"* ]] || [[ "$0" == "/proc/"* ]] || [[ "$0" == "bash" ]] || [[ "$0" == /tmp/* ]]; then
+if [[ "${0:-}" == "/dev/fd/"* ]] || [[ "${0:-}" == "/proc/"* ]] || [[ "${0:-}" == "bash" ]] || [[ "${0:-}" == /tmp/* ]]; then
     SCRIPT_PATH="/usr/local/bin/port-traffic-monitor.sh"
     REMOTE_INSTALL=true
 else
@@ -29,6 +30,9 @@ readonly BURST_STATE_FILE="$CONFIG_DIR/burst_state.json"
 readonly TRAFFIC_HISTORY_DIR="$CONFIG_DIR/traffic_history"
 readonly LOCK_FILE="$CONFIG_DIR/.lock"
 readonly LOG_FILE="$CONFIG_DIR/ptm.log"
+
+# 临时文件 (用于更新)
+readonly TMP_SCRIPT="/tmp/ptm_update.sh"
 
 readonly RED='\033[0;31m'
 readonly YELLOW='\033[0;33m'
@@ -55,9 +59,6 @@ readonly BYTES_PER_TB=1099511627776
 # 速率转换常量
 readonly KBPS_PER_MBPS=1000
 readonly KBPS_PER_GBPS=1000000
-
-# nftables 操作常量
-readonly MAX_NFT_DELETE_ITERATIONS=50
 
 # TC 带宽控制常量
 readonly BURST_CALC_DIVISOR=20
@@ -96,6 +97,7 @@ readonly INVALID=1
 readonly MAX_REASONABLE_BYTES=$((100 * BYTES_PER_TB))  # 100TB
 readonly MAX_REASONABLE_RATE_KBPS=$((100 * KBPS_PER_GBPS))  # 100Gbps
 
+# 全局变量初始化
 NFT_TABLE=""
 NFT_FAMILY=""
 CURRENT_LOG_LEVEL=$LOG_LEVEL_INFO
@@ -110,7 +112,7 @@ init_logging() {
     # 从配置读取日志级别
     if [ -f "$CONFIG_FILE" ]; then
         local level
-        level=$(jq -r '.logging.level // "info"' "$CONFIG_FILE" 2>/dev/null) || level="info"
+        level=$(jq -r '.logging.level // "info"' "$CONFIG_FILE" 2>/dev/null || echo "info")
         case "$level" in
             debug) CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG ;;
             info)  CURRENT_LOG_LEVEL=$LOG_LEVEL_INFO ;;
@@ -153,7 +155,7 @@ _log_write() {
     timestamp=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
     local log_line="[$timestamp] [$level_name] $message"
     
-    echo "$log_line" >> "$LOG_FILE" 2>/dev/null
+    echo "$log_line" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_debug() {
@@ -219,6 +221,8 @@ with_file_lock() {
     
     (
         local count=0
+        # 使用 set +e 防止 flock 失败导致子 shell 退出
+        set +e
         while ! (set -C; echo $$ > "$lock_file") 2>/dev/null; do
             if [ -f "$lock_file" ]; then
                 local pid
@@ -236,6 +240,7 @@ with_file_lock() {
                 sleep 0.1
             fi
         done
+        set -e
         
         trap "rm -f '$lock_file'" EXIT
         "$@"
@@ -252,6 +257,8 @@ acquire_lock() {
 
     mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 
+    # set +e 保护循环条件
+    set +e
     while ! (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; do
         if [ -f "$LOCK_FILE" ]; then
             local pid
@@ -260,6 +267,7 @@ acquire_lock() {
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 count=$((count + 1))
                 if [ $count -ge $timeout ]; then
+                    set -e
                     return 1
                 fi
                 sleep 1
@@ -270,6 +278,7 @@ acquire_lock() {
             sleep 0.1
         fi
     done
+    set -e
 
     return 0
 }
@@ -468,30 +477,6 @@ validate_remark() {
     return $VALID
 }
 
-validate_burst_config() {
-    local burst_rate=$1
-    local burst_window=$2
-    local throttle_rate=$3
-    local throttle_duration=$4
-    
-    validate_rate "$burst_rate" || return $INVALID
-    validate_rate "$throttle_rate" || return $INVALID
-    
-    [[ ! "$burst_window" =~ ^[0-9]+$ ]] && return $INVALID
-    [ "$burst_window" -lt 1 ] && return $INVALID
-    [ "$burst_window" -gt 1440 ] && return $INVALID
-    
-    [[ ! "$throttle_duration" =~ ^[0-9]+$ ]] && return $INVALID
-    [ "$throttle_duration" -lt 1 ] && return $INVALID
-    [ "$throttle_duration" -gt 1440 ] && return $INVALID
-    
-    local burst_kbps=$(parse_rate_to_kbps "$burst_rate")
-    local throttle_kbps=$(parse_rate_to_kbps "$throttle_rate")
-    [ "$throttle_kbps" -ge "$burst_kbps" ] && return $INVALID
-    
-    return $VALID
-}
-
 # ============================================================================
 # 网络请求重试
 # ============================================================================
@@ -501,8 +486,11 @@ curl_with_retry() {
     shift
     local retry_count=0
 
+    # set +e 允许 curl 失败
+    set +e
     while [ $retry_count -lt $CURL_MAX_RETRIES ]; do
         if curl -s --connect-timeout $CONNECT_TIMEOUT --max-time $MAX_TIMEOUT "$@" "$url"; then
+            set -e
             return 0
         fi
         retry_count=$((retry_count + 1))
@@ -510,6 +498,7 @@ curl_with_retry() {
             sleep $CURL_RETRY_DELAY
         fi
     done
+    set -e
     return 1
 }
 
@@ -545,7 +534,7 @@ install_missing_tools() {
 
     case $system_type in
         "debian")
-            apt-get update -qq 2>/dev/null
+            apt-get update -qq 2>/dev/null || true
             for tool in "${missing_tools[@]}"; do
                 case $tool in
                     "nft") apt-get install -y nftables >/dev/null 2>&1 ;;
@@ -628,8 +617,8 @@ check_root() {
 load_nft_config() {
     [ -n "$NFT_TABLE" ] && return
     if [ -f "$CONFIG_FILE" ]; then
-        NFT_TABLE=$(jq -r '.nftables.table_name // "port_monitor"' "$CONFIG_FILE" 2>/dev/null) || NFT_TABLE="port_monitor"
-        NFT_FAMILY=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE" 2>/dev/null) || NFT_FAMILY="inet"
+        NFT_TABLE=$(jq -r '.nftables.table_name // "port_monitor"' "$CONFIG_FILE" 2>/dev/null || echo "port_monitor")
+        NFT_FAMILY=$(jq -r '.nftables.family // "inet"' "$CONFIG_FILE" 2>/dev/null || echo "inet")
     else
         NFT_TABLE="port_monitor"
         NFT_FAMILY="inet"
@@ -677,6 +666,7 @@ _remove_nft_mark_rules() {
     local handle
     
     # 查找带有指定 comment 的规则 handle
+    # grep 可能返回空，|| true 防止 set -e 退出
     nft -a list chain $NFT_FAMILY $NFT_TABLE "$chain" 2>/dev/null | \
         grep "tc_mark_${mark_id}_" | \
         grep -oE 'handle [0-9]+' | awk '{print $2}' | \
@@ -690,7 +680,7 @@ _remove_nft_mark_rules() {
 # ============================================================================
 
 get_default_interface() {
-    ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+    ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || echo "$DEFAULT_INTERFACE"
 }
 
 format_bytes() {
@@ -771,10 +761,10 @@ normalize_size() {
 
 parse_size_to_bytes() {
     local size_str=$1
-    local number=$(echo "$size_str" | grep -oE '^[0-9]+\.?[0-9]*')
-    local unit=$(echo "$size_str" | grep -oE '[A-Za-z]+$' | tr '[:lower:]' '[:upper:]')
+    local number=$(echo "$size_str" | grep -oE '^[0-9]+\.?[0-9]*' || echo "")
+    local unit=$(echo "$size_str" | grep -oE '[A-Za-z]+$' | tr '[:lower:]' '[:upper:]' || echo "")
 
-    [ -z "$number" ] && echo "0" && return 1
+    [ -z "$number" ] && echo "0" && return
 
     local multiplier=0
     case $unit in
@@ -782,7 +772,7 @@ parse_size_to_bytes() {
         "MB"|"M") multiplier=$BYTES_PER_MB ;;
         "GB"|"G") multiplier=$BYTES_PER_GB ;;
         "TB"|"T") multiplier=$BYTES_PER_TB ;;
-        *) echo "0" && return 1 ;;
+        *) echo "0" && return ;;
     esac
 
     echo "scale=0; $number * $multiplier / 1" | bc
@@ -791,7 +781,7 @@ parse_size_to_bytes() {
 parse_rate_to_kbps() {
     local rate=$1
     local rate_lower=$(echo "$rate" | tr '[:upper:]' '[:lower:]')
-    local number=$(echo "$rate_lower" | grep -oE '^[0-9]+')
+    local number=$(echo "$rate_lower" | grep -oE '^[0-9]+' || echo "")
     
     [ -z "$number" ] && echo "0" && return
     
@@ -806,7 +796,7 @@ get_timestamp() { date +%s; }
 
 jq_safe() {
     local result
-    result=$(jq -r "$1" "$2" 2>/dev/null) || result=""
+    result=$(jq -r "$1" "$2" 2>/dev/null || echo "")
     [ -z "$result" ] || [ "$result" = "null" ] && echo "${3:-}" || echo "$result"
 }
 
@@ -819,7 +809,7 @@ get_active_ports() {
         else
             printf "%05d-%s\n" "$port" "$port"
         fi
-    done | sort -n | cut -d'-' -f2-
+    done | sort -n | cut -d'-' -f2- || true
 }
 
 is_port_range() { [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; }
@@ -862,8 +852,8 @@ get_port_traffic() {
     local port_safe=$(get_port_safe "$port")
 
     local input_raw output_raw
-    input_raw=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
-    output_raw=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
+    input_raw=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_in" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}' || echo "0")
+    output_raw=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${port_safe}_out" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}' || echo "0")
     
     local input_bytes=$(safe_parse_int "$input_raw" 0)
     local output_bytes=$(safe_parse_int "$output_raw" 0)
@@ -884,7 +874,7 @@ calculate_total_traffic() {
 
 save_traffic_data() {
     local active_ports
-    active_ports=($(get_active_ports 2>/dev/null)) || return 0
+    active_ports=($(get_active_ports 2>/dev/null || echo "")) || return 0
     [ ${#active_ports[@]} -eq 0 ] && return 0
 
     local json_data="{"
@@ -909,7 +899,7 @@ setup_exit_hooks() {
 
 restore_monitoring_if_needed() {
     local active_ports
-    active_ports=($(get_active_ports 2>/dev/null)) || return 0
+    active_ports=($(get_active_ports 2>/dev/null || echo "")) || return 0
     [ ${#active_ports[@]} -eq 0 ] && return 0
 
     for port in "${active_ports[@]}"; do
@@ -967,7 +957,7 @@ _record_snapshot_internal() {
     
     if [ -f "$history_file" ]; then
         local last_line
-        last_line=$(tail -n 1 "$history_file" 2>/dev/null)
+        last_line=$(tail -n 1 "$history_file" 2>/dev/null || echo "")
         if [ -n "$last_line" ]; then
             local last_ts last_bytes
             read -r last_ts last_bytes <<< "$last_line"
@@ -975,9 +965,9 @@ _record_snapshot_internal() {
             last_ts=$(safe_parse_int "$last_ts" 0)
             last_bytes=$(safe_parse_int "$last_bytes" 0)
             
-            [ "$timestamp" -le "$last_ts" ] 2>/dev/null && return
-            
-            if [ "$total" -lt "$last_bytes" ] 2>/dev/null; then
+            # set -e 保护: 算术比较可能失败
+            if [ "$timestamp" -le "$last_ts" ]; then return; fi
+            if [ "$total" -lt "$last_bytes" ]; then
                 echo "$timestamp $total" > "$history_file"
                 return
             fi
@@ -1170,7 +1160,7 @@ remove_nftables_rules() {
     local port_safe=$(get_port_safe "$port")
 
     local nft_output
-    nft_output=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null) || return
+    nft_output=$(nft -a list table $NFT_FAMILY $NFT_TABLE 2>/dev/null || echo "")
 
     local chain="" handle
     while IFS= read -r line; do
@@ -1882,7 +1872,7 @@ telegram_test() {
     local result=$(curl -s --connect-timeout $CONNECT_TIMEOUT --max-time $MAX_TIMEOUT \
         "https://api.telegram.org/bot${bot_token}/sendMessage" \
         -d "chat_id=${chat_id}" -d "text=🔔 端口流量监控测试消息 - $(get_beijing_time '+%Y-%m-%d %H:%M:%S')" 2>&1)
-    echo "$result" | grep -q '"ok":true'
+    echo "$result" | grep -q '"ok":true' || true
 }
 
 format_status_message() {
@@ -2025,7 +2015,7 @@ add_port() {
     local system_ports="20|21|22|23|25|53|67|68|80|110|143|443|465|546|587|993|995|3306|5432|6379"
     echo -e "${GREEN}当前系统监听端口 (已过滤常用端口):${NC}"
     local ports_list=$(ss -tulnp 2>/dev/null | grep -E "LISTEN|UNCONN" | awk '{print $5}' | \
-        grep -oE '[0-9]+$' | sort -nu | grep -vE "^($system_ports)$" | head -20 | tr '\n' ' ')
+        grep -oE '[0-9]+$' | sort -nu | grep -vE "^($system_ports)$" | head -20 | tr '\n' ' ' || echo "")
     [ -n "$ports_list" ] && echo "$ports_list" || echo -e "${YELLOW}无可用端口${NC}"
     echo
 
@@ -2823,7 +2813,7 @@ check_update() {
     
     # 获取远程版本
     local remote_script
-    remote_script=$(curl -s --connect-timeout 10 --max-time 30 "$UPDATE_URL" 2>/dev/null)
+    remote_script=$(curl -s --connect-timeout 10 --max-time 30 "$UPDATE_URL" 2>/dev/null || echo "")
     
     if [ -z "$remote_script" ]; then
         echo -e "${RED}✗ 无法连接更新服务器${NC}"
@@ -2832,7 +2822,7 @@ check_update() {
     fi
     
     local remote_version
-    remote_version=$(echo "$remote_script" | grep -m1 "^readonly SCRIPT_VERSION=" | cut -d'"' -f2)
+    remote_version=$(echo "$remote_script" | grep -m1 "^readonly SCRIPT_VERSION=" | cut -d'"' -f2 || echo "")
     
     if [ -z "$remote_version" ]; then
         echo -e "${RED}✗ 无法获取远程版本号${NC}"
@@ -2863,8 +2853,10 @@ check_update() {
                 cp "$SCRIPT_PATH" "${SCRIPT_PATH}.bak.${SCRIPT_VERSION}" 2>/dev/null && \
                     echo -e "${GREEN}✓ 已备份到 ${SCRIPT_PATH}.bak.${SCRIPT_VERSION}${NC}"
                 
+                # 原子更新逻辑
                 echo -e "下载新版本..."
-                if echo "$remote_script" > "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
+                if echo "$remote_script" > "$TMP_SCRIPT" && chmod +x "$TMP_SCRIPT"; then
+                    mv "$TMP_SCRIPT" "$SCRIPT_PATH"
                     echo -e "${GREEN}✓ 更新成功!${NC}"
                     echo -e "${YELLOW}请重新运行脚本以使用新版本${NC}"
                     log_action "SYSTEM" "updated from v$SCRIPT_VERSION to v$remote_version"
@@ -2872,7 +2864,7 @@ check_update() {
                     exit 0
                 else
                     echo -e "${RED}✗ 更新失败，正在恢复...${NC}"
-                    cp "${SCRIPT_PATH}.bak.${SCRIPT_VERSION}" "$SCRIPT_PATH" 2>/dev/null
+                    rm -f "$TMP_SCRIPT"
                     sleep 2
                 fi
             fi
@@ -2894,12 +2886,12 @@ uninstall() {
     log_action "SYSTEM" "uninstall started"
 
     local port
-    for port in $(get_active_ports); do
+    # 使用 || true 防止 get_active_ports 为空时出错
+    for port in $(get_active_ports 2>/dev/null || echo ""); do
         remove_nftables_rules "$port"
         remove_quota "$port"
         remove_tc_limit "$port"
         remove_reset_cron "$port"
-        
     done
 
     remove_notify_cron
@@ -2926,12 +2918,11 @@ create_shortcut() {
         echo -e "${YELLOW}首次运行，正在安装脚本...${NC}"
         
         local script_content
-        script_content=$(cat "$0" 2>/dev/null) || script_content=""
+        script_content=$(cat "$0" 2>/dev/null || echo "")
         
         if [ -z "$script_content" ]; then
-            local download_url="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
             echo "正在从 GitHub 下载..."
-            if curl -fsSL "$download_url" -o "$SCRIPT_PATH" 2>/dev/null; then
+            if download_file "$UPDATE_URL" "$SCRIPT_PATH"; then
                 chmod +x "$SCRIPT_PATH"
                 log_success "脚本已安装到 $SCRIPT_PATH"
             else
