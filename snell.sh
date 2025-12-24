@@ -600,6 +600,7 @@ if [ -n "${1:-}" ]; then
     case "$1" in
         start|stop|restart|status) systemctl "$1" snell ;;
         install) install_snell ;;
+        uninstall) uninstall_snell ;; # <--- 新增这一行
         *) menu ;;
     esac
 else
