@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.1"
+readonly SCRIPT_VERSION="3.0.2"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -349,7 +349,12 @@ download_file() {
 
 # ==================== 依赖与环境 ====================
 
-check_root() { [ "$EUID" -ne 0 ] && { echo -e "${RED}错误：需要 root 权限${NC}"; exit 1; } }
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}错误：需要 root 权限${NC}"
+        exit 1
+    fi
+}
 
 check_dependencies() {
     local missing=()
@@ -386,8 +391,8 @@ init_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"ports":{},"nftables":{"table_name":"port_monitor","family":"inet"},"telegram":{"enabled":false},"logging":{"level":"info"}}' > "$CONFIG_FILE"
     fi
-    [ ! -f "$ALERT_STATE_FILE" ] && echo '{}' > "$ALERT_STATE_FILE"
-    [ ! -f "$BURST_STATE_FILE" ] && echo '{}' > "$BURST_STATE_FILE"
+    [ ! -f "$ALERT_STATE_FILE" ] && echo '{}' > "$ALERT_STATE_FILE" || true
+    [ ! -f "$BURST_STATE_FILE" ] && echo '{}' > "$BURST_STATE_FILE" || true
     
     init_logging; load_nft_config
     nft add table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
@@ -756,7 +761,7 @@ remove_quota() {
 }
 
 # TC 相关
-init_tc_class_ids() { [ ! -f "$TC_CLASS_ID_FILE" ] && echo '{"next_id": 256, "mappings": {}}' > "$TC_CLASS_ID_FILE"; }
+init_tc_class_ids() { [ ! -f "$TC_CLASS_ID_FILE" ] && echo '{"next_id": 256, "mappings": {}}' > "$TC_CLASS_ID_FILE" || true; }
 get_tc_class_id() {
     local port=$1; init_tc_class_ids
     local id=$(jq -r ".mappings.\"$port\" // empty" "$TC_CLASS_ID_FILE" 2>/dev/null)
@@ -768,8 +773,10 @@ get_tc_class_id() {
     printf "1:%x" "$id"
 }
 release_tc_class_id() {
-    local port=$1; [ ! -f "$TC_CLASS_ID_FILE" ] && return
-    local tmp=$(mktemp); jq "del(.mappings.\"$port\")" "$TC_CLASS_ID_FILE" > "$tmp" && mv "$tmp" "$TC_CLASS_ID_FILE"
+    local port=$1
+    [ ! -f "$TC_CLASS_ID_FILE" ] && return 0
+    local tmp=$(mktemp)
+    jq "del(.mappings.\"$port\")" "$TC_CLASS_ID_FILE" > "$tmp" && mv "$tmp" "$TC_CLASS_ID_FILE"
 }
 calculate_burst() {
     local kbps=$1; local b=$((kbps * 125 / BURST_CALC_DIVISOR)); [ $b -lt $MIN_BURST_BYTES ] && b=$MIN_BURST_BYTES
@@ -1118,22 +1125,31 @@ handle_cli_args() {
             echo "Success: Port $port removed."
             return 0 ;;
         install)
+            echo ">>> PTM v${SCRIPT_VERSION} 安装中..."
+
             check_root
+            echo "  [1/4] 权限检查通过"
+
             check_dependencies
+            echo "  [2/4] 依赖检查通过"
+
             init_config
-            
-            echo "正在将 PTM 安装到系统路径..."
-            # 强制下载最新版到系统目录
-            if download_file "$UPDATE_URL" "/usr/local/bin/port-traffic-monitor.sh"; then
+            echo "  [3/4] 配置初始化完成"
+
+            echo "  [4/4] 正在下载脚本..."
+            # 强制下载最新版到系统目录 (加时间戳绕过CDN缓存)
+            local install_url="${UPDATE_URL}?t=$(date +%s)"
+            if download_file "$install_url" "/usr/local/bin/port-traffic-monitor.sh"; then
                 chmod +x "/usr/local/bin/port-traffic-monitor.sh"
                 ln -sf "/usr/local/bin/port-traffic-monitor.sh" "/usr/local/bin/ptm"
-                
-                # 创建必要的配置文件
+
+                # 确保配置文件存在
                 [ ! -f "$CONFIG_FILE" ] && echo '{"ports":{},"nftables":{"table_name":"port_monitor","family":"inet"},"telegram":{"enabled":false},"logging":{"level":"info"}}' > "$CONFIG_FILE"
-                
-                log_success "PTM 安装成功！可以直接输入 'ptm' 使用。"
+
+                echo -e "${GREEN}✓ PTM v${SCRIPT_VERSION} 安装成功！${NC}"
+                echo "  使用 'ptm' 命令打开面板"
             else
-                echo -e "${RED}下载失败，无法完成安装。${NC}"
+                echo -e "${RED}✗ 下载失败，无法完成安装。${NC}"
                 return 1
             fi
             return 0 ;;
