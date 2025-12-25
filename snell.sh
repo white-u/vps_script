@@ -106,13 +106,10 @@ ptm_add_integration() {
         echo -e "$(_blue_bg " 流量监控集成 ")"
         read -rp "是否对 Snell 端口 ($port) 开启流量监控? [Y/n]: " enable_ptm
         if [[ "${enable_ptm,,}" != "n" ]]; then
-            read -rp "设置流量配额 (例如 100G, 留空不限): " quota
-
-            # 直接调用 ptm，避免 eval
-            if [ -n "$quota" ]; then
-                ptm add "$port" --remark "$remark" --quota "$quota" && _green "✓ 已加入流量监控" || _yellow "⚠ 添加失败"
+            if ptm add "$port" --remark "$remark"; then
+                _green "✓ 已加入流量监控"
             else
-                ptm add "$port" --remark "$remark" && _green "✓ 已加入流量监控" || _yellow "⚠ 添加失败"
+                _yellow "⚠ 添加失败"
             fi
         fi
     fi

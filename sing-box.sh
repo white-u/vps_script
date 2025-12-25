@@ -98,25 +98,15 @@ ensure_dependencies() {
 ptm_add_integration() {
     local port=$1
     local remark=${2:-"Sing-box"}
-    # 检测是否安装了 Port-Manage (ptm)
     if command -v ptm >/dev/null 2>&1; then
         echo
         echo -e "$(_blue_bg " 流量监控集成 ")"
         read -rp "是否将端口 $port 加入流量监控? [Y/n]: " enable_ptm
         if [[ "${enable_ptm,,}" != "n" ]]; then
-            read -rp "设置流量配额 (例如 100G, 留空不限): " limit
-            read -rp "带宽限制 (例如 50Mbps, 留空不限): " rate
-
-            echo "正在应用监控规则..."
-            # 直接调用 ptm，避免 eval
-            local args=("$port" --remark "$remark")
-            [ -n "$limit" ] && args+=(--quota "$limit")
-            [ -n "$rate" ] && args+=(--rate "$rate")
-
-            if ptm add "${args[@]}"; then
+            if ptm add "$port" --remark "$remark"; then
                 _green "✓ 已加入监控"
             else
-                _yellow "⚠ 添加监控失败，请手动运行 'ptm'"
+                _yellow "⚠ 添加失败"
             fi
         fi
     fi
