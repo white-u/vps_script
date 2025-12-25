@@ -357,9 +357,15 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         echo -e "${YELLOW}自动安装依赖: ${missing[*]}${NC}"
         if [ -f /etc/debian_version ]; then
-            apt-get update -qq && apt-get install -y nftables iproute2 jq bc curl util-linux
+            apt-get update -qq || true
+            apt-get install -y nftables iproute2 jq bc curl util-linux || {
+                echo -e "${RED}依赖安装失败${NC}"; exit 1
+            }
         elif [ -f /etc/redhat-release ]; then
-            yum install -y epel-release && yum install -y nftables iproute jq bc curl util-linux
+            yum install -y epel-release || true
+            yum install -y nftables iproute jq bc curl util-linux || {
+                echo -e "${RED}依赖安装失败${NC}"; exit 1
+            }
         else
             echo -e "${RED}请手动安装: ${missing[*]}${NC}"; exit 1
         fi
