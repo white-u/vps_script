@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.6"
+readonly SCRIPT_VERSION="3.0.7"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -586,12 +586,17 @@ remove_nftables_rules() {
 
 get_port_traffic() {
     local ps=$(get_port_safe "$1")
-    local in=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${ps}_in" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}' || echo "0")
-    local out=$(nft list counter $NFT_FAMILY $NFT_TABLE "port_${ps}_out" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}' || echo "0")
-    in=$(safe_parse_int "$in" 0); out=$(safe_parse_int "$out" 0)
-    [ "$in" -lt 0 ] || [ "$in" -gt "$MAX_REASONABLE_BYTES" ] && in=0
-    [ "$out" -lt 0 ] || [ "$out" -gt "$MAX_REASONABLE_BYTES" ] && out=0
-    echo "$in $out"
+    local in_bytes out_bytes
+
+    # 读取入站流量
+    in_bytes=$(nft list counter inet port_monitor "port_${ps}_in" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
+    [ -z "$in_bytes" ] && in_bytes=0
+
+    # 读取出站流量
+    out_bytes=$(nft list counter inet port_monitor "port_${ps}_out" 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{print $2}')
+    [ -z "$out_bytes" ] && out_bytes=0
+
+    echo "$in_bytes $out_bytes"
 }
 
 calculate_total_traffic() { [ "${3:-single}" = "double" ] && echo $(($1 + $2)) || echo $2; }
