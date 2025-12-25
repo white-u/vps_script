@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.2"
+readonly SCRIPT_VERSION="3.0.3"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -188,7 +188,13 @@ acquire_lock() {
 }
 
 release_lock() {
-    [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null || echo "")" = "$$" ] && rm -f "$LOCK_FILE"
+    if [ -f "$LOCK_FILE" ]; then
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [ "$pid" = "$$" ]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
 }
 
 atomic_write() {
@@ -1144,20 +1150,27 @@ handle_cli_args() {
                 ln -sf "/usr/local/bin/port-traffic-monitor.sh" "/usr/local/bin/ptm"
 
                 # 确保配置文件存在
-                [ ! -f "$CONFIG_FILE" ] && echo '{"ports":{},"nftables":{"table_name":"port_monitor","family":"inet"},"telegram":{"enabled":false},"logging":{"level":"info"}}' > "$CONFIG_FILE"
+                if [ ! -f "$CONFIG_FILE" ]; then
+                    echo '{"ports":{},"nftables":{"table_name":"port_monitor","family":"inet"},"telegram":{"enabled":false},"logging":{"level":"info"}}' > "$CONFIG_FILE"
+                fi
 
                 echo -e "${GREEN}✓ PTM v${SCRIPT_VERSION} 安装成功！${NC}"
                 echo "  使用 'ptm' 命令打开面板"
+                # 清理 trap 并直接退出，避免 set -e 与 EXIT trap 冲突
+                trap - EXIT
+                exit 0
             else
                 echo -e "${RED}✗ 下载失败，无法完成安装。${NC}"
-                return 1
+                trap - EXIT
+                exit 1
             fi
-            return 0 ;;
+            ;;
         uninstall)
             check_root
             load_nft_config
             uninstall
-            return 0 ;;
+            trap - EXIT 2>/dev/null || true
+            exit 0 ;;
         # ================
     esac
 }
