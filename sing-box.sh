@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.8.3"
+SCRIPT_VERSION="v2.8.4"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -299,7 +299,12 @@ EOF
 uninstall() {
     echo
     _yellow "警告: 即将卸载 Sing-box"
-    read -rp "确认卸载? [y/N]: " confirm
+
+    local confirm="y"
+    if [ "$NONINTERACTIVE" != true ]; then
+        read -rp "确认卸载? [y/N]: " confirm
+    fi
+
     if [[ "${confirm,,}" == "y" ]]; then
         # === 新增: PTM 监控清理逻辑 (必须在删除文件前执行) ===
         if command -v ptm >/dev/null 2>&1 && [ -d "$IS_CONF_DIR" ]; then
@@ -776,10 +781,14 @@ show_menu() {
 # ==================== 入口 ====================
 check_root
 
+# 非交互模式标志
+NONINTERACTIVE=false
+
 # 先处理命令行参数
 if [[ -n "${1:-}" ]]; then
     case "$1" in
         install)
+            NONINTERACTIVE=true
             if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
                 _green "Sing-box 已安装"
             else
@@ -788,6 +797,7 @@ if [[ -n "${1:-}" ]]; then
             exit 0
             ;;
         uninstall)
+            NONINTERACTIVE=true
             if [ -f "$IS_SH_BIN" ] || [ -d "$IS_CORE_DIR" ]; then
                 uninstall
             else

@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.4"
+SCRIPT_VERSION="v2.8.0"
 FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
@@ -306,25 +306,12 @@ install_snell() {
     check_root
     ensure_dependencies
     detect_latest_version
-    
+
     local arch; arch=$(map_arch)
     if [ "$arch" = "unsupported" ]; then err "不支持的架构: $(uname -m)"; fi
 
     echo
-    _green ">>> 准备安装 Snell v${VERSION} (${arch})"
-    
-    local default_name; default_name=$(uname -n)
-    read -rp "请输入节点名称 [${default_name}]: " node_name
-    node_name=${node_name:-$default_name}
-
-    local port=$(rand_port)
-    read -rp "请输入端口 [${port}]: " user_port
-    port=${user_port:-$port}
-    
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        err "端口无效"
-    fi
-    if is_port_used "$port"; then err "端口被占用"; fi
+    _green ">>> 正在安装 Snell v${VERSION} (${arch})"
 
     # 下载
     local url="${DL_BASE}/snell-server-v${VERSION}-linux-${arch}.zip"
@@ -332,55 +319,99 @@ install_snell() {
     if ! download_file "$url" "$TMP_DOWNLOAD"; then
         err "下载失败"
     fi
-    
+
     # 校验
     if ! unzip -t "$TMP_DOWNLOAD" >/dev/null 2>&1; then
         err "文件校验失败"
     fi
-    
-    # 安装
+
+    # 安装二进制
     systemctl stop snell 2>/dev/null || true
     if ! unzip -o "$TMP_DOWNLOAD" -d /usr/local/bin >/dev/null; then
         err "解压失败"
     fi
     chmod +x "$SNELL_BIN"
 
-    # --- 脚本自身安装逻辑 (简化版) ---
-    # 无论如何都确保快捷命令可用
+    # --- 脚本自身安装逻辑 ---
     if [[ ! -x "$LOCAL_SCRIPT" ]] || [[ ! -L "$LINK_BIN" ]]; then
         echo "正在安装管理脚本..."
         local script_url_nocache="${SCRIPT_URL}?t=$(date +%s)"
-
-        # 下载脚本
         curl -fsSL "$script_url_nocache" -o "$LOCAL_SCRIPT" 2>/dev/null || \
         wget -qO "$LOCAL_SCRIPT" "$script_url_nocache" 2>/dev/null || \
         curl -fsSL "$SCRIPT_URL" -o "$LOCAL_SCRIPT" 2>/dev/null || \
         wget -qO "$LOCAL_SCRIPT" "$SCRIPT_URL" 2>/dev/null || true
 
-        # 验证并创建快捷命令
         if [[ -f "$LOCAL_SCRIPT" ]] && [[ -s "$LOCAL_SCRIPT" ]]; then
             chmod +x "$LOCAL_SCRIPT"
             ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
             _green "✓ 快捷命令 'snell' 已创建"
-        else
-            _red "✗ 脚本下载失败"
-            _yellow "  手动修复: curl -fsSL $SCRIPT_URL -o $LOCAL_SCRIPT && chmod +x $LOCAL_SCRIPT && ln -sf $LOCAL_SCRIPT $LINK_BIN"
         fi
     fi
-    # ------------------------
 
-    # 权限与配置
+    # 创建用户和目录
     if ! id -u snell >/dev/null 2>&1; then
         useradd -r -s /usr/sbin/nologin snell || true
     fi
     mkdir -p "$(dirname "$SNELL_LOG")" "$SNELL_DIR"
     touch "$SNELL_LOG"
     chown snell:snell "$SNELL_LOG" 2>/dev/null || true
+    echo "v${VERSION}" > "$SNELL_VERSION_FILE"
+
+    # 创建 systemd 服务
+    cat > "$SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=Snell Server
+After=network.target
+
+[Service]
+User=snell
+Group=snell
+ExecStart=$SNELL_BIN -c $SNELL_CONF
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+StandardOutput=append:$SNELL_LOG
+StandardError=append:$SNELL_LOG
+SyslogIdentifier=snell-server
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+
+    # 非交互模式：只安装不配置
+    if [ "$NONINTERACTIVE" = true ]; then
+        echo
+        _green "✓ Snell 安装完成"
+        echo "  运行 'snell' 添加节点配置"
+        return 0
+    fi
+
+    # 交互模式：继续配置节点
+    setup_snell_node
+}
+
+# 配置 Snell 节点 (交互式)
+setup_snell_node() {
+    local node_name port
+    local default_name; default_name=$(uname -n)
+
+    echo
+    read -rp "请输入节点名称 [${default_name}]: " node_name
+    node_name=${node_name:-$default_name}
+
+    port=$(rand_port)
+    read -rp "请输入端口 [${port}]: " user_port
+    port=${user_port:-$port}
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        err "端口无效"
+    fi
+    if is_port_used "$port"; then err "端口被占用"; fi
 
     local psk=$(generate_psk)
     echo "$node_name" > "${SNELL_DIR}/node_name.txt"
-    echo "v${VERSION}" > "$SNELL_VERSION_FILE"
-    
+
     backup_conf
     cat > "$SNELL_CONF" <<EOF
 [snell-server]
@@ -392,41 +423,16 @@ EOF
     chown -R snell:snell "$SNELL_DIR" 2>/dev/null || true
     chmod 640 "$SNELL_CONF"
 
-    # Systemd (优化 LimitNOFILE)
-    cat > "$SYSTEMD_SERVICE" <<EOF
-[Unit]
-Description=Snell Proxy Service
-After=network.target
-
-[Service]
-Type=simple
-User=snell
-Group=snell
-LimitNOFILE=1048576
-ExecStart=${SNELL_BIN} -c ${SNELL_CONF}
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-Restart=on-failure
-RestartSec=5s
-StandardOutput=append:${SNELL_LOG}
-StandardError=append:${SNELL_LOG}
-SyslogIdentifier=snell-server
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
     firewall_allow "$port"
     update_config_txt
-    
-    systemctl daemon-reload
+
     systemctl enable snell >/dev/null 2>&1
     systemctl start snell
 
     echo
-    _green "安装完成!"
+    _green "✓ 节点配置完成!"
 
-    # [插入点] PTM 集成
+    # PTM 集成
     ptm_add_integration "$port"
 
     echo
@@ -467,7 +473,12 @@ update_snell() {
 uninstall_snell() {
     echo
     _yellow "警告: 即将卸载 Snell"
-    read -rp "确认卸载? [y/N]: " confirm
+
+    local confirm="y"
+    if [ "$NONINTERACTIVE" != true ]; then
+        read -rp "确认卸载? [y/N]: " confirm
+    fi
+
     if [[ "${confirm,,}" == "y" ]]; then
         # === 新增: PTM 监控清理逻辑 (必须在删除配置前执行) ===
         # 读取配置文件中的端口 (格式通常为 listen = ::0:12345)
@@ -542,7 +553,16 @@ menu() {
     echo
     read -rp " 请输入序号: " pick
     case "$pick" in
-        1) install_snell; pause_return ;;
+        1)
+           if [ -f "$SNELL_BIN" ]; then
+               # 已安装，只配置节点
+               setup_snell_node
+           else
+               # 未安装，完整安装
+               install_snell
+           fi
+           pause_return
+           ;;
         2) uninstall_snell; pause_return ;;
         3) show_config_info; pause_return ;;
         4) update_snell; pause_return ;;
@@ -620,10 +640,13 @@ menu() {
 }
 
 # ==================== 入口 ====================
+# 非交互模式标志
+NONINTERACTIVE=false
+
 if [ -n "${1:-}" ]; then
     case "$1" in
         start|stop|restart|status) systemctl "$1" snell ;;
-        install) install_snell; exit 0 ;;
+        install) NONINTERACTIVE=true; install_snell; exit 0 ;;
         uninstall) uninstall_snell; exit 0 ;;
         *) menu ;;
     esac
