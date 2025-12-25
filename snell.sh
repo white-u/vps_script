@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.1"
+SCRIPT_VERSION="v2.7.2"
 FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
@@ -348,9 +348,10 @@ install_snell() {
     # --- 脚本自身安装逻辑 ---
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
-        # 管道/远程运行
+        # 管道/远程运行 (加时间戳绕过CDN缓存)
         echo "正在下载管理脚本..."
-        if download_file "$SCRIPT_URL" "$LOCAL_SCRIPT"; then
+        local script_url_nocache="${SCRIPT_URL}?t=$(date +%s)"
+        if download_file "$script_url_nocache" "$LOCAL_SCRIPT"; then
             chmod +x "$LOCAL_SCRIPT"
             ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
         else

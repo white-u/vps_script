@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.8.0"
+SCRIPT_VERSION="v2.8.1"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -241,8 +241,10 @@ install_singbox() {
     # 脚本安装 (原子更新)
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
+        # 管道/远程运行 (加时间戳绕过CDN缓存)
         echo "正在下载管理脚本..."
-        if download_file "$IS_SH_URL" "$TMP_SCRIPT"; then
+        local script_url_nocache="${IS_SH_URL}?t=$(date +%s)"
+        if download_file "$script_url_nocache" "$TMP_SCRIPT"; then
             mv "$TMP_SCRIPT" "$IS_SH_BIN"
             chmod +x "$IS_SH_BIN"
             ln -sf "$IS_SH_BIN" "$IS_LINK_BIN"
