@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.2"
+SCRIPT_VERSION="v2.7.3"
 FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
@@ -347,21 +347,36 @@ install_snell() {
 
     # --- 脚本自身安装逻辑 ---
     local current_path; current_path=$(realpath "$0" 2>/dev/null || echo "$0")
-    if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]]; then
+    if [[ ! -f "$current_path" ]] || [[ "$current_path" == "/dev/fd/"* ]] || [[ "$current_path" == "/proc/"* ]] || [[ "$current_path" == *"/tmp/"* ]]; then
         # 管道/远程运行 (加时间戳绕过CDN缓存)
-        echo "正在下载管理脚本..."
+        echo "正在下载管理脚本到 $LOCAL_SCRIPT ..."
         local script_url_nocache="${SCRIPT_URL}?t=$(date +%s)"
-        if download_file "$script_url_nocache" "$LOCAL_SCRIPT"; then
+
+        # 尝试下载，失败则用备用方法
+        if ! curl -fsSL "$script_url_nocache" -o "$LOCAL_SCRIPT" 2>/dev/null; then
+            if ! wget -qO "$LOCAL_SCRIPT" "$script_url_nocache" 2>/dev/null; then
+                _yellow "警告: 脚本下载失败，尝试备用方式..."
+                # 备用：直接从原始URL下载
+                curl -fsSL "$SCRIPT_URL" -o "$LOCAL_SCRIPT" 2>/dev/null || \
+                wget -qO "$LOCAL_SCRIPT" "$SCRIPT_URL" 2>/dev/null || true
+            fi
+        fi
+
+        # 验证下载成功
+        if [[ -f "$LOCAL_SCRIPT" ]] && [[ -s "$LOCAL_SCRIPT" ]]; then
             chmod +x "$LOCAL_SCRIPT"
             ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
+            _green "✓ 快捷命令 'snell' 创建成功"
         else
-            _yellow "脚本下载失败，无法创建快捷命令 'snell'，但服务安装不受影响。"
+            _red "✗ 脚本下载失败，无法创建快捷命令 'snell'"
+            _yellow "  可手动执行: curl -fsSL $SCRIPT_URL -o $LOCAL_SCRIPT && chmod +x $LOCAL_SCRIPT && ln -sf $LOCAL_SCRIPT $LINK_BIN"
         fi
     elif [[ "$current_path" != "$LOCAL_SCRIPT" ]]; then
         # 本地文件运行
         cp "$current_path" "$LOCAL_SCRIPT"
         chmod +x "$LOCAL_SCRIPT"
         ln -sf "$LOCAL_SCRIPT" "$LINK_BIN"
+        _green "✓ 快捷命令 'snell' 创建成功"
     fi
     # ------------------------
 
