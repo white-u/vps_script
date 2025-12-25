@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (修复版 v3.0.1)
+# 端口流量监控脚本 (修复版 v3.0.4)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
 # 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.3"
+readonly SCRIPT_VERSION="3.0.4"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -737,7 +737,7 @@ apply_quota() {
     local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
     local q_bytes=$(parse_size_to_bytes "$limit"); [ "$q_bytes" -eq 0 ] && return 1
     
-    local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]} ${t[1]} "$billing")
+    local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]:-0} ${t[1]:-0} "$billing")
     local q_name="port_${ps}_quota"
     
     remove_quota "$port" 2>/dev/null || true
@@ -1030,7 +1030,7 @@ check_and_send_alerts() {
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
         [ "$limit" = "unlimited" ] && continue
         local l_bytes=$(parse_size_to_bytes "$limit"); [ "$l_bytes" -eq 0 ] && continue
-        local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]} ${t[1]} "single")
+        local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]:-0} ${t[1]:-0} "single")
         local pct=$((used * 100 / l_bytes))
         local sent=$(jq_safe ".\"$port\"" "$ALERT_STATE_FILE" "0")
         for th in "${ALERT_THRESHOLDS[@]}"; do
@@ -1230,7 +1230,7 @@ show_status() {
             local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
             local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
             local extra=""; [ "$limit" != "unlimited" ] && extra="[限:$limit]"; [ "$rate" != "unlimited" ] && extra+="[宽:$rate]"
-            echo -e "${GREEN}${port}${NC} ${YELLOW}(${remark})${NC} $extra ↑$(format_bytes ${t[0]}) ↓$(format_bytes ${t[1]})"
+            echo -e "${GREEN}${port}${NC} ${YELLOW}(${remark})${NC} $extra ↑$(format_bytes ${t[0]:-0}) ↓$(format_bytes ${t[1]:-0})"
         done
     fi
     echo
