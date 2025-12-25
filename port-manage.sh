@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (修复版 v3.0.6)
+# 端口流量监控脚本 (修复版 v3.0.8)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
 # 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.7"
+readonly SCRIPT_VERSION="3.0.8"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -477,7 +477,7 @@ format_status_message() {
     for port in "${ports[@]}"; do
         local traffic=($(get_port_traffic "$port"))
         local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
-        local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
+        local used=$(calculate_total_traffic ${traffic[0]:-0} ${traffic[1]:-0} "$billing")
         total=$((total + used))
 
         # 超过限制时只统计流量，不添加详情
@@ -603,7 +603,7 @@ calculate_total_traffic() { [ "${3:-single}" = "double" ] && echo $(($1 + $2)) |
 
 save_traffic_data() {
     local active_ports
-    active_ports=($(get_active_ports 2>/dev/null || echo "")) || return 0
+    active_ports=($(get_active_ports 2>/dev/null || echo ""))
     [ ${#active_ports[@]} -eq 0 ] && return 0
 
     local json_data="{"
@@ -701,7 +701,7 @@ record_traffic_snapshot() {
     local port=$1; local ps=$(get_port_safe "$port")
     local history_file="$TRAFFIC_HISTORY_DIR/${ps}.log"
     local traffic=($(get_port_traffic "$port"))
-    local total=$((${traffic[0]} + ${traffic[1]}))
+    local total=$((${traffic[0]:-0} + ${traffic[1]:-0}))
     with_file_lock "${history_file}.lock" 3 _record_snapshot_internal "$history_file" "$(get_timestamp)" "$total"
 }
 
@@ -1277,7 +1277,8 @@ show_menu() {
 set_remark() {
     local ports=($(get_active_ports)); [ ${#ports[@]} -eq 0 ] && return
     for i in "${!ports[@]}"; do echo "$((i+1)). ${ports[$i]}"; done
-    read -p "选择: " s; [ "$s" -le ${#ports[@]} ] && {
+    read -p "选择: " s
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#ports[@]} ] && {
         read -p "新备注: " r
         update_config ".ports.\"${ports[$((s-1))]}\".remark = \"$r\""
         log_success "更新成功"
@@ -1287,7 +1288,8 @@ set_remark() {
 set_bandwidth() {
     local ports=($(get_active_ports)); [ ${#ports[@]} -eq 0 ] && return
     for i in "${!ports[@]}"; do echo "$((i+1)). ${ports[$i]}"; done
-    read -p "选择: " s; [ "$s" -le ${#ports[@]} ] && {
+    read -p "选择: " s
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#ports[@]} ] && {
         read -p "限制 (0=取消): " r
         if [ "$r" = "0" ]; then r="unlimited"; else r=$(normalize_rate "$r"); fi
         local p="${ports[$((s-1))]}"
@@ -1300,7 +1302,8 @@ set_bandwidth() {
 set_quota() {
     local ports=($(get_active_ports)); [ ${#ports[@]} -eq 0 ] && return
     for i in "${!ports[@]}"; do echo "$((i+1)). ${ports[$i]}"; done
-    read -p "选择: " s; [ "$s" -le ${#ports[@]} ] && {
+    read -p "选择: " s
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#ports[@]} ] && {
         read -p "配额 (0=取消): " q
         if [ "$q" = "0" ]; then q="unlimited"; else q=$(normalize_size "$q"); fi
         local p="${ports[$((s-1))]}"
@@ -1313,13 +1316,15 @@ set_quota() {
 reset_traffic() {
     local ports=($(get_active_ports)); [ ${#ports[@]} -eq 0 ] && return
     for i in "${!ports[@]}"; do echo "$((i+1)). ${ports[$i]}"; done
-    read -p "选择: " s; [ "$s" -le ${#ports[@]} ] && reset_port_traffic "${ports[$((s-1))]}"
+    read -p "选择: " s
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#ports[@]} ] && reset_port_traffic "${ports[$((s-1))]}"
 }
 
 setup_burst_protection() {
     local ports=($(get_active_ports)); [ ${#ports[@]} -eq 0 ] && return
     for i in "${!ports[@]}"; do echo "$((i+1)). ${ports[$i]}"; done
-    read -p "选择: " s; [ "$s" -le ${#ports[@]} ] && {
+    read -p "选择: " s
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#ports[@]} ] && {
         local p="${ports[$((s-1))]}"
         echo "1. 启用  2. 禁用"
         read -p "选: " a
