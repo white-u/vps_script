@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (修复版 v3.0.5)
+# 端口流量监控脚本 (修复版 v3.0.6)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
 # 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.5"
+readonly SCRIPT_VERSION="3.0.6"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -402,11 +402,36 @@ init_config() {
     
     init_logging; load_nft_config
     nft add table $NFT_FAMILY $NFT_TABLE 2>/dev/null || true
+
+    # 检查是否需要修复 chain 优先级 (从 priority 0 改为 -150)
+    local need_fix=false
+    if nft list chain $NFT_FAMILY $NFT_TABLE input 2>/dev/null | grep -q "priority 0"; then
+        need_fix=true
+    fi
+
+    if [ "$need_fix" = true ]; then
+        # 保存现有端口配置，删除旧 chains，重建
+        log_action "SYSTEM" "Fixing chain priority from 0 to -150"
+        for chain in input output forward prerouting postrouting; do
+            nft delete chain $NFT_FAMILY $NFT_TABLE $chain 2>/dev/null || true
+        done
+    fi
+
+    # 使用 priority -150 确保在其他防火墙规则之前计数
     for chain in input output forward; do
-        nft add chain $NFT_FAMILY $NFT_TABLE $chain "{ type filter hook $chain priority 0; }" 2>/dev/null || true
+        nft add chain $NFT_FAMILY $NFT_TABLE $chain "{ type filter hook $chain priority -150; policy accept; }" 2>/dev/null || true
     done
-    nft add chain $NFT_FAMILY $NFT_TABLE prerouting "{ type filter hook prerouting priority mangle; }" 2>/dev/null || true
-    nft add chain $NFT_FAMILY $NFT_TABLE postrouting "{ type filter hook postrouting priority mangle; }" 2>/dev/null || true
+    nft add chain $NFT_FAMILY $NFT_TABLE prerouting "{ type filter hook prerouting priority -150; policy accept; }" 2>/dev/null || true
+    nft add chain $NFT_FAMILY $NFT_TABLE postrouting "{ type filter hook postrouting priority -150; policy accept; }" 2>/dev/null || true
+
+    # 如果修复了优先级，需要重新添加所有端口的规则
+    if [ "$need_fix" = true ]; then
+        local ports=($(get_active_ports 2>/dev/null || echo ""))
+        for port in "${ports[@]}"; do
+            [ -n "$port" ] && add_nftables_rules "$port"
+        done
+        log_action "SYSTEM" "Chain priority fixed, rules re-added for ${#ports[@]} ports"
+    fi
     
     trap 'release_lock' EXIT; trap 'release_lock; exit 1' INT TERM
 }
