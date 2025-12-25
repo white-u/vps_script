@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.0"
+SCRIPT_VERSION="v2.7.1"
 FALLBACK_VERSION="4.1.0" 
 
 # ==================== 颜色函数 ====================
@@ -545,30 +545,49 @@ menu() {
         6) systemctl stop snell; _green "已执行停止"; pause_return ;;
         7) systemctl restart snell; _green "已执行重启"; pause_return ;;
         8) tail -n 50 "$SNELL_LOG"; pause_return ;;
-        9) 
+        9)
            read -rp "修改端口(1) 或 PSK(2)? " sub
            backup_conf
            if [[ "$sub" == "1" ]]; then
               # 1. 先获取旧端口 (用于解除监控)
               local old_port=$(read_snell_conf "listen" | sed -E 's/.*:([0-9]+)$/\1/')
-              
-              read -rp "新端口: " np
-              if [[ "$np" =~ ^[0-9]+$ ]]; then
+
+              read -rp "新端口 [$old_port]: " np
+              np=${np:-$old_port}
+
+              # 验证端口
+              if ! [[ "$np" =~ ^[0-9]+$ ]] || [ "$np" -lt 1 ] || [ "$np" -gt 65535 ]; then
+                  _yellow "端口无效 (需要 1-65535)"
+              elif [ "$np" != "$old_port" ] && is_port_used "$np"; then
+                  _yellow "端口 $np 已被占用"
+              else
                   # 2. 修改配置文件
                   sed -i -E "s/listen = .*:[0-9]+/listen = ::0:$np/" "$SNELL_CONF"
-                  
-                  # 3. 配置防火墙和系统服务
+
+                  # 3. 更新防火墙 (删除旧的，添加新的)
+                  if [ "$np" != "$old_port" ]; then
+                      # 删除旧端口防火墙规则
+                      if command -v ufw >/dev/null 2>&1; then
+                          ufw delete allow "$old_port/tcp" >/dev/null 2>&1 || true
+                          ufw delete allow "$old_port/udp" >/dev/null 2>&1 || true
+                      fi
+                      if command -v firewall-cmd >/dev/null 2>&1; then
+                          firewall-cmd --permanent --remove-port="$old_port/tcp" >/dev/null 2>&1 || true
+                          firewall-cmd --permanent --remove-port="$old_port/udp" >/dev/null 2>&1 || true
+                      fi
+                  fi
                   firewall_allow "$np"
+
                   update_config_txt
                   systemctl restart snell
-                  
+
                   # 4. PTM 集成：清理旧监控，添加新监控
-                  if [ -n "$old_port" ]; then ptm_del_integration "$old_port"; fi
-                  ptm_add_integration "$np"
-                  
-                  _green "端口已修改"
-              else
-                  _yellow "无效端口"
+                  if [ "$np" != "$old_port" ] && [ -n "$old_port" ]; then
+                      ptm_del_integration "$old_port"
+                      ptm_add_integration "$np"
+                  fi
+
+                  _green "端口已修改: $old_port -> $np"
               fi
            elif [[ "$sub" == "2" ]]; then
               read -rp "新PSK: " npsk

@@ -1132,6 +1132,8 @@ handle_cli_args() {
             fi
             return 0 ;;
         uninstall)
+            check_root
+            load_nft_config
             uninstall
             return 0 ;;
         # ================
@@ -1301,11 +1303,19 @@ create_shortcut() {
 # ==================== 主入口 ====================
 
 main() {
+    # install/uninstall 命令需要特殊处理，不预先初始化
+    if [ $# -gt 0 ]; then
+        case $1 in
+            install|uninstall) handle_cli_args "$@"; exit $? ;;
+        esac
+    fi
+
+    # 其他命令需要完整初始化
     check_root; check_dependencies; init_config; create_shortcut
 
     if [ $# -gt 0 ]; then
         case $1 in
-            add|del|delete|install|uninstall) handle_cli_args "$@"; exit $? ;;
+            add|del|delete) handle_cli_args "$@"; exit $? ;;
             --reset) 
                 [ -z "${2:-}" ] && exit 1
                 nft reset counter $NFT_FAMILY $NFT_TABLE "port_$(get_port_safe "$2")_in" >/dev/null 2>&1 || true

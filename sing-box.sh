@@ -11,7 +11,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==================== 版本配置 ====================
-SCRIPT_VERSION="v2.7.5"
+SCRIPT_VERSION="v2.8.0"
 
 # ==================== 颜色函数 ====================
 _red() { echo -e "\e[31m$@\e[0m"; }
@@ -509,6 +509,148 @@ del() {
     fi
 }
 
+# ==================== 修改配置功能 ====================
+modify() {
+    get_conf_list
+    if [[ ${#conf_list[@]} -eq 0 ]]; then _yellow "无配置"; return; fi
+
+    echo
+    echo "选择要修改的配置:"
+    for i in "${!conf_list[@]}"; do
+        printf " %2d. %s\n" "$((i+1))" "${conf_list[$i]}"
+    done
+    echo "  0. 返回"
+    read -rp "序号: " idx
+
+    if [[ ! "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#conf_list[@]}" ]; then
+        return
+    fi
+
+    local file="${conf_list[$((idx-1))]}"
+    local path="$IS_CONF_DIR/$file"
+    local type=$(read_json_val "$path" '.inbounds[0].type')
+    local old_port=$(read_json_val "$path" '.inbounds[0].listen_port')
+
+    echo
+    echo "当前配置: $file"
+    echo "类型: $type | 端口: $old_port"
+    echo
+    echo "选择修改项:"
+    echo "  1. 修改端口"
+    if [[ "$type" == "vless" ]]; then
+        echo "  2. 修改 UUID"
+        echo "  3. 修改 SNI"
+    elif [[ "$type" == "shadowsocks" ]]; then
+        echo "  2. 修改密码"
+    fi
+    echo "  0. 返回"
+    read -rp "选择: " modify_choice
+
+    case "$modify_choice" in
+        1)  # 修改端口
+            read -rp "新端口 [$old_port]: " new_port
+            new_port=${new_port:-$old_port}
+
+            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                _red "端口无效"; return
+            fi
+
+            if [ "$new_port" != "$old_port" ] && is_port_used "$new_port"; then
+                _red "端口 $new_port 已被占用"; return
+            fi
+
+            # 更新配置文件
+            local tmp=$(mktemp)
+            if jq ".inbounds[0].listen_port = $new_port" "$path" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$path"
+
+                # 更新防火墙
+                if [ "$new_port" != "$old_port" ]; then
+                    firewall_remove "$old_port"
+                    firewall_allow "$new_port"
+
+                    # PTM 集成：切换监控端口
+                    if command -v ptm >/dev/null 2>&1; then
+                        ptm_del_integration "$old_port"
+                        local remark=$(read_json_val "$path" '.inbounds[0].tag')
+                        [ -z "$remark" ] || [ "$remark" = "null" ] && remark="${file%.*}"
+                        ptm_add_integration "$new_port" "$remark"
+                    fi
+                fi
+
+                systemctl restart $IS_CORE
+                _green "端口已修改: $old_port -> $new_port"
+            else
+                rm -f "$tmp"
+                _red "修改失败"
+            fi
+            ;;
+        2)
+            if [[ "$type" == "vless" ]]; then
+                # 修改 UUID
+                local old_uuid=$(read_json_val "$path" '.inbounds[0].users[0].uuid')
+                local new_uuid=$(cat /proc/sys/kernel/random/uuid)
+                read -rp "新 UUID [$new_uuid]: " input_uuid
+                new_uuid=${input_uuid:-$new_uuid}
+
+                local tmp=$(mktemp)
+                if jq ".inbounds[0].users[0].uuid = \"$new_uuid\"" "$path" > "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$path"
+                    systemctl restart $IS_CORE
+                    _green "UUID 已修改"
+                    echo "旧: $old_uuid"
+                    echo "新: $new_uuid"
+                else
+                    rm -f "$tmp"; _red "修改失败"
+                fi
+            elif [[ "$type" == "shadowsocks" ]]; then
+                # 修改密码
+                local old_pass=$(read_json_val "$path" '.inbounds[0].password')
+                local new_pass=$(openssl rand -base64 16)
+                read -rp "新密码 [$new_pass]: " input_pass
+                new_pass=${input_pass:-$new_pass}
+
+                local tmp=$(mktemp)
+                if jq ".inbounds[0].password = \"$new_pass\"" "$path" > "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$path"
+                    systemctl restart $IS_CORE
+                    _green "密码已修改"
+                    echo "旧: $old_pass"
+                    echo "新: $new_pass"
+                else
+                    rm -f "$tmp"; _red "修改失败"
+                fi
+            fi
+            ;;
+        3)
+            if [[ "$type" == "vless" ]]; then
+                # 修改 SNI
+                local old_sni=$(read_json_val "$path" '.inbounds[0].tls.server_name')
+                read -rp "新 SNI [$old_sni]: " new_sni
+                new_sni=${new_sni:-$old_sni}
+
+                local tmp=$(mktemp)
+                # 同时更新 server_name 和 handshake.server
+                if jq ".inbounds[0].tls.server_name = \"$new_sni\" | .inbounds[0].tls.reality.handshake.server = \"$new_sni\"" "$path" > "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$path"
+                    systemctl restart $IS_CORE
+                    _green "SNI 已修改: $old_sni -> $new_sni"
+                else
+                    rm -f "$tmp"; _red "修改失败"
+                fi
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
+
+    # 显示更新后的配置
+    echo
+    is_conf_file="$file"
+    info_show
+}
+
 info_show() {
     local path="$IS_CONF_DIR/$is_conf_file"
     local type=$(read_json_val "$path" '.inbounds[0].type')
@@ -586,26 +728,27 @@ show_menu() {
         echo -e " 🟢 状态: $is_core_status      版本: ${is_core_ver:-$(_red "未安装")}"
         echo -e " 📋 配置: ${#conf_list[@]} 个"
         echo
-        echo -e "  1. 添加配置 $(_green "+")         2. 删除配置 🗑️"
-        echo -e "  3. 查看详情 👁️          4. 更新核心 🆙"
+        echo -e "  1. 添加配置 $(_green "+")         2. 修改配置 ✏️"
+        echo -e "  3. 删除配置 🗑️          4. 查看详情 👁️"
         echo
         echo -e "  5. 启动服务 ▶️          6. 停止服务 ⏹️"
         echo -e "  7. 重启服务 🔄          8. 查看日志 📜"
         echo
-        echo -e "  9. 更新脚本 🔄         10. 卸载脚本 ❌"
-        echo -e "  0. 退出"
+        echo -e "  9. 更新核心 🆙         10. 更新脚本 🔄"
+        echo -e " 11. 卸载脚本 ❌           0. 退出"
         echo
         read -rp " 请输入序号: " pick
         case "$pick" in
             1) add; pause_return ;;
-            2) del; pause_return ;;
-            3) info; pause_return ;;
-            4) install_singbox; pause_return ;;
+            2) modify; pause_return ;;
+            3) del; pause_return ;;
+            4) info; pause_return ;;
             5) systemctl start $IS_CORE; pause_return ;;
             6) systemctl stop $IS_CORE; pause_return ;;
             7) systemctl restart $IS_CORE; pause_return ;;
             8) tail -n 50 "$IS_LOG_DIR/sing-box.log"; pause_return ;;
-            9) 
+            9) install_singbox; pause_return ;;
+            10)
                 echo "正在获取最新脚本..."
                 if download_file "$IS_SH_URL" "$TMP_SCRIPT"; then
                     mv "$TMP_SCRIPT" "$IS_SH_BIN"
@@ -617,7 +760,7 @@ show_menu() {
                     pause_return
                 fi
                 ;;
-            10) uninstall ;;
+            11) uninstall ;;
             0) exit 0 ;;
             *) ;;
         esac

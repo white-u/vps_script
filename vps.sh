@@ -53,8 +53,6 @@ else
     else
         echo
         _red "✗ 安装脚本执行失败！"
-        echo "这通常是因为下载的脚本中存在语法错误(如多余的符号)。"
-        echo "当前下载链接已强制刷新缓存，请检查 GitHub 仓库中的 port-manage.sh 最后一行是否还有 '}' 符号。"
         exit 1
     fi
 fi
@@ -76,19 +74,19 @@ choice=${choice:-1}
 case $choice in
     1)
         echo "正在启动 Sing-box 脚本..."
-        bash <(curl -L "$URL_SB")
+        bash <(curl -L -f "$URL_SB") || { _red "Sing-box 脚本执行失败"; exit 1; }
         ;;
     2)
         echo "正在启动 Snell 脚本..."
-        bash <(curl -L "$URL_SNELL")
+        bash <(curl -L -f "$URL_SNELL") || { _red "Snell 脚本执行失败"; exit 1; }
         ;;
     3)
         echo ">>> 正在安装 Sing-box..."
-        bash <(curl -L "$URL_SB")
+        bash <(curl -L -f "$URL_SB") || { _red "Sing-box 安装失败"; }
         echo
         echo ">>> ------------------------------------------------"
         echo ">>> 正在安装 Snell..."
-        bash <(curl -L "$URL_SNELL")
+        bash <(curl -L -f "$URL_SNELL") || { _red "Snell 安装失败"; }
         ;;
     4)
         echo
@@ -101,27 +99,27 @@ case $choice in
         echo
         read -rp "请选择清理对象: " del_choice
         case $del_choice in
-            1) bash <(curl -L "$URL_SB") uninstall ;;
-            2) bash <(curl -L "$URL_SNELL") uninstall ;;
-            3) 
+            1) bash <(curl -L -f "$URL_SB") uninstall ;;
+            2) bash <(curl -L -f "$URL_SNELL") uninstall ;;
+            3)
                 if command -v ptm >/dev/null 2>&1; then
                     ptm uninstall
                 else
-                    bash <(curl -L "$URL_PTM") uninstall
+                    bash <(curl -L -f "$URL_PTM") uninstall
                 fi
                 ;;
-            4) 
+            4)
                 echo ">>> 步骤 1/3: 卸载 Sing-box..."
-                bash <(curl -L "$URL_SB") uninstall
+                bash <(curl -L -f "$URL_SB") uninstall || true
                 echo
                 echo ">>> 步骤 2/3: 卸载 Snell..."
-                bash <(curl -L "$URL_SNELL") uninstall
+                bash <(curl -L -f "$URL_SNELL") uninstall || true
                 echo
                 echo ">>> 步骤 3/3: 卸载 Port-Manage..."
                 if command -v ptm >/dev/null 2>&1; then
                     ptm uninstall
                 else
-                    bash <(curl -L "$URL_PTM") uninstall
+                    bash <(curl -L -f "$URL_PTM") uninstall
                 fi
                 ;;
             *) echo "取消操作。" ;;
