@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (修复版 v3.0.4)
+# 端口流量监控脚本 (修复版 v3.0.5)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
 # 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.4"
+readonly SCRIPT_VERSION="3.0.5"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -973,11 +973,11 @@ get_burst_status() {
 
 setup_reset_cron() {
     local port=$1; local day=$(jq_safe ".ports.\"$port\".quota.reset_day" "$CONFIG_FILE" "")
-    [ -n "$day" ] && [ "$day" != "0" ] && {
+    if [ -n "$day" ] && [ "$day" != "0" ]; then
         local tmp=$(mktemp); crontab -l 2>/dev/null | grep -v "重置$port$" > "$tmp" || true
         echo "5 0 $day * * $SCRIPT_PATH --reset $port >/dev/null 2>&1 # 重置$port" >> "$tmp"
         crontab "$tmp"; rm -f "$tmp"
-    }
+    fi
 }
 
 remove_reset_cron() {
