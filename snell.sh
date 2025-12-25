@@ -100,22 +100,20 @@ ensure_dependencies() {
 # ==================== PTM 集成模块 ====================
 ptm_add_integration() {
     local port=$1
-    local remark="Snell-Node"
+    local remark="Snell"
     if command -v ptm >/dev/null 2>&1; then
         echo
         echo -e "$(_blue_bg " 流量监控集成 ")"
         read -rp "是否对 Snell 端口 ($port) 开启流量监控? [Y/n]: " enable_ptm
         if [[ "${enable_ptm,,}" != "n" ]]; then
-             # Snell 比较简单，直接添加即可，或者也询问配额
-             read -rp "设置流量配额 (例如 100G, 留空不限): " quota
-             local cmd="ptm add $port --remark \"$remark\""
-             [ -n "$quota" ] && cmd+=" --quota $quota"
-             
-             if eval "$cmd" >/dev/null 2>&1; then
-                _green "✓ 已加入流量监控"
-             else
-                _yellow "⚠ 添加失败，请手动运行 ptm"
-             fi
+            read -rp "设置流量配额 (例如 100G, 留空不限): " quota
+
+            # 直接调用 ptm，避免 eval
+            if [ -n "$quota" ]; then
+                ptm add "$port" --remark "$remark" --quota "$quota" && _green "✓ 已加入流量监控" || _yellow "⚠ 添加失败"
+            else
+                ptm add "$port" --remark "$remark" && _green "✓ 已加入流量监控" || _yellow "⚠ 添加失败"
+            fi
         fi
     fi
 }
