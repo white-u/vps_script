@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# VPS 综合部署向导 v1.5
+# VPS 综合部署向导 v1.6
 # 整合: Port-Manage (基石) + Sing-box/Snell (应用)
 # Usage: bash vps.sh 或 vps
 #
 
-SCRIPT_VERSION="v1.5"
+SCRIPT_VERSION="v1.6"
 
 # 颜色定义
 _red() { echo -e "\033[31m$@\033[0m"; }
@@ -153,7 +153,8 @@ case $choice in
         ;;
     *)
         ACTION_TYPE="exit"
-        echo "退出。"
+        echo "无效选择，退出。"
+        exit 0
         ;;
 esac
 
@@ -165,14 +166,20 @@ fi
 # ================= 结束提示 =================
 echo
 echo "================================================================"
-if [[ "$ACTION_TYPE" == "uninstall" ]]; then
-    echo -e "$(_green "卸载完成！")"
-else
-    echo -e "$(_green "部署流程结束！")"
-    echo "常用指令:"
-    command -v ptm >/dev/null 2>&1 && echo "  ptm   - 打开流量监控面板"
-    command -v sb >/dev/null 2>&1 && echo "  sb    - 打开 Sing-box 面板"
-    command -v snell >/dev/null 2>&1 && echo "  snell - 打开 Snell 面板"
-    command -v vps >/dev/null 2>&1 && echo "  vps   - 打开此安装向导"
-fi
+case "$ACTION_TYPE" in
+    uninstall)
+        echo -e "$(_green "卸载完成！")"
+        ;;
+    cancel)
+        echo "已取消操作。"
+        ;;
+    install|skip)
+        echo -e "$(_green "部署流程结束！")"
+        echo "常用指令:"
+        command -v ptm >/dev/null 2>&1 && echo "  ptm   - 打开流量监控面板"
+        command -v sb >/dev/null 2>&1 && echo "  sb    - 打开 Sing-box 面板"
+        command -v snell >/dev/null 2>&1 && echo "  snell - 打开 Snell 面板"
+        command -v vps >/dev/null 2>&1 && echo "  vps   - 打开此安装向导"
+        ;;
+esac
 echo "================================================================"
