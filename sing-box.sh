@@ -625,18 +625,42 @@ show_menu() {
 }
 
 # ==================== 入口 ====================
-if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
-    check_root
-    if [[ -n "${1:-}" ]]; then
-        case "$1" in
-            add) add ;;
-            info) info ;;
-            uninstall) uninstall ;;
-            *) show_menu ;;
-        esac
-    else
-        show_menu
-    fi
+check_root
+
+# 先处理命令行参数
+if [[ -n "${1:-}" ]]; then
+    case "$1" in
+        uninstall)
+            if [ -f "$IS_SH_BIN" ] || [ -d "$IS_CORE_DIR" ]; then
+                uninstall
+            else
+                _yellow "Sing-box 未安装，无需卸载"
+            fi
+            exit 0
+            ;;
+        add|info)
+            if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
+                [ "$1" = "add" ] && add
+                [ "$1" = "info" ] && info
+            else
+                _red "Sing-box 未安装，请先安装"
+                exit 1
+            fi
+            ;;
+        *)
+            # 其他参数，检查是否已安装
+            if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
+                show_menu
+            else
+                install_singbox
+            fi
+            ;;
+    esac
 else
-    install_singbox
+    # 无参数时
+    if [ -f "$IS_SH_BIN" ] && [ -d "$IS_CORE_DIR" ]; then
+        show_menu
+    else
+        install_singbox
+    fi
 fi

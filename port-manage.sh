@@ -232,6 +232,20 @@ validate_port() {
     fi
 }
 
+format_rate() {
+    local kbps=${1:-0}
+    kbps=$(safe_parse_int "$kbps" 0)
+    [ "$kbps" -lt 0 ] && kbps=0
+
+    if [ $kbps -ge $KBPS_PER_GBPS ]; then
+        printf "%.2fGbps" "$(echo "scale=2; $kbps / $KBPS_PER_GBPS" | bc)"
+    elif [ $kbps -ge $KBPS_PER_MBPS ]; then
+        printf "%.2fMbps" "$(echo "scale=2; $kbps / $KBPS_PER_MBPS" | bc)"
+    else
+        echo "${kbps}Kbps"
+    fi
+}
+
 normalize_rate() {
     local input=$1; [ -z "$input" ] && echo "" && return
     local lower=$(echo "$input" | tr '[:upper:]' '[:lower:]')
@@ -390,6 +404,111 @@ get_active_ports() { [ -f "$CONFIG_FILE" ] && jq -r '.ports | keys[]' "$CONFIG_F
 is_port_range() { [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; }
 get_port_range_start() { if is_port_range "$1"; then echo "$1" | cut -d'-' -f1; else echo "$1"; fi; }
 get_port_range_end() { if is_port_range "$1"; then echo "$1" | cut -d'-' -f2; else echo "$1"; fi; }
+
+format_bytes() {
+    local bytes=${1:-0}
+    bytes=$(safe_parse_int "$bytes" 0)
+    [ "$bytes" -lt 0 ] && bytes=0
+
+    if [ $bytes -ge $BYTES_PER_TB ]; then
+        printf "%.2fTB" "$(echo "scale=2; $bytes / $BYTES_PER_TB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_GB ]; then
+        printf "%.2fGB" "$(echo "scale=2; $bytes / $BYTES_PER_GB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_MB ]; then
+        printf "%.2fMB" "$(echo "scale=2; $bytes / $BYTES_PER_MB" | bc)"
+    elif [ $bytes -ge $BYTES_PER_KB ]; then
+        printf "%.2fKB" "$(echo "scale=2; $bytes / $BYTES_PER_KB" | bc)"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+format_status_message() {
+    local server_name=$(jq_safe ".telegram.server_name" "$CONFIG_FILE" "$(hostname)")
+    local timestamp=$(get_beijing_time '+%Y-%m-%d %H:%M:%S')
+    local ports=($(get_active_ports))
+    local total=0 port_info=""
+    local port
+    local port_count=0
+    local max_ports=15  # 限制显示的端口数量，避免消息过长
+
+    for port in "${ports[@]}"; do
+        local traffic=($(get_port_traffic "$port"))
+        local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
+        local used=$(calculate_total_traffic ${traffic[0]} ${traffic[1]} "$billing")
+        total=$((total + used))
+
+        # 超过限制时只统计流量，不添加详情
+        port_count=$((port_count + 1))
+        [ $port_count -gt $max_ports ] && continue
+
+        local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
+        local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
+
+        local remark_display="" percent_display="" burst_display="" rate_display=""
+        [ -n "$remark" ] && remark_display=" ($remark)"
+
+        if [ "$limit" != "unlimited" ]; then
+            local limit_bytes=$(parse_size_to_bytes "$limit")
+            [ "$limit_bytes" -gt 0 ] && percent_display=" [$(( used * 100 / limit_bytes ))%]"
+        fi
+
+        local burst_status=$(get_burst_status "$port")
+        case "$burst_status" in
+            throttled) burst_display=" 🔽限速中" ;;
+            normal) burst_display=" ⚡保护中" ;;
+        esac
+
+        local current_rate_kbps=$(get_average_rate "$port" 5)
+        [ "$current_rate_kbps" -gt 0 ] && rate_display=" 📶$(format_rate $current_rate_kbps)"
+
+        port_info+="
+📌 端口 ${port}${remark_display}${percent_display}${burst_display}${rate_display}
+   ├ 入站: $(format_bytes ${traffic[0]})
+   ├ 出站: $(format_bytes ${traffic[1]})
+   └ 总计: $(format_bytes $used)"
+    done
+
+    local truncated_note=""
+    [ ${#ports[@]} -gt $max_ports ] && truncated_note="
+━━━━━━━━━━━━━━━━
+⚠️ 仅显示前 $max_ports 个端口"
+
+    echo "🔔 <b>端口流量监控状态</b>
+━━━━━━━━━━━━━━━━
+⏰ ${timestamp}
+🖥 ${server_name}
+📊 监控端口: ${#ports[@]} 个
+💾 总流量: $(format_bytes $total)
+━━━━━━━━━━━━━━━━${port_info}${truncated_note}"
+}
+
+show_logs() {
+    local lines=${1:-50}
+    local interactive=${2:-false}
+    
+    echo -e "${CYAN}=== 最近 $lines 条日志 ===${NC}\n"
+    
+    if [ -f "$LOG_FILE" ]; then
+        tail -n "$lines" "$LOG_FILE" | while read -r line; do
+            if [[ "$line" =~ \[ERROR\] ]]; then
+                echo -e "${RED}$line${NC}"
+            elif [[ "$line" =~ \[WARN\] ]]; then
+                echo -e "${YELLOW}$line${NC}"
+            elif [[ "$line" =~ \[ACTION\] ]]; then
+                echo -e "${GREEN}$line${NC}"
+            else
+                echo "$line"
+            fi
+        done
+    else
+        echo -e "${YELLOW}暂无日志${NC}"
+    fi
+    
+    echo
+    [ "$interactive" = "true" ] && read -p "按回车键返回..."
+}
+
 
 # ==================== NFTables 核心逻辑 ====================
 
@@ -978,7 +1097,7 @@ handle_cli_args() {
             
             log_action "API" "add port $port quota=$n_quota rate=$n_rate"
             echo "Success: Port $port monitored."
-            exit 0 ;;
+            return 0 ;;
         del|delete)
             local port="$1"; [ -z "$port" ] && { echo "Error: Port required"; exit 1; }
             remove_nftables_rules "$port"; remove_quota "$port"; remove_tc_limit "$port"
@@ -991,7 +1110,7 @@ handle_cli_args() {
             
             log_action "API" "del port $port"
             echo "Success: Port $port removed."
-            exit 0 ;;
+            return 0 ;;
         install)
             check_root
             check_dependencies
@@ -1009,13 +1128,12 @@ handle_cli_args() {
                 log_success "PTM 安装成功！可以直接输入 'ptm' 使用。"
             else
                 echo -e "${RED}下载失败，无法完成安装。${NC}"
-                exit 1
+                return 1
             fi
-            exit 0 ;;
-        # === 关键修复 ===
+            return 0 ;;
         uninstall)
             uninstall
-            exit 0 ;;
+            return 0 ;;
         # ================
     esac
 }
@@ -1187,7 +1305,7 @@ main() {
 
     if [ $# -gt 0 ]; then
         case $1 in
-            add|del|delete) handle_cli_args "$@"; exit 0 ;;
+            add|del|delete|install|uninstall) handle_cli_args "$@"; exit $? ;;
             --reset) 
                 [ -z "${2:-}" ] && exit 1
                 nft reset counter $NFT_FAMILY $NFT_TABLE "port_$(get_port_safe "$2")_in" >/dev/null 2>&1 || true
