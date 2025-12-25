@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# 端口流量监控脚本 (修复版 v3.0.8)
+# 端口流量监控脚本 (修复版 v3.0.9)
 # 功能: 流量监控、速率限制、配额管理、突发保护、Telegram通知、CLI API集成
 # 修复: 补全缺失的 download_file 函数，解决首次安装时脚本崩溃的问题
 # ============================================================================
@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="3.0.8"
+readonly SCRIPT_VERSION="3.0.9"
 readonly SCRIPT_NAME="端口流量监控"
 readonly UPDATE_URL="https://raw.githubusercontent.com/white-u/vps_script/main/port-manage.sh"
 
@@ -475,9 +475,10 @@ format_status_message() {
     local max_ports=15  # 限制显示的端口数量，避免消息过长
 
     for port in "${ports[@]}"; do
-        local traffic=($(get_port_traffic "$port"))
+        local t_in t_out
+        read t_in t_out <<< "$(get_port_traffic "$port")"
         local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
-        local used=$(calculate_total_traffic ${traffic[0]:-0} ${traffic[1]:-0} "$billing")
+        local used=$(calculate_total_traffic ${t_in:-0} ${t_out:-0} "$billing")
         total=$((total + used))
 
         # 超过限制时只统计流量，不添加详情
@@ -506,8 +507,8 @@ format_status_message() {
 
         port_info+="
 📌 端口 ${port}${remark_display}${percent_display}${burst_display}${rate_display}
-   ├ 入站: $(format_bytes ${traffic[0]})
-   ├ 出站: $(format_bytes ${traffic[1]})
+   ├ 入站: $(format_bytes ${t_in:-0})
+   ├ 出站: $(format_bytes ${t_out:-0})
    └ 总计: $(format_bytes $used)"
     done
 
@@ -610,10 +611,11 @@ save_traffic_data() {
     local first=true
     
     for port in "${active_ports[@]}"; do
-        local traffic=($(get_port_traffic "$port"))
-        if [ "${traffic[0]:-0}" -gt 0 ] || [ "${traffic[1]:-0}" -gt 0 ]; then
+        local t_in t_out
+        read t_in t_out <<< "$(get_port_traffic "$port")"
+        if [ "${t_in:-0}" -gt 0 ] || [ "${t_out:-0}" -gt 0 ]; then
             [ "$first" = true ] && first=false || json_data+=","
-            json_data+="\"$port\":{\"input\":${traffic[0]},\"output\":${traffic[1]},\"time\":\"$(get_beijing_time -Iseconds)\"}"
+            json_data+="\"$port\":{\"input\":${t_in:-0},\"output\":${t_out:-0},\"time\":\"$(get_beijing_time -Iseconds)\"}"
         fi
     done
     json_data+="}"
@@ -700,8 +702,9 @@ _record_snapshot_internal() {
 record_traffic_snapshot() {
     local port=$1; local ps=$(get_port_safe "$port")
     local history_file="$TRAFFIC_HISTORY_DIR/${ps}.log"
-    local traffic=($(get_port_traffic "$port"))
-    local total=$((${traffic[0]:-0} + ${traffic[1]:-0}))
+    local t_in t_out
+    read t_in t_out <<< "$(get_port_traffic "$port")"
+    local total=$((${t_in:-0} + ${t_out:-0}))
     with_file_lock "${history_file}.lock" 3 _record_snapshot_internal "$history_file" "$(get_timestamp)" "$total"
 }
 
@@ -766,8 +769,10 @@ apply_quota() {
     local ps=$(get_port_safe "$port")
     local billing=$(jq_safe ".ports.\"$port\".billing" "$CONFIG_FILE" "single")
     local q_bytes=$(parse_size_to_bytes "$limit"); [ "$q_bytes" -eq 0 ] && return 1
-    
-    local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]:-0} ${t[1]:-0} "$billing")
+
+    local t_in t_out
+    read t_in t_out <<< "$(get_port_traffic "$port")"
+    local used=$(calculate_total_traffic ${t_in:-0} ${t_out:-0} "$billing")
     local q_name="port_${ps}_quota"
     
     remove_quota "$port" 2>/dev/null || true
@@ -1055,12 +1060,15 @@ telegram_send() {
 check_and_send_alerts() {
     local tg=$(jq_safe ".telegram.enabled" "$CONFIG_FILE" "false")
     [ "$tg" != "true" ] && return
-    local ports=($(get_active_ports))
+    local ports
+    IFS=$'\n' read -d '' -ra ports < <(get_active_ports && printf '\0') || true
     for port in "${ports[@]}"; do
         local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
         [ "$limit" = "unlimited" ] && continue
         local l_bytes=$(parse_size_to_bytes "$limit"); [ "$l_bytes" -eq 0 ] && continue
-        local t=($(get_port_traffic "$port")); local used=$(calculate_total_traffic ${t[0]:-0} ${t[1]:-0} "single")
+        local t_in t_out
+        read t_in t_out <<< "$(get_port_traffic "$port")"
+        local used=$(calculate_total_traffic ${t_in:-0} ${t_out:-0} "single")
         local pct=$((used * 100 / l_bytes))
         local sent=$(jq_safe ".\"$port\"" "$ALERT_STATE_FILE" "0")
         for th in "${ALERT_THRESHOLDS[@]}"; do
@@ -1252,15 +1260,17 @@ remove_port() {
 show_status() {
     clear
     echo -e "${BLUE}=== 端口流量监控 v${SCRIPT_VERSION} ===${NC}"
-    local ports=($(get_active_ports))
+    local ports
+    IFS=$'\n' read -d '' -ra ports < <(get_active_ports && printf '\0') || true
     if [ ${#ports[@]} -eq 0 ]; then echo -e "${YELLOW}暂无监控端口${NC}"; else
         for port in "${ports[@]}"; do
-            local t=($(get_port_traffic "$port"))
+            local in_bytes out_bytes
+            read in_bytes out_bytes <<< "$(get_port_traffic "$port")"
             local remark=$(jq_safe ".ports.\"$port\".remark" "$CONFIG_FILE" "")
             local limit=$(jq_safe ".ports.\"$port\".quota.limit" "$CONFIG_FILE" "unlimited")
             local rate=$(jq_safe ".ports.\"$port\".bandwidth.rate" "$CONFIG_FILE" "unlimited")
             local extra=""; [ "$limit" != "unlimited" ] && extra="[限:$limit]"; [ "$rate" != "unlimited" ] && extra+="[宽:$rate]"
-            echo -e "${GREEN}${port}${NC} ${YELLOW}(${remark})${NC} $extra ↑$(format_bytes ${t[0]:-0}) ↓$(format_bytes ${t[1]:-0})"
+            echo -e "${GREEN}${port}${NC} ${YELLOW}(${remark})${NC} $extra ↑$(format_bytes ${in_bytes:-0}) ↓$(format_bytes ${out_bytes:-0})"
         done
     fi
     echo
