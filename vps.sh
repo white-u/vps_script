@@ -2,13 +2,14 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v2.1 (Fix: Alpine兼容性, 服务发现解析优化)
+# 版本: v2.3 (Final Stable: Fix BC Syntax & Alpine Deps)
 # ==============================================================================
 
 # --- 全局配置 ---
 SHORTCUT_NAME="pm"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
-DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
+# 请确保此 URL 是你存放该脚本的真实 Raw 地址
+DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
@@ -25,11 +26,34 @@ CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
 # ==============================================================================
-# 1. 基础架构模块 (Infrastructure)
+# 1. 基础架构模块
 # ==============================================================================
 
 check_root() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行此脚本。${PLAIN}" && exit 1
+}
+
+# 安装快捷指令 (修复 curl | bash 模式下的自身定位问题)
+install_shortcut() {
+    # 如果当前不在安装路径，且不是由 Cron 调用的
+    if [[ "$0" != "$INSTALL_PATH" ]] && [[ "$1" != "--monitor" ]]; then
+        echo -e "${YELLOW}正在安装快捷指令 '$SHORTCUT_NAME'...${PLAIN}"
+        
+        # 强制重新下载自身到安装目录
+        curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH"
+        
+        if [ $? -eq 0 ]; then
+            chmod +x "$INSTALL_PATH"
+            echo -e "${GREEN}安装成功! 以后输入 '$SHORTCUT_NAME' 即可使用。${PLAIN}"
+            echo -e "${GREEN}正在跳转到安装后的脚本...${PLAIN}"
+            sleep 1
+            # 替换当前进程，跳转执行
+            exec "$INSTALL_PATH" "$@"
+        else
+            echo -e "${RED}下载失败，请检查网络或 DOWNLOAD_URL 设置。${PLAIN}"
+            exit 1
+        fi
+    fi
 }
 
 get_iface() {
@@ -37,8 +61,8 @@ get_iface() {
 }
 
 install_deps() {
-    # 检查命令是否存在
-    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt")
+    # 检查命令是否存在 (flock 通常在 util-linux 中)
+    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock")
     local missing=false
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then missing=true; break; fi
@@ -50,34 +74,21 @@ install_deps() {
             . /etc/os-release
             case $ID in
                 debian|ubuntu)
-                    apt-get update && apt-get install -y nftables iproute2 jq bc curl coreutils ;;
+                    apt-get update && apt-get install -y nftables iproute2 jq bc curl coreutils util-linux ;;
                 centos|rhel|almalinux|rocky)
-                    yum install -y nftables iproute tc jq bc curl coreutils ;;
+                    yum install -y nftables iproute tc jq bc curl coreutils util-linux ;;
                 alpine)
-                    # Alpine 需要 coreutils(含numfmt) 和 iproute2(含ss/tc)
-                    apk add nftables iproute2 jq bc curl coreutils ;;
+                    # Alpine: numfmt在coreutils, flock在util-linux
+                    apk add nftables iproute2 jq bc curl coreutils util-linux ;;
                 *)
-                    echo -e "${RED}不支持的系统，请手动安装: nftables iproute2 jq bc curl coreutils${PLAIN}" && exit 1 ;;
+                    echo -e "${RED}不支持的系统，请手动安装: nftables iproute2 jq bc curl coreutils util-linux${PLAIN}" && exit 1 ;;
             esac
         fi
     fi
 
-    # 初始化配置
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
         echo "{\"interface\": \"$(get_iface)\", \"ports\": {}}" > "$CONFIG_FILE"
-    fi
-}
-
-install_shortcut() {
-    # 只有当脚本不在安装路径，且不是由cron调用时才安装快捷指令
-    if [[ "$0" != "$INSTALL_PATH" ]] && [[ "$1" != "--monitor" ]]; then
-        echo -e "${YELLOW}正在安装快捷指令 '$SHORTCUT_NAME'...${PLAIN}"
-        cp "$0" "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
-        echo -e "${GREEN}安装成功! 以后输入 '$SHORTCUT_NAME' 即可使用。${PLAIN}"
-        sleep 1
-        exec "$INSTALL_PATH"
     fi
 }
 
@@ -92,7 +103,6 @@ init_nft_table() {
         nft add set $NFT_TABLE blocked_ports { type inet_service\; }
         nft add chain $NFT_TABLE input { type filter hook input priority 0\; }
         nft add chain $NFT_TABLE output { type filter hook output priority 0\; }
-        # 阻断规则 (最高优先级)
         nft add rule $NFT_TABLE input meta l4proto { tcp, udp } dport @blocked_ports drop
         nft add rule $NFT_TABLE output meta l4proto { tcp, udp } sport @blocked_ports drop
         return 0
@@ -102,11 +112,8 @@ init_nft_table() {
 
 init_tc_root() {
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
-    # 检查是否存在 HTB root
     if ! tc qdisc show dev "$iface" | grep -q "htb 1:"; then
-        # 创建根队列，默认流量走 1:10 (未监控流量不限速)
         tc qdisc add dev "$iface" root handle 1: htb default 10
-        # 默认类: 1Gbps
         tc class add dev "$iface" parent 1: classid 1:10 htb rate 1000mbit
     fi
 }
@@ -117,7 +124,6 @@ apply_port_rules() {
     local limit_mbps=$(echo "$conf" | jq -r '.limit_mbps // 0')
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
     
-    # 动态限速检查: 如果处于惩罚状态，覆盖限速值
     local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
     if [ "$is_punished" == "true" ]; then
         local punish_val=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps // 50')
@@ -127,25 +133,19 @@ apply_port_rules() {
     init_nft_table
     init_tc_root
 
-    # 1. NFT 计数器
     nft add counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null
     nft add counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null
 
-    # 2. NFT 规则 (监控 + 打标)
     if ! nft list chain $NFT_TABLE input | grep -q "dport $port"; then
         nft add rule $NFT_TABLE input meta l4proto { tcp, udp } dport $port counter name "cnt_in_${port}"
     fi
     if ! nft list chain $NFT_TABLE output | grep -q "sport $port"; then
-        # 统计 + Mark (用于TC分类，mark值等于端口号)
         nft add rule $NFT_TABLE output meta l4proto { tcp, udp } sport $port counter name "cnt_out_${port}" meta mark set $port
     fi
 
-    # 3. TC 规则 (隔离限速)
-    # 清理旧规则
     tc filter del dev "$iface" parent 1: protocol ip prio 1 handle $port fw 2>/dev/null
     tc class del dev "$iface" parent 1: classid 1:$port 2>/dev/null
 
-    # 应用新限速
     if [ "$limit_mbps" != "0" ] && [ -n "$limit_mbps" ]; then
         tc class add dev "$iface" parent 1: classid 1:$port htb rate "${limit_mbps}mbit"
         tc filter add dev "$iface" parent 1: protocol ip prio 1 handle $port fw flowid 1:$port
@@ -161,7 +161,7 @@ reload_all_rules() {
 }
 
 # ==============================================================================
-# 3. 核心守护进程 (The Watchdog) - Crontab 任务
+# 3. 核心守护进程 (The Watchdog)
 # ==============================================================================
 
 safe_write_config() {
@@ -173,7 +173,7 @@ safe_write_config() {
 }
 
 cron_task() {
-    # 自愈: 检查 NFT 表是否存在 (防止重启失效)
+    # 1. 检查防火墙状态 (自愈)
     if ! nft list table $NFT_TABLE &>/dev/null; then
         reload_all_rules
     fi
@@ -188,29 +188,37 @@ cron_task() {
         local mode=$(echo "$p_conf" | jq -r '.quota_mode')
         local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
         
-        # 统计数据读取
         local acc_in=$(echo "$p_conf" | jq -r '.stats.acc_in // 0')
         local acc_out=$(echo "$p_conf" | jq -r '.stats.acc_out // 0')
         local last_k_in=$(echo "$p_conf" | jq -r '.stats.last_kernel_in // 0')
         local last_k_out=$(echo "$p_conf" | jq -r '.stats.last_kernel_out // 0')
 
-        # 获取内核当前值
         local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
 
-        # --- Sync 算法 ---
-        # 如果当前值 < 上次值，说明重启过，delta = 当前值
-        local delta_in=$(echo "if ($curr_k_in < $last_k_in) $curr_k_in else $curr_k_in - $last_k_in" | bc)
-        local delta_out=$(echo "if ($curr_k_out < $last_k_out) $curr_k_out else $curr_k_out - $last_k_out" | bc)
+        # --- 核心修复: 兼容性更好的增量计算 ---
+        # 使用 Shell 逻辑判断 + bc 计算，避免 bc 版本差异导致的语法错误
+        local delta_in=0
+        if [ $(echo "$curr_k_in < $last_k_in" | bc) -eq 1 ]; then
+             delta_in=$curr_k_in
+        else
+             delta_in=$(echo "$curr_k_in - $last_k_in" | bc)
+        fi
+
+        local delta_out=0
+        if [ $(echo "$curr_k_out < $last_k_out" | bc) -eq 1 ]; then
+             delta_out=$curr_k_out
+        else
+             delta_out=$(echo "$curr_k_out - $last_k_out" | bc)
+        fi
         
         acc_in=$(echo "$acc_in + $delta_in" | bc)
         acc_out=$(echo "$acc_out + $delta_out" | bc)
 
-        # 更新 JSON 对象
         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
         modified=true
 
-        # --- Dynamic QoS 算法 ---
+        # Dynamic QoS
         local dyn_enable=$(echo "$p_conf" | jq -r '.dyn_limit.enable // false')
         if [ "$dyn_enable" == "true" ]; then
             local dyn_trigger=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_mbps')
@@ -221,12 +229,10 @@ cron_task() {
             local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
             local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
 
-            # 计算本分钟速率 (Mbps)
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1024 / 1024" | bc)
             local rule_changed=false
 
             if [ "$is_punished" == "true" ]; then
-                # 惩罚中 -> 检查是否刑满
                 if [ "$current_ts" -ge "$end_ts" ]; then
                     is_punished="false"
                     strike=0
@@ -234,11 +240,9 @@ cron_task() {
                     rule_changed=true
                 fi
             else
-                # 正常中 -> 检查是否超速
                 if [ $(echo "$current_mbps > $dyn_trigger" | bc) -eq 1 ]; then
                     strike=$((strike + 1))
                     if [ "$strike" -ge "$dyn_trig_time" ]; then
-                        # 触发惩罚
                         is_punished="true"
                         end_ts=$((current_ts + dyn_punish_time * 60))
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
@@ -247,7 +251,6 @@ cron_task() {
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = $strike")
                     fi
                 else
-                    # 速度正常，重置连续计数
                     if [ "$strike" -gt 0 ]; then
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = 0")
                     fi
@@ -257,11 +260,11 @@ cron_task() {
             if [ "$rule_changed" == "true" ]; then
                 safe_write_config "$tmp_json"
                 apply_port_rules "$port"
-                tmp_json=$(cat "$CONFIG_FILE") # 重新读取最新
+                tmp_json=$(cat "$CONFIG_FILE")
             fi
         fi
 
-        # --- Quota 算法 ---
+        # Quota
         local total_usage=0
         if [ "$mode" == "out_only" ]; then
             total_usage=$acc_out
@@ -285,24 +288,22 @@ cron_task() {
 }
 
 setup_cron() {
-    # 修正路径指向安装位置
     if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH --monitor"; then
         (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH --monitor") | crontab -
     fi
 }
 
 # ==============================================================================
-# 4. 服务发现与扫描 (Service Discovery)
+# 4. 服务发现与扫描
 # ==============================================================================
 
 scan_active_services() {
     echo -e "${YELLOW}正在扫描系统活跃服务...${PLAIN}"
-    # 修正: 使用 sed 提取进程名，兼容 BusyBox awk
+    # 兼容 BusyBox awk (sed 提取进程名)
     local scan_res=$(ss -lntuH | awk '{
         n = split($5, addr, ":")
         port = addr[n]
         proto = $1
-        # 将整行传给 sed 提取进程名
         print port "/" proto " " $0
     }' | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | awk '{print $1 " " $NF}' | sort -u -k1,1)
 
@@ -310,7 +311,7 @@ scan_active_services() {
 }
 
 # ==============================================================================
-# 5. UI 交互模块 (User Interface)
+# 5. UI 交互模块
 # ==============================================================================
 
 fmt_bytes() {
@@ -410,7 +411,6 @@ add_port_flow() {
     while read -r line; do
         [ -z "$line" ] && continue
         local p_proto=$(echo "$line" | awk '{print $1}')
-        # 提取进程名 (处理可能的空格)
         local p_proc=$(echo "$line" | awk '{$1=""; print $0}' | sed 's/^ //')
         [ -z "$p_proc" ] && p_proc="Unknown"
         local p_num=$(echo "$p_proto" | awk -F/ '{print $1}')
@@ -622,9 +622,12 @@ uninstall_script() {
 # ==============================================================================
 # 入口逻辑
 # ==============================================================================
+# 1. 检查权限
 check_root
-install_deps
+# 2. 安装/跳转快捷指令
 install_shortcut "$1"
+# 3. 检查依赖
+install_deps
 
 if [ "$1" == "--monitor" ]; then
     cron_task
