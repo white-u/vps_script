@@ -2,13 +2,14 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v2.4 Stable (集成服务发现优化、动态QoS、持久化保护、Alpine兼容)
+# 版本: v2.4 Stable
+# 功能: 流量统计/配额阻断/独立限速/服务发现/动态QoS/自动安装
 # ==============================================================================
 
 # --- 全局配置 ---
 SHORTCUT_NAME="pm"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
-# [可选] 如果你有自己的 Github 仓库，可修改此 URL 用于脚本自我更新/修复安装
+# [可选] 脚本自我修复/安装的源地址
 DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 
 CONFIG_DIR="/etc/port_monitor"
@@ -40,7 +41,6 @@ install_shortcut() {
         echo -e "${YELLOW}正在安装快捷指令 '$SHORTCUT_NAME'...${PLAIN}"
         
         # 强制重新下载自身到安装目录，确保文件完整性
-        # 注意: 如果 DOWNLOAD_URL 404，这里会失败。如果无法连接外网，请手动 cp 当前文件到 /usr/local/bin/pm
         curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH"
         
         if [ $? -eq 0 ]; then
@@ -220,6 +220,7 @@ cron_task() {
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
 
         # --- Sync 算法 (计算增量) ---
+        # 兼容性修复: 使用 Shell 逻辑 + BC 计算，避免 BC 语法版本差异
         local delta_in=0
         if [ $(echo "$curr_k_in < $last_k_in" | bc) -eq 1 ]; then delta_in=$curr_k_in; else delta_in=$(echo "$curr_k_in - $last_k_in" | bc); fi
 
