@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v2.3 (Final Stable: Fix BC Syntax & Alpine Deps)
+# 版本: v2.4 Stable (集成服务发现优化、动态QoS、持久化保护、Alpine兼容)
 # ==============================================================================
 
 # --- 全局配置 ---
 SHORTCUT_NAME="pm"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
-# 请确保此 URL 是你存放该脚本的真实 Raw 地址
+# [可选] 如果你有自己的 Github 仓库，可修改此 URL 用于脚本自我更新/修复安装
 DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 
 CONFIG_DIR="/etc/port_monitor"
@@ -26,7 +26,7 @@ CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
 # ==============================================================================
-# 1. 基础架构模块
+# 1. 基础架构模块 (Infrastructure)
 # ==============================================================================
 
 check_root() {
@@ -39,7 +39,8 @@ install_shortcut() {
     if [[ "$0" != "$INSTALL_PATH" ]] && [[ "$1" != "--monitor" ]]; then
         echo -e "${YELLOW}正在安装快捷指令 '$SHORTCUT_NAME'...${PLAIN}"
         
-        # 强制重新下载自身到安装目录
+        # 强制重新下载自身到安装目录，确保文件完整性
+        # 注意: 如果 DOWNLOAD_URL 404，这里会失败。如果无法连接外网，请手动 cp 当前文件到 /usr/local/bin/pm
         curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH"
         
         if [ $? -eq 0 ]; then
@@ -51,17 +52,25 @@ install_shortcut() {
             exec "$INSTALL_PATH" "$@"
         else
             echo -e "${RED}下载失败，请检查网络或 DOWNLOAD_URL 设置。${PLAIN}"
-            exit 1
+            # 降级策略: 尝试直接复制 (如果是本地文件运行)
+            if [ -f "$0" ]; then
+                cp "$0" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+                echo -e "${YELLOW}已尝试本地复制安装。${PLAIN}"
+                exec "$INSTALL_PATH" "$@"
+            else
+                exit 1
+            fi
         fi
     fi
 }
 
 get_iface() {
+    # 自动获取默认路由网卡
     ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n 1
 }
 
 install_deps() {
-    # 检查命令是否存在 (flock 通常在 util-linux 中)
+    # 检查命令是否存在
     local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock")
     local missing=false
     for dep in "${deps[@]}"; do
@@ -86,6 +95,7 @@ install_deps() {
         fi
     fi
 
+    # 初始化配置目录
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
         echo "{\"interface\": \"$(get_iface)\", \"ports\": {}}" > "$CONFIG_FILE"
@@ -93,7 +103,7 @@ install_deps() {
 }
 
 # ==============================================================================
-# 2. 网络引擎模块 (Network Engine)
+# 2. 网络引擎模块 (Network Engine: Nftables & TC)
 # ==============================================================================
 
 init_nft_table() {
@@ -103,6 +113,7 @@ init_nft_table() {
         nft add set $NFT_TABLE blocked_ports { type inet_service\; }
         nft add chain $NFT_TABLE input { type filter hook input priority 0\; }
         nft add chain $NFT_TABLE output { type filter hook output priority 0\; }
+        # 阻断规则 (最高优先级)
         nft add rule $NFT_TABLE input meta l4proto { tcp, udp } dport @blocked_ports drop
         nft add rule $NFT_TABLE output meta l4proto { tcp, udp } sport @blocked_ports drop
         return 0
@@ -112,8 +123,11 @@ init_nft_table() {
 
 init_tc_root() {
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
+    # 检查是否存在 HTB root
     if ! tc qdisc show dev "$iface" | grep -q "htb 1:"; then
+        # 创建根队列，默认流量走 1:10 (未监控流量不限速)
         tc qdisc add dev "$iface" root handle 1: htb default 10
+        # 默认类: 1Gbps
         tc class add dev "$iface" parent 1: classid 1:10 htb rate 1000mbit
     fi
 }
@@ -124,6 +138,7 @@ apply_port_rules() {
     local limit_mbps=$(echo "$conf" | jq -r '.limit_mbps // 0')
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
     
+    # 动态限速检查: 如果处于惩罚状态，覆盖限速值
     local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
     if [ "$is_punished" == "true" ]; then
         local punish_val=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps // 50')
@@ -133,19 +148,25 @@ apply_port_rules() {
     init_nft_table
     init_tc_root
 
+    # 1. NFT 计数器 (幂等操作)
     nft add counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null
     nft add counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null
 
+    # 2. NFT 规则 (监控 + 打标)
     if ! nft list chain $NFT_TABLE input | grep -q "dport $port"; then
         nft add rule $NFT_TABLE input meta l4proto { tcp, udp } dport $port counter name "cnt_in_${port}"
     fi
     if ! nft list chain $NFT_TABLE output | grep -q "sport $port"; then
+        # 统计 + Mark (用于TC分类，mark值等于端口号)
         nft add rule $NFT_TABLE output meta l4proto { tcp, udp } sport $port counter name "cnt_out_${port}" meta mark set $port
     fi
 
+    # 3. TC 规则 (隔离限速)
+    # 清理旧规则
     tc filter del dev "$iface" parent 1: protocol ip prio 1 handle $port fw 2>/dev/null
     tc class del dev "$iface" parent 1: classid 1:$port 2>/dev/null
 
+    # 应用新限速
     if [ "$limit_mbps" != "0" ] && [ -n "$limit_mbps" ]; then
         tc class add dev "$iface" parent 1: classid 1:$port htb rate "${limit_mbps}mbit"
         tc filter add dev "$iface" parent 1: protocol ip prio 1 handle $port fw flowid 1:$port
@@ -161,11 +182,12 @@ reload_all_rules() {
 }
 
 # ==============================================================================
-# 3. 核心守护进程 (The Watchdog)
+# 3. 核心守护进程 (The Watchdog - Cron Task)
 # ==============================================================================
 
 safe_write_config() {
     local content="$1"
+    # 使用 flock 确保原子写入，防止并发损坏
     (
         flock -x 200
         echo "$content" > "$CONFIG_FILE"
@@ -173,7 +195,7 @@ safe_write_config() {
 }
 
 cron_task() {
-    # 1. 检查防火墙状态 (自愈)
+    # 1. 检查防火墙状态 (自愈: 防止重启后规则丢失)
     if ! nft list table $NFT_TABLE &>/dev/null; then
         reload_all_rules
     fi
@@ -193,24 +215,16 @@ cron_task() {
         local last_k_in=$(echo "$p_conf" | jq -r '.stats.last_kernel_in // 0')
         local last_k_out=$(echo "$p_conf" | jq -r '.stats.last_kernel_out // 0')
 
+        # 获取内核当前值
         local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
 
-        # --- 核心修复: 兼容性更好的增量计算 ---
-        # 使用 Shell 逻辑判断 + bc 计算，避免 bc 版本差异导致的语法错误
+        # --- Sync 算法 (计算增量) ---
         local delta_in=0
-        if [ $(echo "$curr_k_in < $last_k_in" | bc) -eq 1 ]; then
-             delta_in=$curr_k_in
-        else
-             delta_in=$(echo "$curr_k_in - $last_k_in" | bc)
-        fi
+        if [ $(echo "$curr_k_in < $last_k_in" | bc) -eq 1 ]; then delta_in=$curr_k_in; else delta_in=$(echo "$curr_k_in - $last_k_in" | bc); fi
 
         local delta_out=0
-        if [ $(echo "$curr_k_out < $last_k_out" | bc) -eq 1 ]; then
-             delta_out=$curr_k_out
-        else
-             delta_out=$(echo "$curr_k_out - $last_k_out" | bc)
-        fi
+        if [ $(echo "$curr_k_out < $last_k_out" | bc) -eq 1 ]; then delta_out=$curr_k_out; else delta_out=$(echo "$curr_k_out - $last_k_out" | bc); fi
         
         acc_in=$(echo "$acc_in + $delta_in" | bc)
         acc_out=$(echo "$acc_out + $delta_out" | bc)
@@ -218,7 +232,7 @@ cron_task() {
         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
         modified=true
 
-        # Dynamic QoS
+        # --- Dynamic QoS (动态限速) ---
         local dyn_enable=$(echo "$p_conf" | jq -r '.dyn_limit.enable // false')
         if [ "$dyn_enable" == "true" ]; then
             local dyn_trigger=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_mbps')
@@ -229,10 +243,12 @@ cron_task() {
             local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
             local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
 
+            # 计算本分钟速率 (Mbps)
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1024 / 1024" | bc)
             local rule_changed=false
 
             if [ "$is_punished" == "true" ]; then
+                # 惩罚中 -> 检查是否刑满
                 if [ "$current_ts" -ge "$end_ts" ]; then
                     is_punished="false"
                     strike=0
@@ -240,9 +256,11 @@ cron_task() {
                     rule_changed=true
                 fi
             else
+                # 正常中 -> 检查是否超速
                 if [ $(echo "$current_mbps > $dyn_trigger" | bc) -eq 1 ]; then
                     strike=$((strike + 1))
                     if [ "$strike" -ge "$dyn_trig_time" ]; then
+                        # 触发惩罚
                         is_punished="true"
                         end_ts=$((current_ts + dyn_punish_time * 60))
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
@@ -251,12 +269,14 @@ cron_task() {
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = $strike")
                     fi
                 else
+                    # 速度正常，重置连续计数
                     if [ "$strike" -gt 0 ]; then
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = 0")
                     fi
                 fi
             fi
             
+            # 如果状态改变，需要重新应用 TC 规则
             if [ "$rule_changed" == "true" ]; then
                 safe_write_config "$tmp_json"
                 apply_port_rules "$port"
@@ -264,7 +284,7 @@ cron_task() {
             fi
         fi
 
-        # Quota
+        # --- Quota (配额阻断) ---
         local total_usage=0
         if [ "$mode" == "out_only" ]; then
             total_usage=$acc_out
@@ -288,30 +308,69 @@ cron_task() {
 }
 
 setup_cron() {
+    # 确保 Cron 指向的是安装路径
     if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH --monitor"; then
         (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH --monitor") | crontab -
     fi
 }
 
 # ==============================================================================
-# 4. 服务发现与扫描
+# 4. 服务发现与扫描 (Service Discovery)
 # ==============================================================================
 
 scan_active_services() {
-    echo -e "${YELLOW}正在扫描系统活跃服务...${PLAIN}"
-    # 兼容 BusyBox awk (sed 提取进程名)
-    local scan_res=$(ss -lntuH | awk '{
+    # 打印到 stderr 防止被变量捕获，影响数据解析
+    echo -e "${YELLOW}正在扫描系统活跃服务...${PLAIN}" >&2
+    
+    # ss 参数: l=listening, n=numeric, t=tcp, u=udp, p=processes, H=no_header
+    # 逻辑: 提取端口、协议、进程名，并合并相同端口的TCP/UDP
+    
+    local scan_res=$(ss -lntupH | awk '{
+        # 提取协议
+        proto = $1
+        
+        # 提取端口 (处理 IPv4 0.0.0.0:80 和 IPv6 [::]:80)
         n = split($5, addr, ":")
         port = addr[n]
-        proto = $1
-        print port "/" proto " " $0
-    }' | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | awk '{print $1 " " $NF}' | sort -u -k1,1)
+        
+        # 提取进程名: users:(("nginx",pid=...
+        # 兼容 BusyBox Awk (不支持match array), 使用 index/substr 手动提取
+        proc = "Unknown"
+        idx = index($0, "users:((\"")
+        if (idx > 0) {
+            subline = substr($0, idx + 9)
+            q_idx = index(subline, "\"")
+            if (q_idx > 0) {
+                proc = substr(subline, 1, q_idx - 1)
+            }
+        }
+        
+        # 聚合逻辑: 键值 = 端口 + 进程名
+        key = port " " proc
+        
+        if (seen[key] == "") {
+            protos[key] = proto
+            ports[key] = port
+            procs[key] = proc
+            seen[key] = 1
+        } else {
+            # 如果已存在，追加协议 (例如 tcp -> tcp/udp)
+            if (index(protos[key], proto) == 0) {
+                protos[key] = protos[key] "/" proto
+            }
+        }
+    }
+    END {
+        for (k in protos) {
+            print ports[k], protos[k], procs[k]
+        }
+    }' | sort -n -k1) # 按端口号数字排序
 
     echo "$scan_res"
 }
 
 # ==============================================================================
-# 5. UI 交互模块
+# 5. UI 交互模块 (User Interface)
 # ==============================================================================
 
 fmt_bytes() {
@@ -397,6 +456,7 @@ show_main_menu() {
 }
 
 add_port_flow() {
+    # 获取扫描数据
     local scan_data=$(scan_active_services)
     
     echo -e "\n======================================================================"
@@ -410,18 +470,19 @@ add_port_flow() {
     
     while read -r line; do
         [ -z "$line" ] && continue
-        local p_proto=$(echo "$line" | awk '{print $1}')
-        local p_proc=$(echo "$line" | awk '{$1=""; print $0}' | sed 's/^ //')
-        [ -z "$p_proc" ] && p_proc="Unknown"
-        local p_num=$(echo "$p_proto" | awk -F/ '{print $1}')
+        # line格式: 80 tcp/udp nginx
+        local p_port=$(echo "$line" | awk '{print $1}')
+        local p_proto=$(echo "$line" | awk '{print $2}')
+        # 提取进程名 (剩余部分)
+        local p_proc=$(echo "$line" | awk '{$1=""; $2=""; print $0}' | sed 's/^ *//')
         
         local status="[可选]"
-        if jq -e ".ports[\"$p_num\"]" "$CONFIG_FILE" >/dev/null; then
+        if jq -e ".ports[\"$p_port\"]" "$CONFIG_FILE" >/dev/null; then
             status="${YELLOW}[已监控]${PLAIN}"
         fi
         
-        printf " [%d]  %-15s %-25s %-10s\n" $idx "$p_proto" "$p_proc" "$status"
-        map_ports[$idx]=$p_num
+        printf " [%d]  %-15s %-25s %-10s\n" $idx "${p_port}/${p_proto}" "$p_proc" "$status"
+        map_ports[$idx]=$p_port
         ((idx++))
     done <<< "$scan_data"
     
