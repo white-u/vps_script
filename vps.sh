@@ -2,19 +2,18 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v3.6 Final Release
-# 修复汇总: 
-# 1. 解决 Cron 与 用户并发写入导致的"添加不显示"问题 (信号锁机制)
-# 2. 解决 大数值/浮点数导致的"流量显示为0"问题 (强制整数清洗)
-# 3. 解决 大端口 TC 报错问题 (Hex 双轨制)
-# 4. 解决 删除/禁用 QoS 后的状态残留 (主动解封/重置)
-# 5. 解决 curl | bash 安装模式路径错误 (强制网络下载)
+# 版本: v3.7 Stable
+# 更新日志:
+# 1. [核心修复] Cron 死锁自动解除机制 (超时 10分钟自动解锁)
+# 2. [优化] 兼容 Loader 引导模式，防止安装路径冲突
+# 3. [优化] 提升 jq 数据处理的安全性
+# 4. [原特性] 包含 v3.6 的所有双轨制 Hex、整数清洗等修复
 # ==============================================================================
 
 # --- 全局配置 ---
 SHORTCUT_NAME="pm"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
-# [重要] 脚本自我修复/安装的源地址
+# [注意] 如果您 Fork 了此脚本，请修改下方的更新源地址
 DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 
 CONFIG_DIR="/etc/port_monitor"
@@ -23,7 +22,7 @@ LOCK_FILE="/var/run/pm.lock"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
-SCRIPT_PATH=$(readlink -f "$0")
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -40,33 +39,38 @@ check_root() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行此脚本。${PLAIN}" && exit 1
 }
 
-# 智能安装逻辑：兼容管道运行和本地运行
+# 智能安装逻辑：兼容管道运行、Loader加载和本地运行
 install_shortcut() {
-    # 排除条件：不是由 Cron 调用 且 (当前不在安装位置 或 文件不存在)
-    if [[ "$1" != "--monitor" ]] && [[ "$0" != "$INSTALL_PATH" ]]; then
-        echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
-        
-        # 强制从网络下载最新版到安装目录
-        curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH" 2>/dev/null
-        
-        # 验证下载完整性
-        if [ -s "$INSTALL_PATH" ]; then
-            chmod +x "$INSTALL_PATH"
-            echo -e "${GREEN}安装成功! 快捷指令: $SHORTCUT_NAME${PLAIN}"
-            echo -e "${GREEN}正在启动管理面板...${PLAIN}"
-            sleep 1
-            # 移交控制权给安装好的脚本
+    # 如果是 Cron 模式，或者当前运行的程序路径($0)已经是安装目标，则跳过安装
+    [[ "$1" == "--monitor" ]] && return
+    [[ "$0" == "$INSTALL_PATH" ]] && return
+    
+    # 增加逻辑：如果是被 source 加载的 (Loader 模式)，$0 也是 INSTALL_PATH，会自动跳过，无需额外改动
+    
+    echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
+    
+    # 强制从网络下载最新版到安装目录
+    # 注意：如果这台机器没有外网，这里会失败，但不影响核心逻辑运行
+    curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH" 2>/dev/null
+    
+    # 验证下载完整性
+    if [ -s "$INSTALL_PATH" ]; then
+        chmod +x "$INSTALL_PATH"
+        echo -e "${GREEN}安装成功! 快捷指令: $SHORTCUT_NAME${PLAIN}"
+        echo -e "${GREEN}正在启动管理面板...${PLAIN}"
+        sleep 1
+        # 移交控制权给安装好的脚本
+        exec "$INSTALL_PATH" "$@"
+    else
+        # 降级策略：本地复制 (仅当本地文件存在且非管道运行时)
+        if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+            echo -e "${YELLOW}网络下载失败，尝试本地安装...${PLAIN}"
+            cp "$SCRIPT_PATH" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
             exec "$INSTALL_PATH" "$@"
         else
-            # 降级策略：本地复制
-            if [ -f "$0" ]; then
-                echo -e "${YELLOW}网络下载失败，尝试本地安装...${PLAIN}"
-                cp "$0" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
-                exec "$INSTALL_PATH" "$@"
-            else
-                echo -e "${RED}致命错误: 安装失败，请检查网络连接。${PLAIN}"
-                exit 1
-            fi
+            # 如果是 curl | bash 且下载失败，我们依然允许内存中的脚本继续运行
+            # 但不会生成快捷指令
+            echo -e "${YELLOW}警告: 无法安装快捷指令 (网络问题或管道运行)，将仅在本次会话运行。${PLAIN}"
         fi
     fi
 }
@@ -77,7 +81,7 @@ get_iface() {
 
 install_deps() {
     # 核心依赖清单 (Alpine 需特判)
-    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock")
+    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock" "stat")
     local missing=false
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then missing=true; break; fi
@@ -93,7 +97,7 @@ install_deps() {
                 centos|rhel|almalinux|rocky)
                     yum install -y -q nftables iproute tc jq bc curl coreutils util-linux ;;
                 alpine)
-                    # Alpine 特别需要 coreutils(numfmt) 和 util-linux(flock)
+                    # Alpine 特别需要 coreutils(stat, numfmt) 和 util-linux(flock)
                     apk add --no-cache nftables iproute2 jq bc curl coreutils util-linux ;;
                 *)
                     echo -e "${RED}系统不受支持，请手动安装: ${deps[*]}${PLAIN}" && exit 1 ;;
@@ -136,6 +140,8 @@ init_nft_table() {
 
 init_tc_root() {
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
+    [ -z "$iface" ] && iface=$(get_iface)
+    
     # 初始化 HTB 根队列
     if ! tc qdisc show dev "$iface" | grep -q "htb 1:"; then
         tc qdisc add dev "$iface" root handle 1: htb default 10
@@ -149,6 +155,7 @@ apply_port_rules() {
     local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
     local limit_mbps=$(echo "$conf" | jq -r '.limit_mbps // 0')
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
+    [ -z "$iface" ] && iface=$(get_iface)
     
     # 检查惩罚状态，优先应用惩罚限速
     local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
@@ -207,7 +214,7 @@ reload_all_rules() {
 
 safe_write_config() {
     local content="$1"
-    # 使用 flock 确保原子写入，但更重要的是下面的 USER_EDIT_LOCK 机制
+    # 使用 flock 确保原子写入
     (
         flock -x 200
         echo "$content" > "$CONFIG_FILE"
@@ -215,9 +222,19 @@ safe_write_config() {
 }
 
 cron_task() {
-    # [核心修复] 并发避让：如果用户正在操作，Cron 立即停止，绝不读取旧数据覆盖新数据
+    # [核心修复 V3.7] 智能死锁解除与并发避让
     if [ -f "$USER_EDIT_LOCK" ]; then
-        exit 0
+        # 获取锁文件未更新的秒数
+        local lock_age=$(($(date +%s) - $(stat -c %Y "$USER_EDIT_LOCK" 2>/dev/null || echo 0)))
+        
+        # 阈值判定：10分钟 (600秒)
+        if [ "$lock_age" -gt 600 ] || [ "$lock_age" -lt 0 ]; then
+             # 超时，视为用户异常断线，强制清理锁，恢复监控
+             rm -f "$USER_EDIT_LOCK"
+        else
+             # 未超时，避让用户操作
+             exit 0
+        fi
     fi
 
     # 注入 PATH 确保命令可用
@@ -268,7 +285,7 @@ cron_task() {
         acc_in=$(echo "scale=0; $acc_in + $delta_in" | bc)
         acc_out=$(echo "scale=0; $acc_out + $delta_out" | bc)
 
-        # 写入 JSON
+        # 写入 JSON 变量
         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
         modified=true
 
@@ -327,7 +344,7 @@ cron_task() {
         
         # 1024 计算 GiB
         local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
-        local is_blocked_nft=$(nft list set $NFT_TABLE blocked_ports | grep -q "$port" && echo "yes" || echo "no")
+        local is_blocked_nft=$(nft list set $NFT_TABLE blocked_ports 2>/dev/null | grep -q "$port" && echo "yes" || echo "no")
 
         if (( $(echo "$total_usage > $quota_bytes" | bc -l) )); then
             [ "$is_blocked_nft" == "no" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
@@ -381,7 +398,7 @@ show_main_menu() {
 
     clear
     echo -e "====================================================================================="
-    echo -e "   Linux 端口流量管理 (快捷指令: $SHORTCUT_NAME) - 后台每分钟刷新"
+    echo -e "   Linux 端口流量管理 (v3.7 Stable) - 后台每分钟刷新"
     echo -e "====================================================================================="
     printf " %-4s %-12s %-10s %-25s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
     echo -e "-------------------------------------------------------------------------------------"
@@ -512,7 +529,6 @@ add_port_flow() {
     
     echo -e "\n>> 正在配置端口: $target_port"
     
-    # --- 修复开始: 增加输入校验 ---
     read -p "月流量配额 (纯数字, GB): " quota
     if [[ ! "$quota" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}错误: 配额必须是纯整数，不要带单位!${PLAIN}"; sleep 2; show_main_menu; return
@@ -525,7 +541,6 @@ add_port_flow() {
 
     read -p "出站限速 (纯数字, Mbps, 0为不限速): " limit
     if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
-        # 允许空输入默认为0，但不允许乱输
         if [ -z "$limit" ]; then limit=0; else
              echo -e "${RED}错误: 限速必须是纯整数!${PLAIN}"; sleep 2; show_main_menu; return
         fi
@@ -533,12 +548,10 @@ add_port_flow() {
     [ -z "$limit" ] && limit=0
 
     read -p "备注信息: " comment
-    # --- 修复结束 ---
 
     local tmp=$(mktemp)
     
-    # --- 修复开始: 使用 jq 参数传递变量，防止特殊字符报错，并增加逻辑判断 ---
-    # 使用 --arg 传递字符串，--argjson 传递数字，确保 JSON 绝对安全
+    # 使用 --argjson 确保 JSON 类型安全
     if jq --argjson q "$quota" \
           --arg m "$mode" \
           --argjson l "$limit" \
@@ -566,7 +579,6 @@ add_port_flow() {
         sleep 2
         show_main_menu
     fi
-    # --- 修复结束 ---
 }
 
 config_port_menu() {
@@ -652,11 +664,9 @@ config_port_menu() {
                 ;;
             4) 
                 configure_dyn_qos "$port" 
-                # 这里不需要设置 success，因为子函数内部处理了
                 ;;
             5) 
                 read -p "新备注: " val
-                # 使用 --arg 字符串传参，完美支持空格和引号
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
                     success=true
                 fi
@@ -664,8 +674,8 @@ config_port_menu() {
             6) 
                 read -p "确定清零吗? [y/N]: " confirm
                 if [[ "$confirm" == "y" ]]; then
-                   local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" | jq -r '.nftables[0].counter.bytes // 0')
-                   local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" | jq -r '.nftables[0].counter.bytes // 0')
+                   local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
+                   local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
                    
                    if jq --argjson ki "$k_in" --argjson ko "$k_out" --arg p "$port" \
                       '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko' \
@@ -748,7 +758,7 @@ delete_port_flow() {
     
     read -p "确定删除端口 $port 监控吗? [y/N]: " confirm
     if [[ "$confirm" == "y" ]]; then
-        # 1. 优先解封 (防止 config 删了后规则还在)
+        # 1. 优先解封
         nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
         
         # 2. 删除 TC 规则 (使用 Hex)
@@ -776,7 +786,7 @@ uninstall_script() {
         crontab -l 2>/dev/null | grep -v "$SHORTCUT_NAME" | crontab -
         stop_edit_lock
         
-        # 2. 清内核 (不依赖 config，重新探测)
+        # 2. 清内核
         local iface=$(get_iface)
         if [ -n "$iface" ] && tc qdisc show dev "$iface" | grep -q "htb 1:"; then
             tc qdisc del dev "$iface" root handle 1: htb 2>/dev/null
