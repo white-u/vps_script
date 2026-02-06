@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v4.0 Stable
+# 版本: v4.2 Stable
 # 更新日志:
 # 1. [致命修复] jq printf → floor: 修复流量统计完全失效的问题
 # 2. [致命修复] nft JSON 索引 [0] → select(.counter): 修复内核计数器永远读为0
@@ -19,9 +19,20 @@
 # 13. [优化] nft/tc 关键操作添加错误检测与日志输出
 # 14. [新功能] 自动重置配额: 支持设置每月1-31日自动清零流量并开启新周期
 # 15. [新功能] Telegram 通知: 配额阈值预警/封禁/DynQoS惩罚/恢复/自动重置
-#     - 支持自定义阈值 (默认50%/80%/100%)
-#     - 支持自定义 API 地址 (国内反代)
-#     - 通知状态机防重复推送
+# --- v4.1 ---
+# 16. [严重修复] NFT 规则检查 grep -q → grep -qw: 修复带引号输出不匹配导致
+#     规则重复添加、流量翻倍计数; 同时修复端口子串误判(80 vs 8080)
+# 17. [严重修复] cron_task 写入改为 safe_write_config_from_file 防止 ARG_MAX 截断
+# 18. [修复] 卸载 crontab 改为 grep -vF 精确匹配，防止误删含"pm"的无关条目
+# 19. [修复] DynQoS 禁用/启用时同步重置 notify_state 防止通知丢失
+# 20. [修复] Telegram 消息对备注中 Markdown 特殊字符 (*_`[) 自动转义
+# 21. [修复] config_port_menu 配额修改增加 >0 校验
+# 22. [修复] delete_port_flow iface 读取增加 get_iface fallback
+# --- v4.2 ---
+# 23. [严重修复] TC default classid 从 1:10 改为 1:fffe，修复端口16(hex=10)
+#     与默认分类冲突导致 HTB 规则被破坏的问题; 增加保留端口保护
+# 24. [修复] 主菜单已阻断行输出去掉 \r 覆盖技巧，改为条件分支直接打印
+# 25. [优化] 所有 read 输入增加 strip_cr 清洗，防止 Windows 粘贴 \r 导致校验失败
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -36,6 +47,9 @@ LOCK_FILE="/var/run/pm.lock"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
+# TC 默认分类 ID (hex)，不得与任何可监控端口的 hex 值冲突
+# 0xfffe = 端口 65534，几乎不会被监控
+TC_DEFAULT_CID="fffe"
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
 
 # --- 颜色定义 ---
@@ -44,6 +58,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PLAIN='\033[0m'
+
+# --- 输入清洗 ---
+# Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
+strip_cr() { echo "${1//$'\r'/}"; }
 
 # ==============================================================================
 # 1. 基础架构模块 (安装与环境)
@@ -171,12 +189,12 @@ init_tc_root() {
     
     # 初始化 HTB 根队列
     if ! tc qdisc show dev "$iface" | grep -q "htb 1:"; then
-        if ! tc qdisc add dev "$iface" root handle 1: htb default 10 2>/dev/null; then
+        if ! tc qdisc add dev "$iface" root handle 1: htb default $TC_DEFAULT_CID 2>/dev/null; then
             echo -e "${RED}[错误] 无法在 $iface 上创建 TC 队列, 限速功能可能不可用。${PLAIN}" >&2
             return 1
         fi
-        # 默认分类 1:10 (1Gbps/不限速通道)
-        tc class add dev "$iface" parent 1: classid 1:10 htb rate 1000mbit
+        # 默认分类 (不限速通道, ID 使用高位值避免与端口 hex 冲突)
+        tc class add dev "$iface" parent 1: classid 1:$TC_DEFAULT_CID htb rate 1000mbit
     fi
 }
 
@@ -205,12 +223,12 @@ apply_port_rules() {
 
     # 2. NFT: 统计 + 打标
     # TCP/UDP 分开判断，防止规则重复堆积
-    if ! nft list chain $NFT_TABLE input | grep -q "counter name cnt_in_${port}"; then
+    if ! nft list chain $NFT_TABLE input | grep -qw "cnt_in_${port}"; then
         nft add rule $NFT_TABLE input tcp dport $port counter name "cnt_in_${port}"
         nft add rule $NFT_TABLE input udp dport $port counter name "cnt_in_${port}"
     fi
     
-    if ! nft list chain $NFT_TABLE output | grep -q "counter name cnt_out_${port}"; then
+    if ! nft list chain $NFT_TABLE output | grep -qw "cnt_out_${port}"; then
         # 注意: Nftables 使用十进制打标
         nft add rule $NFT_TABLE output tcp sport $port counter name "cnt_out_${port}" meta mark set $port
         nft add rule $NFT_TABLE output udp sport $port counter name "cnt_out_${port}" meta mark set $port
@@ -272,17 +290,25 @@ safe_write_config_from_file() {
 # ==============================================================================
 
 # 获取通知标识 (优先端口备注 → hostname → IP)
+# 返回值经过 Markdown 安全转义，可直接用于 Telegram 消息
 get_host_label() {
     local comment="$1"
+    local raw=""
     # 优先使用端口备注
     if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
-        echo "$comment" && return
+        raw="$comment"
+    else
+        # 回退: hostname
+        local h=$(hostname 2>/dev/null)
+        if [ -n "$h" ] && [ "$h" != "localhost" ]; then
+            raw="$h"
+        else
+            # 回退: 公网 IP
+            raw=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1)
+        fi
     fi
-    # 回退: hostname
-    local h=$(hostname 2>/dev/null)
-    [ -n "$h" ] && [ "$h" != "localhost" ] && echo "$h" && return
-    # 回退: 公网 IP
-    ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1
+    # 转义 Telegram Markdown V1 特殊字符: * _ ` [
+    echo "$raw" | sed 's/[_*`\[]/\\&/g'
 }
 
 # 格式化字节为人类可读 (纯 Shell 实现，cron 环境下 numfmt 可能不在 PATH)
@@ -513,7 +539,10 @@ cron_task() {
             fi
             
             if [ "$rule_changed" == "true" ]; then
-                safe_write_config "$tmp_json"
+                local _tmp_dyn=$(mktemp)
+                printf '%s\n' "$tmp_json" > "$_tmp_dyn"
+                safe_write_config_from_file "$_tmp_dyn"
+                rm -f "$_tmp_dyn"
                 apply_port_rules "$port"
                 tmp_json=$(cat "$CONFIG_FILE")
             fi
@@ -609,7 +638,10 @@ cron_task() {
     done
 
     if [ "$modified" == "true" ]; then
-        safe_write_config "$tmp_json"
+        local _tmp_final=$(mktemp)
+        printf '%s\n' "$tmp_json" > "$_tmp_final"
+        safe_write_config_from_file "$_tmp_final"
+        rm -f "$_tmp_final"
     fi
 }
 
@@ -653,7 +685,7 @@ show_main_menu() {
 
     clear
     echo -e "========================================================================================="
-    echo -e "   Linux 端口流量管理 (v4.0 Stable) - 后台每分钟刷新"
+    echo -e "   Linux 端口流量管理 (v4.2 Stable) - 后台每分钟刷新"
     echo -e "========================================================================================="
     printf " %-4s %-12s %-10s %-30s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
     echo -e "-----------------------------------------------------------------------------------------"
@@ -710,12 +742,10 @@ show_main_menu() {
             fi
         fi
 
-        printf " [%d]  %-12s %-10s %-30s %-24s %-15s" $i "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
-        
         if [ "$is_blocked" == true ]; then
-            echo -e "\r${RED} [${i}]  ${port} ... (已阻断)${PLAIN}"
+            echo -e " ${RED}[${i}]  ${port}         [已阻断]  配额用尽，端口已封禁${PLAIN}"
         else
-            echo ""
+            printf " [%d]  %-12s %-10s %-30s %-24s %-15s\n" $i "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
         fi
         
         port_list[$i]=$port
@@ -737,6 +767,7 @@ show_main_menu() {
     echo -e " 0. 退出"
     echo -e "========================================================================================="
     read -p "请输入选项: " choice
+    choice=$(strip_cr "$choice")
     
     case $choice in
         1) add_port_flow ;;
@@ -778,6 +809,7 @@ add_port_flow() {
     echo -e " [0]   返回主菜单"
     echo -e "======================================================================"
     read -p "请输入选项: " sel
+    sel=$(strip_cr "$sel")
     local target_port=""
     if [ "$sel" == "0" ]; then return; fi
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ -n "${map_ports[$sel]}" ]; then
@@ -787,26 +819,35 @@ add_port_flow() {
         fi
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
         read -p "请输入端口号: " target_port
+        target_port=$(strip_cr "$target_port")
     else
         return
     fi
     if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
         echo -e "${RED}无效端口${PLAIN}"; sleep 1; return
     fi
+    # TC 保留端口 (default classid = 0xfffe = 65534)，禁止监控以避免 TC 规则冲突
+    local reserved_port=$((16#$TC_DEFAULT_CID))
+    if [ "$target_port" -eq "$reserved_port" ]; then
+        echo -e "${RED}端口 $reserved_port 为系统保留端口 (TC 默认分类)，无法监控!${PLAIN}"; sleep 2; return
+    fi
     
     echo -e "\n>> 正在配置端口: $target_port"
     
     read -p "月流量配额 (纯数字, GB): " quota
+    quota=$(strip_cr "$quota")
     if [[ ! "$quota" =~ ^[0-9]+$ ]] || [ "$quota" -eq 0 ]; then
         echo -e "${RED}错误: 配额必须是大于0的纯整数，不要带单位!${PLAIN}"; sleep 2; return
     fi
 
     echo "计费模式: 1.双向计费(默认)  2.仅出站计费"
     read -p "选择模式 [1/2]: " mode_idx
+    mode_idx=$(strip_cr "$mode_idx")
     local mode="in_out"
     [ "$mode_idx" == "2" ] && mode="out_only"
 
     read -p "出站限速 (纯数字, Mbps, 0为不限速): " limit
+    limit=$(strip_cr "$limit")
     if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
         if [ -z "$limit" ]; then limit=0; else
              echo -e "${RED}错误: 限速必须是纯整数!${PLAIN}"; sleep 2; return
@@ -815,6 +856,7 @@ add_port_flow() {
     [ -z "$limit" ] && limit=0
 
     read -p "每月自动重置日 (1-31, 0为不自动重置): " reset_day
+    reset_day=$(strip_cr "$reset_day")
     if [[ ! "$reset_day" =~ ^[0-9]+$ ]]; then
         reset_day=0
     fi
@@ -823,6 +865,7 @@ add_port_flow() {
     fi
 
     read -p "备注信息: " comment
+    comment=$(strip_cr "$comment")
 
     local tmp=$(mktemp)
     
@@ -863,6 +906,7 @@ config_port_menu() {
     local arr=("$@")
     echo -e "\n请输入要配置的端口 ID (查看上方列表): "
     read -p "ID > " id
+    id=$(strip_cr "$id")
     if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
     local port=${arr[$((id-1))]}
     if [ -z "$port" ]; then return; fi
@@ -913,6 +957,7 @@ config_port_menu() {
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " sub_choice
+        sub_choice=$(strip_cr "$sub_choice")
         
         local tmp=$(mktemp)
         local success=false
@@ -920,16 +965,18 @@ config_port_menu() {
         case $sub_choice in
             1) 
                 read -p "新配额 (纯数字, GB): " val
-                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         success=true
                     fi
                 else
-                    echo -e "${RED}错误: 必须输入纯整数!${PLAIN}"; sleep 1
+                    echo -e "${RED}错误: 必须输入大于0的纯整数!${PLAIN}"; sleep 1
                 fi 
                 ;;
             2) 
                 read -p "模式 (1.双向 2.仅出站): " m
+                m=$(strip_cr "$m")
                 local nm="in_out"
                 [ "$m" == "2" ] && nm="out_only"
                 if jq --arg v "$nm" --arg p "$port" '.ports[$p].quota_mode = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
@@ -938,6 +985,7 @@ config_port_menu() {
                 ;;
             3) 
                 read -p "新限速 (纯数字, Mbps): " val
+                val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].limit_mbps = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         apply_port_rules "$port"
@@ -952,12 +1000,14 @@ config_port_menu() {
                 ;;
             5) 
                 read -p "新备注: " val
+                val=$(strip_cr "$val")
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                     success=true
                 fi
                 ;;
             6) 
                 read -p "确定清零吗? [y/N]: " confirm
+                confirm=$(strip_cr "$confirm")
                 if [[ "$confirm" == "y" ]]; then
                    local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
                    local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
@@ -973,6 +1023,7 @@ config_port_menu() {
                 ;;
             7) 
                 read -p "自动重置日 (1-31, 0为关闭自动重置): " val
+                val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 31 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].reset_day = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         if [ "$val" -eq 0 ]; then
@@ -1005,9 +1056,10 @@ configure_dyn_qos() {
     echo -e "2. 禁用 (Disable)"
     echo -e "0. 取消 (Cancel)"
     read -p "请选择: " qos_sel
+    qos_sel=$(strip_cr "$qos_sel")
     
     if [ "$qos_sel" == "2" ]; then
-        if jq --arg p "$port" '.ports[$p].dyn_limit.enable = false | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+        if jq --arg p "$port" '.ports[$p].dyn_limit.enable = false | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0 | .ports[$p].notify_state.punish_notified = false | .ports[$p].notify_state.recover_notified = true' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
             apply_port_rules "$port"
             echo -e "${GREEN}已禁用 QoS 策略。${PLAIN}"
         fi
@@ -1018,6 +1070,8 @@ configure_dyn_qos() {
         read -p "(2/4) 连续触发时长 [例如 5] (分钟): " trig_time
         read -p "(3/4) 惩罚限速值 [例如 5] (Mbps): " pun_mbps
         read -p "(4/4) 惩罚持续时长 [例如 60] (分钟): " pun_time
+        trig_mbps=$(strip_cr "$trig_mbps"); trig_time=$(strip_cr "$trig_time")
+        pun_mbps=$(strip_cr "$pun_mbps"); pun_time=$(strip_cr "$pun_time")
         
         # 统一校验所有输入是否为纯数字
         if [[ ! "$trig_mbps" =~ ^[0-9]+$ ]] || [[ ! "$trig_time" =~ ^[0-9]+$ ]] || \
@@ -1038,7 +1092,7 @@ configure_dyn_qos() {
                   "strike_count": 0, 
                   "is_punished": false,
                   "punish_end_ts": 0
-              }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+              } | .ports[$p].notify_state.punish_notified = false | .ports[$p].notify_state.recover_notified = true' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
               echo -e "${GREEN}动态策略已更新!${PLAIN}"
         else
               echo -e "${RED}写入失败，请检查配置文件权限。${PLAIN}"
@@ -1092,6 +1146,7 @@ configure_telegram() {
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " tg_choice
+        tg_choice=$(strip_cr "$tg_choice")
         
         local tmp=$(mktemp)
         local success=false
@@ -1101,6 +1156,7 @@ configure_telegram() {
                 echo -e "\n从 @BotFather 获取 Bot Token"
                 echo -e "格式示例: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyz"
                 read -p "Bot Token: " new_token
+                new_token=$(strip_cr "$new_token")
                 if [ -n "$new_token" ]; then
                     if jq --arg v "$new_token" '.telegram.bot_token = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         echo -e "${GREEN}Token 已保存。${PLAIN}"; success=true
@@ -1113,6 +1169,7 @@ configure_telegram() {
                 echo -e "\n发送任意消息给 @userinfobot 获取 Chat ID"
                 echo -e "群组 ID 为负数, 示例: -1001234567890"
                 read -p "Chat ID: " new_chat
+                new_chat=$(strip_cr "$new_chat")
                 if [ -n "$new_chat" ]; then
                     if jq --arg v "$new_chat" '.telegram.chat_id = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         echo -e "${GREEN}Chat ID 已保存。${PLAIN}"; success=true
@@ -1174,6 +1231,7 @@ configure_telegram() {
                 echo -e "\n当前阈值: $tg_thresholds (%)"
                 echo -e "输入新阈值 (逗号分隔, 例如: 50,80,100)"
                 read -p "阈值: " new_thr
+                new_thr=$(strip_cr "$new_thr")
                 if [ -n "$new_thr" ]; then
                     # 清洗输入: 去空格，转数组，过滤非法值
                     local thr_json=$(echo "$new_thr" | tr -d ' ' | tr ',' '\n' | awk '$1 ~ /^[0-9]+$/ && $1>0 && $1<=100' | sort -n -u | jq -R 'tonumber' | jq -s '.')
@@ -1192,6 +1250,7 @@ configure_telegram() {
                 echo -e "国内推荐反代示例: https://tg.example.com"
                 echo -e "留空则恢复默认: https://api.telegram.org"
                 read -p "新地址: " new_api
+                new_api=$(strip_cr "$new_api")
                 [ -z "$new_api" ] && new_api="https://api.telegram.org"
                 # 去掉末尾斜杠
                 new_api="${new_api%/}"
@@ -1213,11 +1272,13 @@ configure_telegram() {
 delete_port_flow() {
     local arr=("$@")
     read -p "请输入要删除的端口 ID: " id
+    id=$(strip_cr "$id")
     if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
     local port=${arr[$((id-1))]}
     if [ -z "$port" ]; then return; fi
     
     read -p "确定删除端口 $port 监控吗? [y/N]: " confirm
+    confirm=$(strip_cr "$confirm")
     if [[ "$confirm" == "y" ]]; then
         # 1. 优先解封
         nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
@@ -1225,6 +1286,7 @@ delete_port_flow() {
         # 2. 删除 TC 规则 (使用 Hex, IPv4 + IPv6)
         local port_hex=$(printf '%x' $port)
         local iface=$(jq -r '.interface' "$CONFIG_FILE")
+        [ -z "$iface" ] && iface=$(get_iface)
         tc filter del dev "$iface" parent 1: protocol ip prio 1 handle 0x$port_hex fw 2>/dev/null
         tc filter del dev "$iface" parent 1: protocol ipv6 prio 1 handle 0x$port_hex fw 2>/dev/null
         tc class del dev "$iface" parent 1: classid 1:$port_hex 2>/dev/null
@@ -1242,9 +1304,10 @@ delete_port_flow() {
 uninstall_script() {
     echo -e "${RED}!!! 危险操作警告 !!!${PLAIN}"
     read -p "确定要彻底卸载 (清除规则、停止服务、删除文件)? [y/N]: " confirm
+    confirm=$(strip_cr "$confirm")
     if [[ "${confirm,,}" == "y" ]]; then
         # 1. 停服务
-        crontab -l 2>/dev/null | grep -v "$SHORTCUT_NAME" | crontab -
+        crontab -l 2>/dev/null | grep -vF "$INSTALL_PATH --monitor" | crontab -
         stop_edit_lock
         
         # 2. 清内核
