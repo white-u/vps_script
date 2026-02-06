@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v3.8 Stable
+# 版本: v4.0 Stable
 # 更新日志:
 # 1. [致命修复] jq printf → floor: 修复流量统计完全失效的问题
 # 2. [致命修复] nft JSON 索引 [0] → select(.counter): 修复内核计数器永远读为0
@@ -17,6 +17,11 @@
 # 11. [优化] 移除 add_port_flow 中过早释放编辑锁的问题
 # 12. [优化] safe_write_config_from_file: 文件路径传参避免 ARG_MAX 限制
 # 13. [优化] nft/tc 关键操作添加错误检测与日志输出
+# 14. [新功能] 自动重置配额: 支持设置每月1-31日自动清零流量并开启新周期
+# 15. [新功能] Telegram 通知: 配额阈值预警/封禁/DynQoS惩罚/恢复/自动重置
+#     - 支持自定义阈值 (默认50%/80%/100%)
+#     - 支持自定义 API 地址 (国内反代)
+#     - 通知状态机防重复推送
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -120,8 +125,16 @@ install_deps() {
     fi
     # 强制完整性检查：如果文件损坏或为空，重置它
     if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo "{\"interface\": \"$(get_iface)\", \"ports\": {}}" > "$CONFIG_FILE"
+        echo '{"interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' > "$CONFIG_FILE"
     fi
+    # 确保存在 telegram 字段 (旧版本升级兼容)
+    if ! jq -e '.telegram' "$CONFIG_FILE" >/dev/null 2>&1; then
+        local tmp=$(mktemp)
+        jq '.telegram = {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        rm -f "$tmp"
+    fi
+    # 保护配置文件 (含 bot_token)
+    chmod 600 "$CONFIG_FILE"
 }
 
 # ==============================================================================
@@ -254,6 +267,129 @@ safe_write_config_from_file() {
     ) 200>"$LOCK_FILE"
 }
 
+# ==============================================================================
+# 2.5 Telegram 通知引擎
+# ==============================================================================
+
+# 获取通知标识 (优先端口备注 → hostname → IP)
+get_host_label() {
+    local comment="$1"
+    # 优先使用端口备注
+    if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
+        echo "$comment" && return
+    fi
+    # 回退: hostname
+    local h=$(hostname 2>/dev/null)
+    [ -n "$h" ] && [ "$h" != "localhost" ] && echo "$h" && return
+    # 回退: 公网 IP
+    ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1
+}
+
+# 格式化字节为人类可读 (纯 Shell 实现，cron 环境下 numfmt 可能不在 PATH)
+fmt_bytes_plain() {
+    local b=$1
+    [ -z "$b" ] || [ "$b" -eq 0 ] 2>/dev/null && echo "0B" && return
+    echo "$b" | awk '{
+        if ($1>=1073741824) printf "%.1fGB", $1/1073741824
+        else if ($1>=1048576) printf "%.1fMB", $1/1048576
+        else if ($1>=1024) printf "%.1fKB", $1/1024
+        else printf "%dB", $1
+    }'
+}
+
+# Telegram 发送核心
+# 用法: tg_send "消息内容"
+tg_send() {
+    local msg="$1"
+    [ -z "$msg" ] && return
+    
+    # 读取 Telegram 配置
+    local tg_conf=$(jq -r '.telegram // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$tg_conf" ] && return
+    
+    local enabled=$(echo "$tg_conf" | jq -r '.enable // false')
+    [ "$enabled" != "true" ] && return
+    
+    local token=$(echo "$tg_conf" | jq -r '.bot_token // empty')
+    local chat_id=$(echo "$tg_conf" | jq -r '.chat_id // empty')
+    [ -z "$token" ] || [ -z "$chat_id" ] && return
+    
+    # 支持自定义 API 地址 (国内反代)
+    local api_url=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
+    
+    # 异步发送，不阻塞 Cron，超时 10 秒
+    curl -sf --max-time 10 \
+        "${api_url}/bot${token}/sendMessage" \
+        -d chat_id="$chat_id" \
+        -d text="$msg" \
+        -d parse_mode="Markdown" \
+        >/dev/null 2>&1 &
+}
+
+# --- 预定义通知模板 ---
+
+# 配额阈值预警
+tg_notify_quota() {
+    local port=$1 comment=$2 percent=$3 used_fmt=$4 quota_gb=$5 mode=$6 threshold=$7
+    local label=$(get_host_label "$comment")
+    local mode_str="双向"
+    [ "$mode" == "out_only" ] && mode_str="仅出站"
+    local icon="⚠️"
+    [ "$threshold" -ge 100 ] && icon="🔴"
+    tg_send "${icon} *端口流量预警*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📊 已用: ${used_fmt} / ${quota_gb}GB (*${percent}%*)
+📋 模式: ${mode_str}
+⏰ 状态: 已超过 *${threshold}%* 阈值"
+}
+
+# 端口封禁通知
+tg_notify_blocked() {
+    local port=$1 comment=$2 quota_gb=$3 reset_day=$4
+    local label=$(get_host_label "$comment")
+    local reset_str="手动重置"
+    [ "$reset_day" -gt 0 ] 2>/dev/null && reset_str="每月 ${reset_day} 日自动重置"
+    tg_send "🚫 *端口已封禁*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📊 流量配额已耗尽，端口已被封禁
+🔄 重置策略: ${reset_str}"
+}
+
+# DynQoS 惩罚触发
+tg_notify_punish() {
+    local port=$1 comment=$2 avg_mbps=$3 trigger_mbps=$4 punish_mbps=$5 punish_min=$6
+    local label=$(get_host_label "$comment")
+    tg_send "⚡ *动态限速触发*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📈 平均速率: ${avg_mbps} Mbps (阈值 ${trigger_mbps} Mbps)
+📉 已降速至: *${punish_mbps} Mbps*
+⏱ 持续时间: ${punish_min} 分钟"
+}
+
+# DynQoS 惩罚恢复
+tg_notify_recover() {
+    local port=$1 comment=$2
+    local label=$(get_host_label "$comment")
+    tg_send "✅ *限速已恢复*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📈 惩罚期结束，已恢复原始速率"
+}
+
+# 配额自动重置
+tg_notify_reset() {
+    local port=$1 comment=$2 quota_gb=$3
+    local label=$(get_host_label "$comment")
+    tg_send "🔄 *配额已自动重置*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📊 新配额: ${quota_gb} GB
+⏰ 新周期已开始"
+}
+
 cron_task() {
     # [核心修复 V3.7] 智能死锁解除与并发避让
     if [ -f "$USER_EDIT_LOCK" ]; then
@@ -328,18 +464,29 @@ cron_task() {
             local dyn_trigger=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_mbps')
             local dyn_trig_time=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_time')
             local dyn_punish_time=$(echo "$p_conf" | jq -r '.dyn_limit.punish_time')
+            local dyn_punish_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps')
             local strike=$(echo "$p_conf" | jq -r '.dyn_limit.strike_count // 0')
             local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
             local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
+            local comment=$(echo "$p_conf" | jq -r '.comment // ""')
 
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1000000" | bc)
             local rule_changed=false
+
+            # 通知状态
+            local punish_notified=$(echo "$p_conf" | jq -r '.notify_state.punish_notified // false')
+            local recover_notified=$(echo "$p_conf" | jq -r '.notify_state.recover_notified // true')
 
             if [ "$is_punished" == "true" ]; then
                 if [ "$current_ts" -ge "$end_ts" ]; then
                     is_punished="false"
                     strike=0
                     tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0")
+                    # 通知: 惩罚恢复
+                    if [ "$recover_notified" != "true" ]; then
+                        tg_notify_recover "$port" "$comment"
+                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.recover_notified = true | .ports[\"$port\"].notify_state.punish_notified = false")
+                    fi
                     rule_changed=true
                 fi
             else
@@ -349,6 +496,11 @@ cron_task() {
                         is_punished="true"
                         end_ts=$((current_ts + dyn_punish_time * 60))
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
+                        # 通知: 惩罚触发
+                        if [ "$punish_notified" != "true" ]; then
+                            tg_notify_punish "$port" "$comment" "$current_mbps" "$dyn_trigger" "$dyn_punish_mbps" "$dyn_punish_time"
+                            tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.punish_notified = true | .ports[\"$port\"].notify_state.recover_notified = false")
+                        fi
                         rule_changed=true
                     else
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = $strike")
@@ -364,6 +516,41 @@ cron_task() {
                 safe_write_config "$tmp_json"
                 apply_port_rules "$port"
                 tmp_json=$(cat "$CONFIG_FILE")
+            fi
+        fi
+
+        # --- 自动重置配额 ---
+        local reset_day=$(echo "$p_conf" | jq -r '.reset_day // 0')
+        if [ "$reset_day" -gt 0 ] 2>/dev/null && [ "$reset_day" -le 31 ] 2>/dev/null; then
+            local last_reset_ts=$(echo "$p_conf" | jq -r '(.last_reset_ts // 0) | floor')
+            
+            # 计算当月有效重置日 (处理大月小月: 设31日但当月只有28/30天)
+            local days_in_month=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%-d 2>/dev/null)
+            [ -z "$days_in_month" ] && days_in_month=28
+            local effective_day=$reset_day
+            [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
+            
+            # 计算本月重置时间点 (当月 effective_day 日 00:00:00)
+            local reset_date=$(printf "%s-%02d 00:00:00" "$(date +%Y-%m)" "$effective_day")
+            local reset_ts=$(date -d "$reset_date" +%s 2>/dev/null || echo 0)
+            
+            # 判定: 已过重置日 且 上次重置在本周期之前 → 执行重置
+            if [ "$current_ts" -ge "$reset_ts" ] && [ "$last_reset_ts" -lt "$reset_ts" ]; then
+                local comment_r=$(echo "$p_conf" | jq -r '.comment // ""')
+                acc_in=0; acc_out=0
+                tmp_json=$(echo "$tmp_json" | jq \
+                    --arg p "$port" --argjson ts "$current_ts" --argjson ki "$curr_k_in" --argjson ko "$curr_k_out" \
+                    '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 
+                     | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko 
+                     | .ports[$p].last_reset_ts = $ts
+                     | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0
+                     | .ports[$p].notify_state.quota_level = 0 | .ports[$p].notify_state.punish_notified = false | .ports[$p].notify_state.recover_notified = true')
+                # 解封端口
+                nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
+                apply_port_rules "$port"
+                # 通知: 配额已重置
+                tg_notify_reset "$port" "$comment_r" "$quota_gb"
+                modified=true
             fi
         fi
 
@@ -384,6 +571,40 @@ cron_task() {
             [ "$is_blocked_nft" == "false" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
         else
             [ "$is_blocked_nft" == "true" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \}
+        fi
+
+        # --- 配额阈值通知 (状态机: quota_level 只升不降，重置时归零) ---
+        local comment_n=$(echo "$p_conf" | jq -r '.comment // ""')
+        local reset_day_n=$(echo "$p_conf" | jq -r '.reset_day // 0')
+        local quota_level=$(echo "$p_conf" | jq -r '.notify_state.quota_level // 0')
+        # 获取用户自定义阈值列表 (默认 [50,80,100])
+        local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
+        
+        if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
+            local percent=$(echo "scale=1; $total_usage * 100 / $quota_bytes" | bc 2>/dev/null)
+            [ -z "$percent" ] && percent=0
+            local used_fmt=$(fmt_bytes_plain "$total_usage")
+
+            # 从高到低遍历阈值，命中最高的未通知阈值
+            local new_level=$quota_level
+            for thr in $(echo "$thresholds" | sort -rn); do
+                [ -z "$thr" ] && continue
+                if (( $(echo "$percent >= $thr" | bc -l) )) && [ "$quota_level" -lt "$thr" ]; then
+                    new_level=$thr
+                    break
+                fi
+            done
+
+            if [ "$new_level" -gt "$quota_level" ]; then
+                # 发阈值通知
+                tg_notify_quota "$port" "$comment_n" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level"
+                # 如果达到 100% 同时发封禁通知
+                if [ "$new_level" -ge 100 ]; then
+                    tg_notify_blocked "$port" "$comment_n" "$quota_gb" "$reset_day_n"
+                fi
+                tmp_json=$(echo "$tmp_json" | jq --argjson lv "$new_level" ".ports[\"$port\"].notify_state.quota_level = \$lv")
+                modified=true
+            fi
         fi
     done
 
@@ -431,11 +652,11 @@ show_main_menu() {
     start_edit_lock 
 
     clear
-    echo -e "====================================================================================="
-    echo -e "   Linux 端口流量管理 (v3.8 Stable) - 后台每分钟刷新"
-    echo -e "====================================================================================="
-    printf " %-4s %-12s %-10s %-25s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
-    echo -e "-------------------------------------------------------------------------------------"
+    echo -e "========================================================================================="
+    echo -e "   Linux 端口流量管理 (v4.0 Stable) - 后台每分钟刷新"
+    echo -e "========================================================================================="
+    printf " %-4s %-12s %-10s %-30s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
+    echo -e "-----------------------------------------------------------------------------------------"
 
     local port_list=()
     local i=1
@@ -472,6 +693,11 @@ show_main_menu() {
         fi
         
         local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
+        local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
+        local quota_str="${status_clean} / ${quota} GB"
+        if [ "$reset_day" -gt 0 ] 2>/dev/null; then
+            quota_str="${quota_str} [R${reset_day}]"
+        fi
         local limit_str=""
         if [ "$is_punished" == "true" ]; then
             local punish_val=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps')
@@ -484,7 +710,7 @@ show_main_menu() {
             fi
         fi
 
-        printf " [%d]  %-12s %-10s %-25s %-24s %-15s" $i "$port" "$mode_str" "${status_clean} / ${quota} GB" "$limit_str" "$comment"
+        printf " [%d]  %-12s %-10s %-30s %-24s %-15s" $i "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
         
         if [ "$is_blocked" == true ]; then
             echo -e "\r${RED} [${i}]  ${port} ... (已阻断)${PLAIN}"
@@ -495,22 +721,29 @@ show_main_menu() {
         port_list[$i]=$port
         ((i++))
     done
-    echo -e "-------------------------------------------------------------------------------------"
-    echo -e " 说明: 流量每分钟更新一次。当前正在编辑中，后台刷新已暂停。\n"
+    echo -e "-----------------------------------------------------------------------------------------"
+    echo -e " 说明: 流量每分钟更新一次。[Rxx]=每月xx日自动重置。当前正在编辑中，后台刷新已暂停。\n"
+
+    # Telegram 状态指示
+    local tg_status="${YELLOW}⚪ 未配置${PLAIN}"
+    local tg_enabled=$(jq -r '.telegram.enable // false' "$CONFIG_FILE" 2>/dev/null)
+    [ "$tg_enabled" == "true" ] && tg_status="${GREEN}✅ 已开启${PLAIN}"
 
     echo -e " 1. 添加 监控端口 (服务扫描)"
     echo -e " 2. 配置 端口 (修改/动态QoS/重置)"
     echo -e " 3. 删除 监控端口"
-    echo -e " 4. 卸载 脚本"
+    echo -e " 4. 通知设置 (Telegram) $tg_status"
+    echo -e " 5. 卸载 脚本"
     echo -e " 0. 退出"
-    echo -e "====================================================================================="
+    echo -e "========================================================================================="
     read -p "请输入选项: " choice
     
     case $choice in
         1) add_port_flow ;;
         2) config_port_menu "${port_list[@]}" ;;
         3) delete_port_flow "${port_list[@]}" ;;
-        4) uninstall_script ;;
+        4) configure_telegram ;;
+        5) uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
         *) ;; # 无效输入, 循环重新显示菜单
     esac
@@ -581,6 +814,14 @@ add_port_flow() {
     fi
     [ -z "$limit" ] && limit=0
 
+    read -p "每月自动重置日 (1-31, 0为不自动重置): " reset_day
+    if [[ ! "$reset_day" =~ ^[0-9]+$ ]]; then
+        reset_day=0
+    fi
+    if [ "$reset_day" -gt 31 ]; then
+        echo -e "${RED}错误: 重置日必须在 1-31 之间!${PLAIN}"; sleep 2; return
+    fi
+
     read -p "备注信息: " comment
 
     local tmp=$(mktemp)
@@ -589,15 +830,20 @@ add_port_flow() {
     if jq --argjson q "$quota" \
           --arg m "$mode" \
           --argjson l "$limit" \
+          --argjson rd "$reset_day" \
+          --argjson lrt "$(date +%s)" \
           --arg c "$comment" \
           --arg p "$target_port" \
        '.ports[$p] = {
         "quota_gb": $q, 
         "quota_mode": $m, 
         "limit_mbps": $l, 
+        "reset_day": $rd,
+        "last_reset_ts": $lrt,
         "comment": $c, 
         "stats": {"acc_in": 0, "acc_out": 0, "last_kernel_in": 0, "last_kernel_out": 0},
-        "dyn_limit": {"enable": false}
+        "dyn_limit": {"enable": false},
+        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true}
     }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
     
         rm "$tmp"
@@ -631,6 +877,7 @@ config_port_menu() {
         local dyn_enable=$(echo "$dyn_conf" | jq -r '.enable // false')
         local dyn_strike=$(echo "$dyn_conf" | jq -r '.strike_count // 0')
         local dyn_trig_time=$(echo "$dyn_conf" | jq -r '.trigger_time // 0')
+        local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
         
         clear
         echo -e "========================================"
@@ -640,6 +887,11 @@ config_port_menu() {
         echo -e " 流量配额: $quota GB"
         echo -e " 计费模式: $([ "$mode" == "out_only" ] && echo "仅出站" || echo "双向")"
         echo -e " 基础限速: $([ "$limit" == "0" ] && echo "无限制" || echo "$limit Mbps")"
+        if [ "$reset_day" -gt 0 ] 2>/dev/null; then
+            echo -e " 自动重置: 每月 ${GREEN}${reset_day}${PLAIN} 日"
+        else
+            echo -e " 自动重置: ${YELLOW}未设置 (手动重置)${PLAIN}"
+        fi
         echo -e ""
         echo -e " [动态突发限制 (QoS)]"
         if [ "$dyn_enable" == "true" ]; then
@@ -657,6 +909,7 @@ config_port_menu() {
         echo -e " 4. 配置 动态突发限制 (QoS)"
         echo -e " 5. 修改 备注信息"
         echo -e " 6. 重置 统计数据 (清零)"
+        echo -e " 7. 修改 自动重置日"
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " sub_choice
@@ -710,13 +963,28 @@ config_port_menu() {
                    local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
                    
                    if jq --argjson ki "$k_in" --argjson ko "$k_out" --arg p "$port" \
-                      '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko' \
+                      '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko | .ports[$p].notify_state.quota_level = 0' \
                       "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                        
                        nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
                        echo -e "${GREEN}已重置。${PLAIN}"; sleep 1
                    fi
                 fi 
+                ;;
+            7) 
+                read -p "自动重置日 (1-31, 0为关闭自动重置): " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 31 ]; then
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].reset_day = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        if [ "$val" -eq 0 ]; then
+                            echo -e "${GREEN}已关闭自动重置。${PLAIN}"
+                        else
+                            echo -e "${GREEN}已设置每月 ${val} 日自动重置。${PLAIN}"
+                        fi
+                        success=true
+                    fi
+                else
+                    echo -e "${RED}错误: 必须输入 0-31 的整数!${PLAIN}"; sleep 1
+                fi
                 ;;
             0) rm "$tmp"; break ;;
         esac
@@ -778,6 +1046,168 @@ configure_dyn_qos() {
     fi
     rm "$tmp" 2>/dev/null
     sleep 1
+}
+
+# ==============================================================================
+# Telegram 通知配置菜单
+# ==============================================================================
+
+configure_telegram() {
+    while true; do
+        local tg_conf=$(jq '.telegram // {}' "$CONFIG_FILE")
+        local tg_enable=$(echo "$tg_conf" | jq -r '.enable // false')
+        local tg_token=$(echo "$tg_conf" | jq -r '.bot_token // ""')
+        local tg_chat=$(echo "$tg_conf" | jq -r '.chat_id // ""')
+        local tg_api=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
+        local tg_thresholds=$(echo "$tg_conf" | jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")')
+        
+        # 脱敏显示 Token
+        local token_display="未配置"
+        if [ -n "$tg_token" ] && [ ${#tg_token} -gt 10 ]; then
+            token_display="${tg_token:0:6}...${tg_token: -4}"
+        elif [ -n "$tg_token" ]; then
+            token_display="已配置"
+        fi
+        
+        clear
+        echo -e "========================================"
+        echo -e "   Telegram 通知配置"
+        echo -e "========================================"
+        if [ "$tg_enable" == "true" ]; then
+            echo -e " 状态:   ${GREEN}✅ 已启用${PLAIN}"
+        else
+            echo -e " 状态:   ${YELLOW}⚪ 未启用${PLAIN}"
+        fi
+        echo -e " Token:  $token_display"
+        echo -e " ChatID: ${tg_chat:-未配置}"
+        echo -e " API:    $tg_api"
+        echo -e " 阈值:   $tg_thresholds (%)"
+        echo -e "========================================"
+        echo -e " 1. 配置 Bot Token"
+        echo -e " 2. 配置 Chat ID"
+        echo -e " 3. 发送测试消息"
+        echo -e " 4. 开启/关闭 通知"
+        echo -e " 5. 修改 通知阈值"
+        echo -e " 6. 修改 API 地址 (国内反代)"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " tg_choice
+        
+        local tmp=$(mktemp)
+        local success=false
+        
+        case $tg_choice in
+            1)
+                echo -e "\n从 @BotFather 获取 Bot Token"
+                echo -e "格式示例: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyz"
+                read -p "Bot Token: " new_token
+                if [ -n "$new_token" ]; then
+                    if jq --arg v "$new_token" '.telegram.bot_token = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        echo -e "${GREEN}Token 已保存。${PLAIN}"; success=true
+                    fi
+                else
+                    echo -e "${RED}输入不能为空!${PLAIN}"
+                fi
+                ;;
+            2)
+                echo -e "\n发送任意消息给 @userinfobot 获取 Chat ID"
+                echo -e "群组 ID 为负数, 示例: -1001234567890"
+                read -p "Chat ID: " new_chat
+                if [ -n "$new_chat" ]; then
+                    if jq --arg v "$new_chat" '.telegram.chat_id = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        echo -e "${GREEN}Chat ID 已保存。${PLAIN}"; success=true
+                    fi
+                else
+                    echo -e "${RED}输入不能为空!${PLAIN}"
+                fi
+                ;;
+            3)
+                echo -e "\n${YELLOW}正在发送测试消息...${PLAIN}"
+                # 临时强制启用发送
+                local test_token=$(jq -r '.telegram.bot_token // ""' "$CONFIG_FILE")
+                local test_chat=$(jq -r '.telegram.chat_id // ""' "$CONFIG_FILE")
+                local test_api=$(jq -r '.telegram.api_url // "https://api.telegram.org"' "$CONFIG_FILE")
+                
+                if [ -z "$test_token" ] || [ -z "$test_chat" ]; then
+                    echo -e "${RED}请先配置 Bot Token 和 Chat ID!${PLAIN}"
+                else
+                    local test_host=$(get_host_label)
+                    local result=$(curl -sf --max-time 10 \
+                        "${test_api}/bot${test_token}/sendMessage" \
+                        -d chat_id="$test_chat" \
+                        -d text="🔔 *测试通知*
+🖥 主机: \`${test_host}\`
+✅ Telegram 通知功能正常!" \
+                        -d parse_mode="Markdown" 2>&1)
+                    
+                    if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
+                        echo -e "${GREEN}✅ 发送成功! 请检查 Telegram。${PLAIN}"
+                    else
+                        local err_desc=$(echo "$result" | jq -r '.description // "连接失败或超时"' 2>/dev/null)
+                        echo -e "${RED}❌ 发送失败: $err_desc${PLAIN}"
+                        echo -e "${YELLOW}提示: 如果在国内服务器，请配置 API 反代地址 (选项6)${PLAIN}"
+                    fi
+                fi
+                ;;
+            4)
+                local new_state="true"
+                [ "$tg_enable" == "true" ] && new_state="false"
+                
+                # 开启前检查配置完整性
+                if [ "$new_state" == "true" ]; then
+                    if [ -z "$tg_token" ] || [ -z "$tg_chat" ]; then
+                        echo -e "${RED}请先配置 Bot Token 和 Chat ID!${PLAIN}"
+                        sleep 1; rm -f "$tmp"; continue
+                    fi
+                fi
+                
+                if jq --argjson v "$new_state" '.telegram.enable = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                    if [ "$new_state" == "true" ]; then
+                        echo -e "${GREEN}✅ 通知已开启${PLAIN}"
+                    else
+                        echo -e "${YELLOW}⚪ 通知已关闭${PLAIN}"
+                    fi
+                    success=true
+                fi
+                ;;
+            5)
+                echo -e "\n当前阈值: $tg_thresholds (%)"
+                echo -e "输入新阈值 (逗号分隔, 例如: 50,80,100)"
+                read -p "阈值: " new_thr
+                if [ -n "$new_thr" ]; then
+                    # 清洗输入: 去空格，转数组，过滤非法值
+                    local thr_json=$(echo "$new_thr" | tr -d ' ' | tr ',' '\n' | awk '$1 ~ /^[0-9]+$/ && $1>0 && $1<=100' | sort -n -u | jq -R 'tonumber' | jq -s '.')
+                    if [ "$(echo "$thr_json" | jq 'length')" -gt 0 ]; then
+                        if jq --argjson v "$thr_json" '.telegram.thresholds = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                            echo -e "${GREEN}阈值已更新: $(echo $thr_json | jq -r 'map(tostring) | join(", ")')%${PLAIN}"
+                            success=true
+                        fi
+                    else
+                        echo -e "${RED}无有效阈值! 请输入 1-100 之间的整数。${PLAIN}"
+                    fi
+                fi
+                ;;
+            6)
+                echo -e "\n当前 API 地址: $tg_api"
+                echo -e "国内推荐反代示例: https://tg.example.com"
+                echo -e "留空则恢复默认: https://api.telegram.org"
+                read -p "新地址: " new_api
+                [ -z "$new_api" ] && new_api="https://api.telegram.org"
+                # 去掉末尾斜杠
+                new_api="${new_api%/}"
+                if jq --arg v "$new_api" '.telegram.api_url = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                    echo -e "${GREEN}API 地址已更新: $new_api${PLAIN}"
+                    success=true
+                fi
+                ;;
+            0)
+                rm -f "$tmp"; break
+                ;;
+        esac
+        
+        rm -f "$tmp"
+        [ "$success" == "true" ] && sleep 0.5 || sleep 1.5
+    done
 }
 
 delete_port_flow() {
