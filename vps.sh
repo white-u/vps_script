@@ -511,32 +511,62 @@ add_port_flow() {
     fi
     
     echo -e "\n>> 正在配置端口: $target_port"
-    read -p "月流量配额 (GB): " quota
+    
+    # --- 修复开始: 增加输入校验 ---
+    read -p "月流量配额 (纯数字, GB): " quota
+    if [[ ! "$quota" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 配额必须是纯整数，不要带单位!${PLAIN}"; sleep 2; show_main_menu; return
+    fi
+
     echo "计费模式: 1.双向计费(默认)  2.仅出站计费"
     read -p "选择模式 [1/2]: " mode_idx
     local mode="in_out"
     [ "$mode_idx" == "2" ] && mode="out_only"
-    read -p "出站限速 (Mbps, 0为不限速): " limit
+
+    read -p "出站限速 (纯数字, Mbps, 0为不限速): " limit
+    if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+        # 允许空输入默认为0，但不允许乱输
+        if [ -z "$limit" ]; then limit=0; else
+             echo -e "${RED}错误: 限速必须是纯整数!${PLAIN}"; sleep 2; show_main_menu; return
+        fi
+    fi
     [ -z "$limit" ] && limit=0
+
     read -p "备注信息: " comment
+    # --- 修复结束 ---
 
     local tmp=$(mktemp)
-    jq ".ports[\"$target_port\"] = {
-        \"quota_gb\": $quota, 
-        \"quota_mode\": \"$mode\", 
-        \"limit_mbps\": $limit, 
-        \"comment\": \"$comment\", 
-        \"stats\": {\"acc_in\": 0, \"acc_out\": 0},
-        \"dyn_limit\": {\"enable\": false}
-    }" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)" && rm "$tmp"
-
-    apply_port_rules "$target_port"
-    echo -e "${GREEN}添加成功!${PLAIN}"
-    # 主动释放锁一瞬间，手动触发更新，以便UI立即显示
-    stop_edit_lock
-    cron_task >/dev/null 2>&1
-    sleep 1
-    show_main_menu
+    
+    # --- 修复开始: 使用 jq 参数传递变量，防止特殊字符报错，并增加逻辑判断 ---
+    # 使用 --arg 传递字符串，--argjson 传递数字，确保 JSON 绝对安全
+    if jq --argjson q "$quota" \
+          --arg m "$mode" \
+          --argjson l "$limit" \
+          --arg c "$comment" \
+          --arg p "$target_port" \
+       '.ports[$p] = {
+        "quota_gb": $q, 
+        "quota_mode": $m, 
+        "limit_mbps": $l, 
+        "comment": $c, 
+        "stats": {"acc_in": 0, "acc_out": 0},
+        "dyn_limit": {"enable": false}
+    }' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+    
+        rm "$tmp"
+        apply_port_rules "$target_port"
+        echo -e "${GREEN}添加成功!${PLAIN}"
+        stop_edit_lock
+        cron_task >/dev/null 2>&1
+        sleep 1
+        show_main_menu
+    else
+        rm "$tmp" 2>/dev/null
+        echo -e "${RED}写入配置失败! 请检查输入内容。${PLAIN}"
+        sleep 2
+        show_main_menu
+    fi
+    # --- 修复结束 ---
 }
 
 config_port_menu() {
@@ -588,23 +618,71 @@ config_port_menu() {
         read -p "请输入选项: " sub_choice
         
         local tmp=$(mktemp)
+        local success=false
+
         case $sub_choice in
-            1) read -p "新配额 (GB): " val; jq ".ports[\"$port\"].quota_gb = $val" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)" ;;
-            2) read -p "模式 (1.双向 2.仅出站): " m; local nm="in_out"; [ "$m" == "2" ] && nm="out_only"; jq ".ports[\"$port\"].quota_mode = \"$nm\"" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)" ;;
-            3) read -p "新限速 (Mbps): " val; jq ".ports[\"$port\"].limit_mbps = $val" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; apply_port_rules "$port" ;;
-            4) configure_dyn_qos "$port" ;;
-            5) read -p "新备注: " val; jq ".ports[\"$port\"].comment = \"$val\"" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)" ;;
-            6) read -p "确定清零吗? [y/N]: " confirm
-               if [[ "$confirm" == "y" ]]; then
+            1) 
+                read -p "新配额 (纯数字, GB): " val
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                        success=true
+                    fi
+                else
+                    echo -e "${RED}错误: 必须输入纯整数!${PLAIN}"; sleep 1
+                fi 
+                ;;
+            2) 
+                read -p "模式 (1.双向 2.仅出站): " m
+                local nm="in_out"
+                [ "$m" == "2" ] && nm="out_only"
+                if jq --arg v "$nm" --arg p "$port" '.ports[$p].quota_mode = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                    success=true
+                fi
+                ;;
+            3) 
+                read -p "新限速 (纯数字, Mbps): " val
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].limit_mbps = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                        apply_port_rules "$port"
+                        success=true
+                    fi
+                else
+                    echo -e "${RED}错误: 必须输入纯整数!${PLAIN}"; sleep 1
+                fi
+                ;;
+            4) 
+                configure_dyn_qos "$port" 
+                # 这里不需要设置 success，因为子函数内部处理了
+                ;;
+            5) 
+                read -p "新备注: " val
+                # 使用 --arg 字符串传参，完美支持空格和引号
+                if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                    success=true
+                fi
+                ;;
+            6) 
+                read -p "确定清零吗? [y/N]: " confirm
+                if [[ "$confirm" == "y" ]]; then
                    local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" | jq -r '.nftables[0].counter.bytes // 0')
                    local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" | jq -r '.nftables[0].counter.bytes // 0')
-                   # [核心] 重置时通过 update 将基准值同步到最新，防止流量暴涨
-                   jq ".ports[\"$port\"].stats.acc_in = 0 | .ports[\"$port\"].stats.acc_out = 0 | .ports[\"$port\"].stats.last_kernel_in = $k_in | .ports[\"$port\"].stats.last_kernel_out = $k_out" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"
-                   nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
-                   echo "已重置。"
-               fi ;;
+                   
+                   if jq --argjson ki "$k_in" --argjson ko "$k_out" --arg p "$port" \
+                      '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko' \
+                      "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                       
+                       nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
+                       echo -e "${GREEN}已重置。${PLAIN}"; sleep 1
+                   fi
+                fi 
+                ;;
             0) rm "$tmp"; break ;;
         esac
+        
+        if [ "$success" == "true" ]; then
+            echo -e "${GREEN}配置已更新。${PLAIN}"
+            sleep 0.5
+        fi
         rm "$tmp" 2>/dev/null
     done
     show_main_menu
@@ -614,25 +692,50 @@ configure_dyn_qos() {
     local port=$1
     local tmp=$(mktemp)
     echo -e "\n--- 配置动态突发限制 (Dynamic QoS) ---"
-    echo -e "1. 启用"
-    echo -e "2. 禁用"
-    echo -e "0. 取消"
+    echo -e "1. 启用 (Enable)"
+    echo -e "2. 禁用 (Disable)"
+    echo -e "0. 取消 (Cancel)"
     read -p "请选择: " qos_sel
+    
     if [ "$qos_sel" == "2" ]; then
-        # 禁用时，顺便重置惩罚状态，确保端口恢复
-        jq ".ports[\"$port\"].dyn_limit.enable = false | .ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"
-        # 强制刷新一次规则，确保解除限速
-        apply_port_rules "$port"
-        echo "已禁用。"
+        if jq --arg p "$port" '.ports[$p].dyn_limit.enable = false | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+            apply_port_rules "$port"
+            echo -e "${GREEN}已禁用 QoS 策略。${PLAIN}"
+        fi
+
     elif [ "$qos_sel" == "1" ]; then
-        read -p "(1/4) 触发阈值 (Mbps): " trig_mbps
-        read -p "(2/4) 连续触发时长 (分钟): " trig_time
-        read -p "(3/4) 惩罚限速值 (Mbps): " pun_mbps
-        read -p "(4/4) 惩罚持续时长 (分钟): " pun_time
-        jq ".ports[\"$port\"].dyn_limit = {\"enable\": true, \"trigger_mbps\": $trig_mbps, \"trigger_time\": $trig_time, \"punish_mbps\": $pun_mbps, \"punish_time\": $pun_time, \"strike_count\": 0, \"is_punished\": false}" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"
-        echo -e "${GREEN}动态策略已更新!${PLAIN}"
+        echo "请输入整数参数 (不要带单位):"
+        read -p "(1/4) 触发阈值 [例如 100] (Mbps): " trig_mbps
+        read -p "(2/4) 连续触发时长 [例如 5] (分钟): " trig_time
+        read -p "(3/4) 惩罚限速值 [例如 5] (Mbps): " pun_mbps
+        read -p "(4/4) 惩罚持续时长 [例如 60] (分钟): " pun_time
+        
+        # 统一校验所有输入是否为纯数字
+        if [[ ! "$trig_mbps" =~ ^[0-9]+$ ]] || [[ ! "$trig_time" =~ ^[0-9]+$ ]] || \
+           [[ ! "$pun_mbps" =~ ^[0-9]+$ ]] || [[ ! "$pun_time" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}错误: 所有参数必须为纯整数! 设置已取消。${PLAIN}"
+            rm "$tmp"; sleep 2; return
+        fi
+        
+        if jq --argjson tm "$trig_mbps" --argjson tt "$trig_time" \
+              --argjson pm "$pun_mbps"  --argjson pt "$pun_time" \
+              --arg p "$port" \
+              '.ports[$p].dyn_limit = {
+                  "enable": true, 
+                  "trigger_mbps": $tm, 
+                  "trigger_time": $tt, 
+                  "punish_mbps": $pm, 
+                  "punish_time": $pt, 
+                  "strike_count": 0, 
+                  "is_punished": false,
+                  "punish_end_ts": 0
+              }' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+              echo -e "${GREEN}动态策略已更新!${PLAIN}"
+        else
+              echo -e "${RED}写入失败，请检查配置文件权限。${PLAIN}"
+        fi
     fi
-    rm "$tmp"
+    rm "$tmp" 2>/dev/null
     sleep 1
 }
 
