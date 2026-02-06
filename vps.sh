@@ -2,12 +2,21 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v3.7 Stable
+# 版本: v3.8 Stable
 # 更新日志:
-# 1. [核心修复] Cron 死锁自动解除机制 (超时 10分钟自动解锁)
-# 2. [优化] 兼容 Loader 引导模式，防止安装路径冲突
-# 3. [优化] 提升 jq 数据处理的安全性
-# 4. [原特性] 包含 v3.6 的所有双轨制 Hex、整数清洗等修复
+# 1. [致命修复] jq printf → floor: 修复流量统计完全失效的问题
+# 2. [致命修复] nft JSON 索引 [0] → select(.counter): 修复内核计数器永远读为0
+# 3. [严重修复] 端口封禁状态改用 nft JSON 精确匹配，防止子串误判
+# 4. [严重修复] reload_all_rules 先销毁再重建，清理已删端口的残留规则
+# 5. [严重修复] 菜单系统递归调用改为循环，防止长时间使用栈溢出
+# 6. [修复] safe_write_config 使用 printf 替代 echo 防止特殊字符
+# 7. [修复] 添加 IPv6 TC 过滤器与 NFT inet 表保持一致
+# 8. [修复] 端口验证增加下限检查(1-65535), 配额不允许为0
+# 9. [修复] 新增端口补全 last_kernel_in/out 初始值
+# 10. [修复] DynQoS 速率计算改用 SI 单位 (Mbps)
+# 11. [优化] 移除 add_port_flow 中过早释放编辑锁的问题
+# 12. [优化] safe_write_config_from_file: 文件路径传参避免 ARG_MAX 限制
+# 13. [优化] nft/tc 关键操作添加错误检测与日志输出
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -122,7 +131,7 @@ install_deps() {
 init_nft_table() {
     nft list table $NFT_TABLE &>/dev/null
     if [ $? -ne 0 ]; then
-        nft add table $NFT_TABLE
+        nft add table $NFT_TABLE || { echo -e "${RED}[错误] 无法创建 nft 表，请检查 nftables 是否正常。${PLAIN}" >&2; return 1; }
         nft add set $NFT_TABLE blocked_ports { type inet_service\; }
         # 优先级 -5，确保先计数再通过系统防火墙(UFW等通常是0)
         nft add chain $NFT_TABLE input { type filter hook input priority -5\; }
@@ -142,9 +151,17 @@ init_tc_root() {
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
     [ -z "$iface" ] && iface=$(get_iface)
     
+    if [ -z "$iface" ]; then
+        echo -e "${RED}[错误] 无法获取网络接口，请检查网络配置。${PLAIN}" >&2
+        return 1
+    fi
+    
     # 初始化 HTB 根队列
     if ! tc qdisc show dev "$iface" | grep -q "htb 1:"; then
-        tc qdisc add dev "$iface" root handle 1: htb default 10
+        if ! tc qdisc add dev "$iface" root handle 1: htb default 10 2>/dev/null; then
+            echo -e "${RED}[错误] 无法在 $iface 上创建 TC 队列, 限速功能可能不可用。${PLAIN}" >&2
+            return 1
+        fi
         # 默认分类 1:10 (1Gbps/不限速通道)
         tc class add dev "$iface" parent 1: classid 1:10 htb rate 1000mbit
     fi
@@ -187,20 +204,27 @@ apply_port_rules() {
     fi
 
     # 3. TC: 限速
-    # 删除旧规则 (使用 Hex)
+    # 删除旧规则 (使用 Hex, IPv4 + IPv6)
     tc filter del dev "$iface" parent 1: protocol ip prio 1 handle 0x$port_hex fw 2>/dev/null
+    tc filter del dev "$iface" parent 1: protocol ipv6 prio 1 handle 0x$port_hex fw 2>/dev/null
     tc class del dev "$iface" parent 1: classid 1:$port_hex 2>/dev/null
 
     # 添加新规则 (如果限速不为0)
     if [ "$limit_mbps" != "0" ] && [ -n "$limit_mbps" ]; then
         # 建立类 ID (Hex)
-        tc class add dev "$iface" parent 1: classid 1:$port_hex htb rate "${limit_mbps}mbit"
-        # 建立过滤器 (Hex) 拦截 Nftables 的 Mark
-        tc filter add dev "$iface" parent 1: protocol ip prio 1 handle 0x$port_hex fw flowid 1:$port_hex
+        if tc class add dev "$iface" parent 1: classid 1:$port_hex htb rate "${limit_mbps}mbit" 2>/dev/null; then
+            # 建立过滤器 (Hex) 拦截 Nftables 的 Mark (IPv4 + IPv6)
+            tc filter add dev "$iface" parent 1: protocol ip prio 1 handle 0x$port_hex fw flowid 1:$port_hex
+            tc filter add dev "$iface" parent 1: protocol ipv6 prio 1 handle 0x$port_hex fw flowid 1:$port_hex 2>/dev/null
+        else
+            echo -e "${YELLOW}[警告] 端口 $port 的 TC 限速规则创建失败 (classid 1:$port_hex)${PLAIN}" >&2
+        fi
     fi
 }
 
 reload_all_rules() {
+    # 彻底销毁旧表再重建，防止已删除端口的规则残留
+    nft delete table $NFT_TABLE 2>/dev/null
     init_nft_table
     local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE")
     for port in $ports; do
@@ -214,10 +238,19 @@ reload_all_rules() {
 
 safe_write_config() {
     local content="$1"
-    # 使用 flock 确保原子写入
+    # 使用 flock 确保原子写入, printf 防止 echo 对 -e/-n 开头内容的误处理
     (
         flock -x 200
-        echo "$content" > "$CONFIG_FILE"
+        printf '%s\n' "$content" > "$CONFIG_FILE"
+    ) 200>"$LOCK_FILE"
+}
+
+# 从文件原子写入配置 (避免 ARG_MAX 限制)
+safe_write_config_from_file() {
+    local src_file="$1"
+    (
+        flock -x 200
+        cat "$src_file" > "$CONFIG_FILE"
     ) 200>"$LOCK_FILE"
 }
 
@@ -255,15 +288,15 @@ cron_task() {
         local mode=$(echo "$p_conf" | jq -r '.quota_mode')
         local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
         
-        # [格式清洗] 强制转整数，消除科学计数法
-        local acc_in=$(echo "$p_conf" | jq -r '.stats.acc_in // 0 | printf "%.0f" .')
-        local acc_out=$(echo "$p_conf" | jq -r '.stats.acc_out // 0 | printf "%.0f" .')
-        local last_k_in=$(echo "$p_conf" | jq -r '.stats.last_kernel_in // 0 | printf "%.0f" .')
-        local last_k_out=$(echo "$p_conf" | jq -r '.stats.last_kernel_out // 0 | printf "%.0f" .')
+        # [格式清洗] 强制转整数，消除科学计数法 (使用 jq 内置 floor)
+        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
+        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
+        local last_k_in=$(echo "$p_conf" | jq -r '(.stats.last_kernel_in // 0) | floor')
+        local last_k_out=$(echo "$p_conf" | jq -r '(.stats.last_kernel_out // 0) | floor')
 
-        # 读取内核
-        local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
-        local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
+        # 读取内核 (使用 select 兼容新版 nft 的 metainfo 头)
+        local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
+        local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         [ -z "$curr_k_in" ] && curr_k_in=0
         [ -z "$curr_k_out" ] && curr_k_out=0
 
@@ -299,7 +332,7 @@ cron_task() {
             local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
             local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
 
-            local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1024 / 1024" | bc)
+            local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1000000" | bc)
             local rule_changed=false
 
             if [ "$is_punished" == "true" ]; then
@@ -344,12 +377,13 @@ cron_task() {
         
         # 1024 计算 GiB
         local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
-        local is_blocked_nft=$(nft list set $NFT_TABLE blocked_ports 2>/dev/null | grep -q "$port" && echo "yes" || echo "no")
+        local is_blocked_nft=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)')
+        # is_blocked_nft 为 "true" 或 "false"
 
         if (( $(echo "$total_usage > $quota_bytes" | bc -l) )); then
-            [ "$is_blocked_nft" == "no" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
+            [ "$is_blocked_nft" == "false" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
         else
-            [ "$is_blocked_nft" == "yes" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \}
+            [ "$is_blocked_nft" == "true" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \}
         fi
     done
 
@@ -398,7 +432,7 @@ show_main_menu() {
 
     clear
     echo -e "====================================================================================="
-    echo -e "   Linux 端口流量管理 (v3.7 Stable) - 后台每分钟刷新"
+    echo -e "   Linux 端口流量管理 (v3.8 Stable) - 后台每分钟刷新"
     echo -e "====================================================================================="
     printf " %-4s %-12s %-10s %-25s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
     echo -e "-------------------------------------------------------------------------------------"
@@ -415,8 +449,8 @@ show_main_menu() {
         local quota=$(echo "$conf" | jq -r '.quota_gb')
         
         # UI 只读 JSON，不再自行计算，保证与 Cron 数据源一致
-        local acc_in=$(echo "$conf" | jq -r '.stats.acc_in // 0 | printf "%.0f" .')
-        local acc_out=$(echo "$conf" | jq -r '.stats.acc_out // 0 | printf "%.0f" .')
+        local acc_in=$(echo "$conf" | jq -r '(.stats.acc_in // 0) | floor')
+        local acc_out=$(echo "$conf" | jq -r '(.stats.acc_out // 0) | floor')
         
         local mode_str="[双向]"
         local total_used=0
@@ -430,7 +464,7 @@ show_main_menu() {
         local status_clean=""
         local is_blocked=false
         
-        if nft list set $NFT_TABLE blocked_ports 2>/dev/null | grep -q "$port"; then
+        if nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)' | grep -q "true"; then
             status_clean="[已阻断]"
             is_blocked=true
         else
@@ -478,7 +512,7 @@ show_main_menu() {
         3) delete_port_flow "${port_list[@]}" ;;
         4) uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
-        *) stop_edit_lock; show_main_menu ;;
+        *) ;; # 无效输入, 循环重新显示菜单
     esac
 }
 
@@ -512,26 +546,26 @@ add_port_flow() {
     echo -e "======================================================================"
     read -p "请输入选项: " sel
     local target_port=""
-    if [ "$sel" == "0" ]; then show_main_menu; return; fi
+    if [ "$sel" == "0" ]; then return; fi
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ -n "${map_ports[$sel]}" ]; then
         target_port=${map_ports[$sel]}
         if jq -e ".ports[\"$target_port\"]" "$CONFIG_FILE" >/dev/null; then
-            echo -e "${RED}该端口已在监控列表中!${PLAIN}"; sleep 2; show_main_menu; return
+            echo -e "${RED}该端口已在监控列表中!${PLAIN}"; sleep 2; return
         fi
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
         read -p "请输入端口号: " target_port
     else
-        show_main_menu; return
+        return
     fi
-    if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -gt 65535 ]; then
-        echo -e "${RED}无效端口${PLAIN}"; sleep 1; show_main_menu; return
+    if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+        echo -e "${RED}无效端口${PLAIN}"; sleep 1; return
     fi
     
     echo -e "\n>> 正在配置端口: $target_port"
     
     read -p "月流量配额 (纯数字, GB): " quota
-    if [[ ! "$quota" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}错误: 配额必须是纯整数，不要带单位!${PLAIN}"; sleep 2; show_main_menu; return
+    if [[ ! "$quota" =~ ^[0-9]+$ ]] || [ "$quota" -eq 0 ]; then
+        echo -e "${RED}错误: 配额必须是大于0的纯整数，不要带单位!${PLAIN}"; sleep 2; return
     fi
 
     echo "计费模式: 1.双向计费(默认)  2.仅出站计费"
@@ -542,7 +576,7 @@ add_port_flow() {
     read -p "出站限速 (纯数字, Mbps, 0为不限速): " limit
     if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
         if [ -z "$limit" ]; then limit=0; else
-             echo -e "${RED}错误: 限速必须是纯整数!${PLAIN}"; sleep 2; show_main_menu; return
+             echo -e "${RED}错误: 限速必须是纯整数!${PLAIN}"; sleep 2; return
         fi
     fi
     [ -z "$limit" ] && limit=0
@@ -562,22 +596,20 @@ add_port_flow() {
         "quota_mode": $m, 
         "limit_mbps": $l, 
         "comment": $c, 
-        "stats": {"acc_in": 0, "acc_out": 0},
+        "stats": {"acc_in": 0, "acc_out": 0, "last_kernel_in": 0, "last_kernel_out": 0},
         "dyn_limit": {"enable": false}
-    }' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+    }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
     
         rm "$tmp"
         apply_port_rules "$target_port"
-        echo -e "${GREEN}添加成功!${PLAIN}"
-        stop_edit_lock
-        cron_task >/dev/null 2>&1
+        echo -e "${GREEN}添加成功! 流量将在下次 Cron 周期开始统计。${PLAIN}"
         sleep 1
-        show_main_menu
+        return
     else
         rm "$tmp" 2>/dev/null
         echo -e "${RED}写入配置失败! 请检查输入内容。${PLAIN}"
         sleep 2
-        show_main_menu
+        return
     fi
 }
 
@@ -585,9 +617,9 @@ config_port_menu() {
     local arr=("$@")
     echo -e "\n请输入要配置的端口 ID (查看上方列表): "
     read -p "ID > " id
-    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then show_main_menu; return; fi
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
     local port=${arr[$((id-1))]}
-    if [ -z "$port" ]; then show_main_menu; return; fi
+    if [ -z "$port" ]; then return; fi
     
     while true; do
         local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
@@ -636,7 +668,7 @@ config_port_menu() {
             1) 
                 read -p "新配额 (纯数字, GB): " val
                 if [[ "$val" =~ ^[0-9]+$ ]]; then
-                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         success=true
                     fi
                 else
@@ -647,14 +679,14 @@ config_port_menu() {
                 read -p "模式 (1.双向 2.仅出站): " m
                 local nm="in_out"
                 [ "$m" == "2" ] && nm="out_only"
-                if jq --arg v "$nm" --arg p "$port" '.ports[$p].quota_mode = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                if jq --arg v "$nm" --arg p "$port" '.ports[$p].quota_mode = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                     success=true
                 fi
                 ;;
             3) 
                 read -p "新限速 (纯数字, Mbps): " val
                 if [[ "$val" =~ ^[0-9]+$ ]]; then
-                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].limit_mbps = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].limit_mbps = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                         apply_port_rules "$port"
                         success=true
                     fi
@@ -667,19 +699,19 @@ config_port_menu() {
                 ;;
             5) 
                 read -p "新备注: " val
-                if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                     success=true
                 fi
                 ;;
             6) 
                 read -p "确定清零吗? [y/N]: " confirm
                 if [[ "$confirm" == "y" ]]; then
-                   local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
-                   local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '.nftables[0].counter.bytes // 0')
+                   local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
+                   local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
                    
                    if jq --argjson ki "$k_in" --argjson ko "$k_out" --arg p "$port" \
                       '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko' \
-                      "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+                      "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                        
                        nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
                        echo -e "${GREEN}已重置。${PLAIN}"; sleep 1
@@ -695,7 +727,6 @@ config_port_menu() {
         fi
         rm "$tmp" 2>/dev/null
     done
-    show_main_menu
 }
 
 configure_dyn_qos() {
@@ -708,7 +739,7 @@ configure_dyn_qos() {
     read -p "请选择: " qos_sel
     
     if [ "$qos_sel" == "2" ]; then
-        if jq --arg p "$port" '.ports[$p].dyn_limit.enable = false | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+        if jq --arg p "$port" '.ports[$p].dyn_limit.enable = false | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
             apply_port_rules "$port"
             echo -e "${GREEN}已禁用 QoS 策略。${PLAIN}"
         fi
@@ -739,7 +770,7 @@ configure_dyn_qos() {
                   "strike_count": 0, 
                   "is_punished": false,
                   "punish_end_ts": 0
-              }' "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)"; then
+              }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
               echo -e "${GREEN}动态策略已更新!${PLAIN}"
         else
               echo -e "${RED}写入失败，请检查配置文件权限。${PLAIN}"
@@ -752,30 +783,30 @@ configure_dyn_qos() {
 delete_port_flow() {
     local arr=("$@")
     read -p "请输入要删除的端口 ID: " id
-    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then show_main_menu; return; fi
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
     local port=${arr[$((id-1))]}
-    if [ -z "$port" ]; then show_main_menu; return; fi
+    if [ -z "$port" ]; then return; fi
     
     read -p "确定删除端口 $port 监控吗? [y/N]: " confirm
     if [[ "$confirm" == "y" ]]; then
         # 1. 优先解封
         nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
         
-        # 2. 删除 TC 规则 (使用 Hex)
+        # 2. 删除 TC 规则 (使用 Hex, IPv4 + IPv6)
         local port_hex=$(printf '%x' $port)
         local iface=$(jq -r '.interface' "$CONFIG_FILE")
         tc filter del dev "$iface" parent 1: protocol ip prio 1 handle 0x$port_hex fw 2>/dev/null
+        tc filter del dev "$iface" parent 1: protocol ipv6 prio 1 handle 0x$port_hex fw 2>/dev/null
         tc class del dev "$iface" parent 1: classid 1:$port_hex 2>/dev/null
         
         # 3. 删除 Config
         local tmp=$(mktemp)
-        jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config "$(cat $tmp)" && rm "$tmp"
+        jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" && rm "$tmp"
         
         # 4. 彻底刷新
         reload_all_rules
         echo -e "${GREEN}删除完成。${PLAIN}"; sleep 1
     fi
-    show_main_menu
 }
 
 uninstall_script() {
@@ -802,7 +833,6 @@ uninstall_script() {
         echo -e "${GREEN}卸载完成。${PLAIN}"
         exit 0
     fi
-    show_main_menu
 }
 
 # ==============================================================================
@@ -816,5 +846,8 @@ if [ "$1" == "--monitor" ]; then
     cron_task
 else
     setup_cron
-    show_main_menu
+    # 使用循环代替递归调用，防止长时间使用导致栈溢出
+    while true; do
+        show_main_menu
+    done
 fi
