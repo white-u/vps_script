@@ -270,7 +270,7 @@ listen = ::0:${port}
 psk = ${psk}
 ipv6 = true
 tfo = true
-obfs = http
+obfs = off
 EOF
     chown snell:snell "${SNELL_CONF_DIR}/${port}.conf"
     chmod 600 "${SNELL_CONF_DIR}/${port}.conf"
