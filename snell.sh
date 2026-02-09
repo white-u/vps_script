@@ -84,6 +84,22 @@ check_root() {
     fi
 }
 
+# 同步快捷命令 (入口处调用, 确保 /usr/local/bin/snell 与运行版本一致)
+sync_script() {
+    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
+        # 文件模式: 直接复制 (跳过从快捷命令自身运行的情况)
+        if [[ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]]; then
+            cp "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+        fi
+    else
+        # 管道/进程替换模式: 从远程下载覆盖
+        if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" 2>/dev/null; then
+            chmod +x "$SCRIPT_PATH"
+        fi
+    fi
+}
+
 # 架构检测
 map_arch() {
     case $(uname -m) in
@@ -215,27 +231,6 @@ WantedBy=multi-user.target
 EOF
     if ! systemctl daemon-reload; then
         err "systemctl daemon-reload 失败，请检查 systemd 状态。"
-    fi
-    
-    # 安装快捷命令 (Self-Install)
-    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
-        # 文件模式: 直接复制
-        if [[ ! -f "$SCRIPT_PATH" ]] || [[ "$(realpath "$0")" != "$SCRIPT_PATH" ]]; then
-            cp "$0" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-            info "快捷命令 'snell' 已安装，以后可直接运行。"
-        fi
-    else
-        # 管道/进程替换模式: 从远程下载
-        if [[ ! -f "$SCRIPT_PATH" ]]; then
-            info "管道运行模式，正在从远程下载脚本安装快捷命令..."
-            if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" 2>/dev/null; then
-                chmod +x "$SCRIPT_PATH"
-                info "快捷命令 'snell' 已安装，以后可直接运行。"
-            else
-                warn "快捷命令安装失败 (网络问题)，核心功能不受影响。"
-            fi
-        fi
     fi
 
     # 恢复服务
@@ -594,6 +589,9 @@ menu() {
 }
 
 # ==================== 入口 ====================
+check_root
+sync_script
+
 if [[ $# -gt 0 ]]; then
     case "$1" in
         install) install_core ;;
