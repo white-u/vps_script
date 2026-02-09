@@ -1,9 +1,11 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 (星辰大海架构复刻版 v4.1)
+# Snell 多实例管理脚本 v5.0
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
+#
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh)
 
 set -euo pipefail
 
@@ -21,7 +23,10 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 BLUE="\033[36m"
+DIM="\033[2m"
 PLAIN="\033[0m"
+
+SCRIPT_VERSION="5.0"
 
 SNELL_BIN="/usr/local/bin/snell-server"
 SNELL_CONF_DIR="/etc/snell"
@@ -44,6 +49,26 @@ get_installed_major_ver() {
         cut -d. -f1 < "$ver_file"
     else
         echo "5"
+    fi
+}
+
+# 读取完整版本号
+get_installed_full_ver() {
+    local ver_file="${SNELL_CONF_DIR}/.version"
+    if [[ -f "$ver_file" ]]; then
+        cat "$ver_file"
+    else
+        echo ""
+    fi
+}
+
+# 获取实例运行状态
+get_instance_status() {
+    local port=$1
+    if systemctl is-active --quiet "snell@${port}" 2>/dev/null; then
+        echo -e "${GREEN}运行中${PLAIN}"
+    else
+        echo -e "${RED}已停止${PLAIN}"
     fi
 }
 
@@ -271,6 +296,7 @@ psk = ${psk}
 ipv6 = true
 tfo = true
 obfs = off
+dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888
 EOF
     chown snell:snell "${SNELL_CONF_DIR}/${port}.conf"
     chmod 600 "${SNELL_CONF_DIR}/${port}.conf"
@@ -299,8 +325,8 @@ del_instance() {
         return
     fi
     
-    echo -e "${BLUE}>>> 删除 Snell 实例${PLAIN}"
-    echo "当前运行的实例:"
+    echo -e " ${BLUE}>>> 删除 Snell 实例${PLAIN}"
+    echo -e " ─────────────────────────────────────"
     
     local i=1
     local ports=()
@@ -308,9 +334,12 @@ del_instance() {
         local p
         p=$(basename "$conf" .conf)
         ports+=("$p")
-        echo -e "  $i. 端口: ${GREEN}$p${PLAIN}"
+        local status
+        status=$(get_instance_status "$p")
+        printf "  [%d]  端口: %-8s  状态: %b\n" $i "$p" "$status"
         i=$((i+1))
     done
+    echo -e " ─────────────────────────────────────"
     
     read -rp "请选择要删除的序号 (输入 0 取消): " choice
     choice=$(strip_cr "$choice")
@@ -350,19 +379,21 @@ show_all_configs() {
     local snell_ver
     snell_ver=$(get_installed_major_ver)
     
-    echo -e "${BLUE}=== Snell 节点配置清单 ===${PLAIN}"
+    echo -e " ${BLUE}>>> Snell 节点配置清单${PLAIN}"
+    echo -e " ════════════════════════════════════════════════════════════════"
     for conf in "${configs[@]}"; do
         local p
         p=$(basename "$conf" .conf)
-        # 读取 PSK
         local key
         key=$(grep '^psk *=' "$conf" | cut -d= -f2 | tr -d '[:space:]' || true)
+        local status
+        status=$(get_instance_status "$p")
         
-        echo -e "${GREEN}端口: $p${PLAIN}"
-        echo -e "Surge/Shadowrocket:"
-        echo -e "snell-$p = snell, $ip, $p, psk=$key, version=${snell_ver}, tfo=true, reuse=true, ipv6=true"
-        echo "---------------------------------------------------"
+        echo -e " ${GREEN}▶ 端口: $p${PLAIN}  状态: $status"
+        echo -e "   ${DIM}snell-$p = snell, $ip, $p, psk=$key, version=${snell_ver}, tfo=true, reuse=true${PLAIN}"
+        echo -e " ────────────────────────────────────────────────────────────────"
     done
+    echo -e " ${DIM}提示: 可直接复制上方配置到 Surge / Stash / Shadowrocket 中使用。${PLAIN}"
 }
 
 show_single_config() {
@@ -375,10 +406,10 @@ show_single_config() {
     local snell_ver
     snell_ver=$(get_installed_major_ver)
     
-    echo
-    echo -e "--- 端口 ${port} 配置 ---"
-    echo -e "snell-$port = snell, $ip, $port, psk=$key, version=${snell_ver}, tfo=true, reuse=true, ipv6=true"
-    echo
+    echo -e " ────────────────────────────────────────────────────────────────"
+    echo -e " ${GREEN}▶ 端口 ${port} 客户端配置:${PLAIN}"
+    echo -e "   snell-$port = snell, $ip, $port, psk=$key, version=${snell_ver}, tfo=true, reuse=true"
+    echo -e " ────────────────────────────────────────────────────────────────"
 }
 
 # 防火墙工具
@@ -418,12 +449,53 @@ close_port() {
     fi
 }
 
+# 更新管理脚本
+update_script() {
+    echo
+    echo -e " ${BLUE}>>> 更新管理脚本${PLAIN}"
+    echo -e " 当前版本: v${SCRIPT_VERSION}"
+    echo -e " 远程地址: ${DIM}${SCRIPT_URL}${PLAIN}"
+    echo
+
+    local tmp_script
+    tmp_script=$(mktemp /tmp/snell_update.XXXXXX.sh)
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
+        err "下载失败，请检查网络。"
+    fi
+
+    # 提取远程版本号
+    local remote_ver
+    remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2 || true)
+
+    if [[ -z "$remote_ver" ]]; then
+        warn "无法解析远程版本号，继续更新..."
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+        info "已是最新版本 (v${SCRIPT_VERSION})，无需更新。"
+        rm -f "$tmp_script"
+        return
+    else
+        echo -e " 发现新版本: ${GREEN}v${remote_ver}${PLAIN}"
+    fi
+
+    mv -f "$tmp_script" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    info "脚本已更新完成! 正在重新加载..."
+    echo
+    exec "$SCRIPT_PATH"
+}
+
 # 彻底卸载
 uninstall_all() {
-    echo -e "${RED}警告: 即将卸载 Snell 核心及所有实例配置!${PLAIN}"
-    read -rp "确认执行? [y/N]: " confirm
+    echo
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo -e " ${RED}  警告: 即将卸载 Snell 核心及所有实例!${PLAIN}"
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo
+    read -rp " 确认执行? (输入 yes 确认): " confirm
     confirm=$(strip_cr "$confirm")
-    [[ "${confirm,,}" != "y" ]] && return
+    [[ "${confirm,,}" != "yes" ]] && { echo " 已取消。"; return; }
     
     # 停止并删除所有实例服务
     local port conf
@@ -451,51 +523,85 @@ uninstall_all() {
 # ==================== 菜单 ====================
 menu() {
     clear
-    echo -e "${BLUE}########## Snell 多实例管理脚本 v4.1 ##########${PLAIN}"
-    echo -e "------------------------------------------------"
-    
-    local core_ver="未安装"
+    echo -e "========================================================================================="
+    echo -e "   Snell 多实例管理脚本 (v${SCRIPT_VERSION})"
+    echo -e "========================================================================================="
+
+    # ---- 状态面板 ----
+    local core_status="${RED}未安装${PLAIN}"
     if [ -f "$SNELL_BIN" ]; then
-        if [[ -f "${SNELL_CONF_DIR}/.version" ]]; then
-            core_ver="v$(cat "${SNELL_CONF_DIR}/.version")"
+        local full_ver
+        full_ver=$(get_installed_full_ver)
+        if [[ -n "$full_ver" ]]; then
+            core_status="${GREEN}v${full_ver}${PLAIN}"
         else
-            core_ver="已安装 (版本未知)"
+            core_status="${GREEN}已安装${PLAIN} ${DIM}(版本未知)${PLAIN}"
         fi
     fi
-    
-    echo -e "核心状态: ${GREEN}${core_ver}${PLAIN}"
+    echo -e " 核心状态: ${core_status}    架构: $(uname -m)"
+    echo -e "-----------------------------------------------------------------------------------------"
+
+    # ---- 实例列表 ----
+    if ls "${SNELL_CONF_DIR}"/*.conf >/dev/null 2>&1; then
+        printf " %-6s %-10s %-12s %-8s %-8s %-s\n" "序号" "端口" "状态" "IPv6" "混淆" "PSK"
+        echo -e " ─────────────────────────────────────────────────────────────────────────────────────"
+
+        local i=1
+        for conf in "${SNELL_CONF_DIR}"/*.conf; do
+            local p
+            p=$(basename "$conf" .conf)
+            local status
+            status=$(get_instance_status "$p")
+            local key
+            key=$(grep '^psk *=' "$conf" | cut -d= -f2 | tr -d '[:space:]' || true)
+            local obfs
+            obfs=$(grep '^obfs *=' "$conf" | cut -d= -f2 | tr -d '[:space:]' || true)
+            local ipv6
+            ipv6=$(grep '^ipv6 *=' "$conf" | cut -d= -f2 | tr -d '[:space:]' || true)
+            local psk_short="${key:0:8}..."
+
+            printf " [%d]    %-10s %b  %-8s %-8s %-s\n" \
+                $i "$p" "$status" "${ipv6:-true}" "${obfs:-off}" "$psk_short"
+            i=$((i+1))
+        done
+    else
+        echo -e " ${DIM}暂无实例，请先安装核心并添加实例。${PLAIN}"
+    fi
+
+    echo -e "========================================================================================="
     echo
-    echo -e "1. 安装 / 更新 Snell 核心"
-    echo -e "2. ${GREEN}添加新的 Snell 实例 (端口)${PLAIN}"
-    echo -e "3. 删除已有实例"
-    echo -e "4. 查看所有配置链接"
-    echo -e "5. 卸载全部 (Core + 所有实例)"
-    echo -e "0. 退出"
-    echo
-    read -rp "请输入选项: " choice
+    echo -e " 1. 安装 / 更新 Snell 核心"
+    echo -e " 2. ${GREEN}添加实例 (新端口)${PLAIN}"
+    echo -e " 3. 删除实例"
+    echo -e " 4. 查看客户端配置"
+    echo -e " 5. 更新管理脚本"
+    echo -e " 6. ${RED}卸载全部${PLAIN}"
+    echo -e " 0. 退出"
+    echo -e "========================================================================================="
+    read -rp " 请输入选项: " choice
     choice=$(strip_cr "$choice")
     
     case $choice in
-        1) install_core; read -rp "按回车返回..." ;;
-        2) add_instance; read -rp "按回车返回..." ;;
-        3) del_instance; read -rp "按回车返回..." ;;
-        4) show_all_configs; read -rp "按回车返回..." ;;
-        5) uninstall_all ;;
+        1) install_core; read -rp " 按回车返回..." ;;
+        2) add_instance; read -rp " 按回车返回..." ;;
+        3) del_instance; read -rp " 按回车返回..." ;;
+        4) show_all_configs; read -rp " 按回车返回..." ;;
+        5) update_script; read -rp " 按回车返回..." ;;
+        6) uninstall_all ;;
         0) exit 0 ;;
-        *) warn "无效选项, 请重新输入" ;;
+        *) ;;
     esac
 }
 
-# 入口判断
+# ==================== 入口 ====================
 if [[ $# -gt 0 ]]; then
-    # 命令行参数: 单次执行
     case "$1" in
         install) install_core ;;
-        add) add_instance ;;
-        *) menu ;;
+        add)     add_instance ;;
+        update)  update_script ;;
+        *)       menu ;;
     esac
 else
-    # 交互模式: 循环菜单
     while true; do
         menu
     done
