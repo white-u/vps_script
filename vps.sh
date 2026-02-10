@@ -2,37 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v4.2 Stable
-# 更新日志:
-# 1. [致命修复] jq printf → floor: 修复流量统计完全失效的问题
-# 2. [致命修复] nft JSON 索引 [0] → select(.counter): 修复内核计数器永远读为0
-# 3. [严重修复] 端口封禁状态改用 nft JSON 精确匹配，防止子串误判
-# 4. [严重修复] reload_all_rules 先销毁再重建，清理已删端口的残留规则
-# 5. [严重修复] 菜单系统递归调用改为循环，防止长时间使用栈溢出
-# 6. [修复] safe_write_config 使用 printf 替代 echo 防止特殊字符
-# 7. [修复] 添加 IPv6 TC 过滤器与 NFT inet 表保持一致
-# 8. [修复] 端口验证增加下限检查(1-65535), 配额不允许为0
-# 9. [修复] 新增端口补全 last_kernel_in/out 初始值
-# 10. [修复] DynQoS 速率计算改用 SI 单位 (Mbps)
-# 11. [优化] 移除 add_port_flow 中过早释放编辑锁的问题
-# 12. [优化] safe_write_config_from_file: 文件路径传参避免 ARG_MAX 限制
-# 13. [优化] nft/tc 关键操作添加错误检测与日志输出
-# 14. [新功能] 自动重置配额: 支持设置每月1-31日自动清零流量并开启新周期
-# 15. [新功能] Telegram 通知: 配额阈值预警/封禁/DynQoS惩罚/恢复/自动重置
-# --- v4.1 ---
-# 16. [严重修复] NFT 规则检查 grep -q → grep -qw: 修复带引号输出不匹配导致
-#     规则重复添加、流量翻倍计数; 同时修复端口子串误判(80 vs 8080)
-# 17. [严重修复] cron_task 写入改为 safe_write_config_from_file 防止 ARG_MAX 截断
-# 18. [修复] 卸载 crontab 改为 grep -vF 精确匹配，防止误删含"pm"的无关条目
-# 19. [修复] DynQoS 禁用/启用时同步重置 notify_state 防止通知丢失
-# 20. [修复] Telegram 消息对备注中 Markdown 特殊字符 (*_`[) 自动转义
-# 21. [修复] config_port_menu 配额修改增加 >0 校验
-# 22. [修复] delete_port_flow iface 读取增加 get_iface fallback
-# --- v4.2 ---
-# 23. [严重修复] TC default classid 从 1:10 改为 1:fffe，修复端口16(hex=10)
-#     与默认分类冲突导致 HTB 规则被破坏的问题; 增加保留端口保护
-# 24. [修复] 主菜单已阻断行输出去掉 \r 覆盖技巧，改为条件分支直接打印
-# 25. [优化] 所有 read 输入增加 strip_cr 清洗，防止 Windows 粘贴 \r 导致校验失败
+# 版本: v4.3 Stable
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -44,6 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
+SCRIPT_VERSION="4.3"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -59,6 +30,20 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PLAIN='\033[0m'
 
+# --- 临时资源清理 ---
+_CLEANUP_FILES=()
+_IS_MENU_MODE=false
+_global_cleanup() {
+    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+        rm -rf "$f" 2>/dev/null
+    done
+    # 仅菜单模式才删除编辑锁, cron(--monitor) 模式不能删(锁可能属于菜单进程)
+    if [ "$_IS_MENU_MODE" == "true" ]; then
+        rm -f "$USER_EDIT_LOCK" 2>/dev/null
+    fi
+}
+trap _global_cleanup EXIT INT TERM
+
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
 strip_cr() { echo "${1//$'\r'/}"; }
@@ -68,7 +53,10 @@ strip_cr() { echo "${1//$'\r'/}"; }
 # ==============================================================================
 
 check_root() {
-    [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行此脚本。${PLAIN}" && exit 1
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误: 必须使用 root 权限运行此脚本。${PLAIN}"
+        exit 1
+    fi
 }
 
 # 智能安装逻辑：兼容管道运行、Loader加载和本地运行
@@ -81,12 +69,13 @@ install_shortcut() {
     
     echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
     
-    # 强制从网络下载最新版到安装目录
-    # 注意：如果这台机器没有外网，这里会失败，但不影响核心逻辑运行
-    curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_PATH" 2>/dev/null
+    # 下载到临时文件, 校验成功后再覆盖, 防止中途断网损坏已有脚本
+    local tmp_dl=$(mktemp /tmp/pm_install.XXXXXX.sh)
+    curl -fsSL --max-time 15 "$DOWNLOAD_URL" -o "$tmp_dl" 2>/dev/null
     
     # 验证下载完整性
-    if [ -s "$INSTALL_PATH" ]; then
+    if [ -s "$tmp_dl" ]; then
+        mv -f "$tmp_dl" "$INSTALL_PATH"
         chmod +x "$INSTALL_PATH"
         echo -e "${GREEN}安装成功! 快捷指令: $SHORTCUT_NAME${PLAIN}"
         echo -e "${GREEN}正在启动管理面板...${PLAIN}"
@@ -94,6 +83,7 @@ install_shortcut() {
         # 移交控制权给安装好的脚本
         exec "$INSTALL_PATH" "$@"
     else
+        rm -f "$tmp_dl"
         # 降级策略：本地复制 (仅当本地文件存在且非管道运行时)
         if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
             echo -e "${YELLOW}网络下载失败，尝试本地安装...${PLAIN}"
@@ -289,24 +279,28 @@ safe_write_config_from_file() {
 # 2.5 Telegram 通知引擎
 # ==============================================================================
 
-# 获取通知标识 (优先端口备注 → hostname → IP)
+# 获取通知标识 (优先 hostname + 端口备注)
+# 格式: "hostname (备注)" 或 "hostname" 或 "IP"
 # 返回值经过 Markdown 安全转义，可直接用于 Telegram 消息
 get_host_label() {
     local comment="$1"
-    local raw=""
-    # 优先使用端口备注
-    if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
-        raw="$comment"
+    local host_part=""
+    
+    # 主标识: hostname → IP
+    local h=$(hostname 2>/dev/null)
+    if [ -n "$h" ] && [ "$h" != "localhost" ]; then
+        host_part="$h"
     else
-        # 回退: hostname
-        local h=$(hostname 2>/dev/null)
-        if [ -n "$h" ] && [ "$h" != "localhost" ]; then
-            raw="$h"
-        else
-            # 回退: 公网 IP
-            raw=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1)
-        fi
+        host_part=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1)
     fi
+    [ -z "$host_part" ] && host_part="Unknown"
+    
+    # 附加备注
+    local raw="$host_part"
+    if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
+        raw="${host_part} (${comment})"
+    fi
+    
     # 转义 Telegram Markdown V1 特殊字符: * _ ` [
     echo "$raw" | sed 's/[_*`\[]/\\&/g'
 }
@@ -416,7 +410,85 @@ tg_notify_reset() {
 ⏰ 新周期已开始"
 }
 
+# 周期性流量报告 (汇总所有端口)
+tg_notify_report() {
+    local host_label=$(get_host_label "")
+    local now_str=$(date '+%Y-%m-%d %H:%M')
+    local report_lines=""
+    
+    local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null | sort -n)
+    [ -z "$ports" ] && return
+    
+    for port in $ports; do
+        local p_conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
+        local comment=$(echo "$p_conf" | jq -r '.comment // ""')
+        local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
+        local mode=$(echo "$p_conf" | jq -r '.quota_mode')
+        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
+        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
+        local limit=$(echo "$p_conf" | jq -r '.limit_mbps // 0')
+        local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
+        
+        local total_used=0
+        if [ "$mode" == "out_only" ]; then
+            total_used=$acc_out
+        else
+            total_used=$(echo "scale=0; $acc_in + $acc_out" | bc)
+        fi
+        
+        local used_fmt=$(fmt_bytes_plain "$total_used")
+        local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
+        local percent=0
+        if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
+            percent=$(echo "scale=1; $total_used * 100 / $quota_bytes" | bc 2>/dev/null)
+        fi
+        [ -z "$percent" ] && percent=0
+        
+        # 状态图标
+        local status_icon="✅"
+        local is_blocked=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)')
+        if [ "$is_blocked" == "true" ]; then
+            status_icon="🚫"
+        elif [ "$is_punished" == "true" ]; then
+            status_icon="⚡"
+        elif [ $(echo "$percent >= 80" | bc 2>/dev/null) -eq 1 ] 2>/dev/null; then
+            status_icon="⚠️"
+        fi
+        
+        # 端口标题
+        local port_title="\`${port}\`"
+        if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
+            local safe_comment=$(echo "$comment" | sed 's/[_*`\[]/\\&/g')
+            port_title="\`${port}\` ${safe_comment}"
+        fi
+        
+        # 限速信息
+        local speed_info=""
+        if [ "$is_punished" == "true" ]; then
+            local pun_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps // 0')
+            speed_info=" ⚡${pun_mbps}M"
+        elif [ "$limit" != "0" ] && [ -n "$limit" ]; then
+            speed_info=" 🔒${limit}M"
+        fi
+        
+        report_lines="${report_lines}
+${status_icon} ${port_title}
+   ${used_fmt} / ${quota_gb}GB (${percent}%)${speed_info}"
+    done
+    
+    tg_send "📋 *定时流量报告*
+🖥 主机: \`${host_label}\`
+⏰ ${now_str}
+${report_lines}"
+}
+
+CRON_LOCK_FILE="/var/run/pm_cron.lock"
+
 cron_task() {
+    # 单例锁: 如果上一轮 cron 还没跑完, 直接退出不堆积
+    exec 9>"$CRON_LOCK_FILE"
+    flock -n 9 || exit 0
+
     # [核心修复 V3.7] 智能死锁解除与并发避让
     if [ -f "$USER_EDIT_LOCK" ]; then
         # 获取锁文件未更新的秒数
@@ -643,6 +715,22 @@ cron_task() {
         safe_write_config_from_file "$_tmp_final"
         rm -f "$_tmp_final"
     fi
+
+    # --- 周期性流量报告 ---
+    local report_hours=$(jq -r '.telegram.report_interval_hours // 0' "$CONFIG_FILE" 2>/dev/null)
+    if [ "$report_hours" -gt 0 ] 2>/dev/null; then
+        local last_report_ts=$(jq -r '.telegram.last_report_ts // 0' "$CONFIG_FILE" 2>/dev/null)
+        local report_interval_sec=$((report_hours * 3600))
+        local next_report_ts=$((last_report_ts + report_interval_sec))
+        
+        if [ "$current_ts" -ge "$next_report_ts" ]; then
+            tg_notify_report
+            # 更新 last_report_ts
+            local _tmp_rpt=$(mktemp)
+            jq --argjson ts "$current_ts" '.telegram.last_report_ts = $ts' "$CONFIG_FILE" > "$_tmp_rpt" && safe_write_config_from_file "$_tmp_rpt"
+            rm -f "$_tmp_rpt"
+        fi
+    fi
 }
 
 setup_cron() {
@@ -679,13 +767,11 @@ fmt_bytes() {
 }
 
 show_main_menu() {
-    # 捕获 Ctrl+C，确保退出时删除锁
-    trap stop_edit_lock EXIT SIGINT SIGTERM
     start_edit_lock 
 
     clear
     echo -e "========================================================================================="
-    echo -e "   Linux 端口流量管理 (v4.2 Stable) - 后台每分钟刷新"
+    echo -e "   Linux 端口流量管理 (v${SCRIPT_VERSION}) - 后台每分钟刷新"
     echo -e "========================================================================================="
     printf " %-4s %-12s %-10s %-30s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "出站限速" "备注"
     echo -e "-----------------------------------------------------------------------------------------"
@@ -749,7 +835,7 @@ show_main_menu() {
         fi
         
         port_list[$i]=$port
-        ((i++))
+        i=$((i + 1))
     done
     echo -e "-----------------------------------------------------------------------------------------"
     echo -e " 说明: 流量每分钟更新一次。[Rxx]=每月xx日自动重置。当前正在编辑中，后台刷新已暂停。\n"
@@ -763,7 +849,8 @@ show_main_menu() {
     echo -e " 2. 配置 端口 (修改/动态QoS/重置)"
     echo -e " 3. 删除 监控端口"
     echo -e " 4. 通知设置 (Telegram) $tg_status"
-    echo -e " 5. 卸载 脚本"
+    echo -e " 5. 更新 脚本"
+    echo -e " 6. ${RED}卸载 脚本${PLAIN}"
     echo -e " 0. 退出"
     echo -e "========================================================================================="
     read -p "请输入选项: " choice
@@ -774,7 +861,8 @@ show_main_menu() {
         2) config_port_menu "${port_list[@]}" ;;
         3) delete_port_flow "${port_list[@]}" ;;
         4) configure_telegram ;;
-        5) uninstall_script ;;
+        5) update_script ;;
+        6) uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
         *) ;; # 无效输入, 循环重新显示菜单
     esac
@@ -802,7 +890,7 @@ add_port_flow() {
             printf " [%d]  %-15s %-25s %-10s\n" $idx "${p_port}/${p_proto}" "$p_proc" "[可选]"
         fi
         map_ports[$idx]=$p_port
-        ((idx++))
+        idx=$((idx + 1))
     done <<< "$scan_data"
     echo -e "----------------------------------------------------------------------"
     echo -e " [M]   手动输入端口号"
@@ -889,13 +977,13 @@ add_port_flow() {
         "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true}
     }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
     
-        rm "$tmp"
+        rm -f "$tmp"
         apply_port_rules "$target_port"
         echo -e "${GREEN}添加成功! 流量将在下次 Cron 周期开始统计。${PLAIN}"
         sleep 1
         return
     else
-        rm "$tmp" 2>/dev/null
+        rm -f "$tmp"
         echo -e "${RED}写入配置失败! 请检查输入内容。${PLAIN}"
         sleep 2
         return
@@ -1037,14 +1125,14 @@ config_port_menu() {
                     echo -e "${RED}错误: 必须输入 0-31 的整数!${PLAIN}"; sleep 1
                 fi
                 ;;
-            0) rm "$tmp"; break ;;
+            0) rm -f "$tmp"; break ;;
         esac
         
         if [ "$success" == "true" ]; then
             echo -e "${GREEN}配置已更新。${PLAIN}"
             sleep 0.5
         fi
-        rm "$tmp" 2>/dev/null
+        rm -f "$tmp"
     done
 }
 
@@ -1077,7 +1165,7 @@ configure_dyn_qos() {
         if [[ ! "$trig_mbps" =~ ^[0-9]+$ ]] || [[ ! "$trig_time" =~ ^[0-9]+$ ]] || \
            [[ ! "$pun_mbps" =~ ^[0-9]+$ ]] || [[ ! "$pun_time" =~ ^[0-9]+$ ]]; then
             echo -e "${RED}错误: 所有参数必须为纯整数! 设置已取消。${PLAIN}"
-            rm "$tmp"; sleep 2; return
+            rm -f "$tmp"; sleep 2; return
         fi
         
         if jq --argjson tm "$trig_mbps" --argjson tt "$trig_time" \
@@ -1098,7 +1186,7 @@ configure_dyn_qos() {
               echo -e "${RED}写入失败，请检查配置文件权限。${PLAIN}"
         fi
     fi
-    rm "$tmp" 2>/dev/null
+    rm -f "$tmp"
     sleep 1
 }
 
@@ -1114,6 +1202,7 @@ configure_telegram() {
         local tg_chat=$(echo "$tg_conf" | jq -r '.chat_id // ""')
         local tg_api=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
         local tg_thresholds=$(echo "$tg_conf" | jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")')
+        local tg_report_hours=$(echo "$tg_conf" | jq -r '.report_interval_hours // 0')
         
         # 脱敏显示 Token
         local token_display="未配置"
@@ -1136,6 +1225,11 @@ configure_telegram() {
         echo -e " ChatID: ${tg_chat:-未配置}"
         echo -e " API:    $tg_api"
         echo -e " 阈值:   $tg_thresholds (%)"
+        if [ "$tg_report_hours" -gt 0 ] 2>/dev/null; then
+            echo -e " 定时报告: 每 ${GREEN}${tg_report_hours}${PLAIN} 小时"
+        else
+            echo -e " 定时报告: ${YELLOW}未开启${PLAIN}"
+        fi
         echo -e "========================================"
         echo -e " 1. 配置 Bot Token"
         echo -e " 2. 配置 Chat ID"
@@ -1143,6 +1237,7 @@ configure_telegram() {
         echo -e " 4. 开启/关闭 通知"
         echo -e " 5. 修改 通知阈值"
         echo -e " 6. 修改 API 地址 (国内反代)"
+        echo -e " 7. 配置 定时流量报告"
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " tg_choice
@@ -1259,6 +1354,24 @@ configure_telegram() {
                     success=true
                 fi
                 ;;
+            7)
+                echo -e "\n当前定时报告: $([ "$tg_report_hours" -gt 0 ] 2>/dev/null && echo "每 ${tg_report_hours} 小时" || echo "未开启")"
+                echo -e "输入间隔小时数 (1-168), 0 为关闭"
+                read -p "间隔 (小时): " rpt_hours
+                rpt_hours=$(strip_cr "$rpt_hours")
+                if [[ "$rpt_hours" =~ ^[0-9]+$ ]] && [ "$rpt_hours" -le 168 ]; then
+                    if jq --argjson v "$rpt_hours" '.telegram.report_interval_hours = $v | .telegram.last_report_ts = 0' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        if [ "$rpt_hours" -eq 0 ]; then
+                            echo -e "${GREEN}定时报告已关闭。${PLAIN}"
+                        else
+                            echo -e "${GREEN}已设置每 ${rpt_hours} 小时发送流量报告。${PLAIN}"
+                        fi
+                        success=true
+                    fi
+                else
+                    echo -e "${RED}错误: 请输入 0-168 之间的整数!${PLAIN}"; sleep 1
+                fi
+                ;;
             0)
                 rm -f "$tmp"; break
                 ;;
@@ -1293,7 +1406,7 @@ delete_port_flow() {
         
         # 3. 删除 Config
         local tmp=$(mktemp)
-        jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" && rm "$tmp"
+        jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" && rm -f "$tmp"
         
         # 4. 彻底刷新
         reload_all_rules
@@ -1301,11 +1414,49 @@ delete_port_flow() {
     fi
 }
 
+update_script() {
+    echo
+    echo -e " ${BLUE}>>> 更新管理脚本${PLAIN}"
+    echo -e " 当前版本: v${SCRIPT_VERSION}"
+    echo -e " 远程地址: ${DOWNLOAD_URL}"
+    echo
+
+    local tmp_script=$(mktemp /tmp/pm_update.XXXXXX.sh)
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if ! curl -fsSL --max-time 15 "$DOWNLOAD_URL" -o "$tmp_script" 2>/dev/null; then
+        echo -e "${RED}下载失败，请检查网络。${PLAIN}"
+        rm -f "$tmp_script"
+        sleep 2
+        return
+    fi
+
+    # 提取远程版本号
+    local remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2)
+
+    if [ -z "$remote_ver" ]; then
+        echo -e "${YELLOW}无法解析远程版本号，继续更新...${PLAIN}"
+    elif [ "$remote_ver" == "$SCRIPT_VERSION" ]; then
+        echo -e "${GREEN}已是最新版本 (v${SCRIPT_VERSION})，无需更新。${PLAIN}"
+        rm -f "$tmp_script"
+        sleep 1
+        return
+    else
+        echo -e " 发现新版本: ${GREEN}v${remote_ver}${PLAIN}"
+    fi
+
+    mv -f "$tmp_script" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    echo -e "${GREEN}脚本已更新完成! 正在重新加载...${PLAIN}"
+    echo
+    exec "$INSTALL_PATH"
+}
+
 uninstall_script() {
     echo -e "${RED}!!! 危险操作警告 !!!${PLAIN}"
-    read -p "确定要彻底卸载 (清除规则、停止服务、删除文件)? [y/N]: " confirm
+    read -p "确定要彻底卸载 (清除规则、停止服务、删除文件)? (输入 yes 确认): " confirm
     confirm=$(strip_cr "$confirm")
-    if [[ "${confirm,,}" == "y" ]]; then
+    if [[ "${confirm,,}" == "yes" ]]; then
         # 1. 停服务
         crontab -l 2>/dev/null | grep -vF "$INSTALL_PATH --monitor" | crontab -
         stop_edit_lock
@@ -1320,6 +1471,7 @@ uninstall_script() {
         # 3. 删文件
         rm -rf "$CONFIG_DIR"
         rm -f "$LOCK_FILE"
+        rm -f "$CRON_LOCK_FILE"
         rm -f "$USER_EDIT_LOCK"
         rm -f "$INSTALL_PATH"
         
@@ -1332,13 +1484,16 @@ uninstall_script() {
 # 入口逻辑
 # ==============================================================================
 check_root
-install_shortcut "$1"
+install_shortcut "${1:-}"
 install_deps
 
-if [ "$1" == "--monitor" ]; then
+if [ "${1:-}" == "--monitor" ]; then
     cron_task
+elif [ "${1:-}" == "update" ]; then
+    update_script
 else
     setup_cron
+    _IS_MENU_MODE=true
     # 使用循环代替递归调用，防止长时间使用导致栈溢出
     while true; do
         show_main_menu
