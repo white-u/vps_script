@@ -331,7 +331,7 @@ add_reality() {
     local tag="reality_$port"
     
     local chain_setting=$(ask_chain_proxy)
-    local tmp=$(mktemp)
+    local tmp=$(mktemp /tmp/xray_XXXXXX.json)
     _CLEANUP_FILES+=("$tmp")
     cp "$XRAY_CONF_FILE" "$tmp"
     
@@ -378,7 +378,7 @@ add_ss2022() {
     local tag="ss_$port"
     
     local chain_setting=$(ask_chain_proxy)
-    local tmp=$(mktemp)
+    local tmp=$(mktemp /tmp/xray_XXXXXX.json)
     _CLEANUP_FILES+=("$tmp")
     cp "$XRAY_CONF_FILE" "$tmp"
     
@@ -443,7 +443,7 @@ configure_advanced() {
                 read -p "请输入上游 SOCKS5 地址 (如 127.0.0.1:40000): " addr
                 addr=$(strip_cr "$addr")
                 if [[ -z "$addr" ]]; then
-                    local tmp=$(mktemp)
+                    local tmp=$(mktemp /tmp/xray_XXXXXX.json)
                     _CLEANUP_FILES+=("$tmp")
                     # 同时删除 outbound 和引用它的路由规则
                     jq 'del(.outbounds[] | select(.tag=="chain_proxy")) |
@@ -453,7 +453,7 @@ configure_advanced() {
                 else
                     local ip=${addr%:*}
                     local port=${addr#*:}
-                    local tmp=$(mktemp)
+                    local tmp=$(mktemp /tmp/xray_XXXXXX.json)
                     _CLEANUP_FILES+=("$tmp")
                     jq 'del(.outbounds[] | select(.tag=="chain_proxy"))' "$XRAY_CONF_FILE" > "$tmp"
                     jq --arg ip "$ip" --arg port "$port" \
@@ -468,7 +468,7 @@ configure_advanced() {
                 fi
                 ;;
             2)
-                local tmp=$(mktemp)
+                local tmp=$(mktemp /tmp/xray_XXXXXX.json)
                 _CLEANUP_FILES+=("$tmp")
                 echo -e "正在应用: 屏蔽广告 + 屏蔽CN + 屏蔽局域网..."
                 # 先删除已有的同类规则(幂等), 再追加
@@ -610,7 +610,7 @@ delete_node() {
         
         if [[ -n "$target_tag" ]]; then
             echo -e "${YELLOW}正在删除节点: $target_tag ...${PLAIN}"
-            local tmp=$(mktemp)
+            local tmp=$(mktemp /tmp/xray_XXXXXX.json)
             _CLEANUP_FILES+=("$tmp")
             jq --arg t "$target_tag" 'del(.inbounds[] | select(.tag==$t))' "$XRAY_CONF_FILE" > "$tmp"
             jq --arg t "$target_tag" 'del(.routing.rules[] | select(.inboundTag and (.inboundTag[] == $t)))' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
