@@ -211,19 +211,54 @@ EOF
 
 safe_save_config() {
     local tmp_json=$1
-    if jq . "$tmp_json" >/dev/null 2>&1; then
-        cp "$tmp_json" "$XRAY_CONF_FILE"
-        systemctl restart xray
-        # 健康检查: 等待 1 秒后确认服务状态
-        sleep 1
-        if systemctl is-active --quiet xray; then
-            echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
-        else
-            echo -e "${RED}警告: 配置已保存但 Xray 启动失败，请检查日志: journalctl -u xray${PLAIN}"
+    
+    # 1. JSON 语法校验
+    if ! jq . "$tmp_json" >/dev/null 2>&1; then
+        echo -e "${RED}JSON 语法校验失败，未保存。${PLAIN}"
+        return 1
+    fi
+    
+    # 2. Xray 语义校验 (不启动服务, 仅验证配置)
+    if [[ -f "$XRAY_BIN" ]]; then
+        local test_output
+        test_output=$("$XRAY_BIN" run -test -c "$tmp_json" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}Xray 配置校验失败，未保存。错误信息:${PLAIN}"
+            echo "$test_output" | tail -5
             return 1
         fi
+    fi
+    
+    # 3. 备份旧配置
+    local backup=""
+    if [[ -f "$XRAY_CONF_FILE" ]] && [[ -s "$XRAY_CONF_FILE" ]]; then
+        backup="${XRAY_CONF_FILE}.bak"
+        cp "$XRAY_CONF_FILE" "$backup"
+    fi
+    
+    # 4. 写入新配置并重启
+    cp "$tmp_json" "$XRAY_CONF_FILE"
+    systemctl restart xray
+    sleep 1
+    
+    if systemctl is-active --quiet xray; then
+        echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
+        rm -f "$backup"
     else
-        echo -e "${RED}JSON 配置生成校验失败，未保存。${PLAIN}"
+        echo -e "${RED}Xray 启动失败! 正在回滚...${PLAIN}"
+        # 显示失败原因
+        journalctl -u xray --no-pager -n 5 2>/dev/null | grep -i "failed\|error" | head -3
+        if [[ -n "$backup" ]] && [[ -f "$backup" ]]; then
+            cp "$backup" "$XRAY_CONF_FILE"
+            systemctl restart xray 2>/dev/null
+            sleep 1
+            if systemctl is-active --quiet xray; then
+                echo -e "${YELLOW}已回滚到上一份有效配置，服务已恢复。${PLAIN}"
+            else
+                echo -e "${RED}回滚后仍无法启动，请手动检查: journalctl -u xray -n 20${PLAIN}"
+            fi
+        fi
+        rm -f "$backup"
         return 1
     fi
 }
@@ -285,7 +320,12 @@ add_reality() {
     
     local uuid=$($XRAY_BIN uuid)
     local keys=$($XRAY_BIN x25519)
-    local pk=$(echo "$keys" | grep "Private" | awk '{print $3}')
+    local pk=$(echo "$keys" | grep -i "private" | awk '{print $NF}')
+    if [[ -z "$pk" ]]; then
+        echo -e "${RED}错误: 无法生成 Reality 密钥对，请检查 Xray 版本。${PLAIN}"
+        echo -e "${YELLOW}x25519 输出: ${keys}${PLAIN}"
+        return
+    fi
     # 注意: 这里只需要存 PrivateKey 到配置文件, PublicKey 后续通过 pk 计算
     local short_id=$(openssl rand -hex 4)
     local tag="reality_$port"
@@ -525,7 +565,7 @@ show_node_info() {
         local sni=$(echo "$node" | jq -r '.streamSettings.realitySettings.serverNames[0]')
         local pbk=$(echo "$node" | jq -r '.streamSettings.realitySettings.privateKey')
         # [修复] 正确计算公钥: 使用参数而非管道
-        local pubk=$($XRAY_BIN x25519 -i "$pbk" | grep "Public" | awk '{print $3}')
+        local pubk=$($XRAY_BIN x25519 -i "$pbk" | grep -i "public" | awk '{print $NF}')
         local sid=$(echo "$node" | jq -r '.streamSettings.realitySettings.shortIds[0]')
         
         local link="vless://${uuid}@${ip}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${pubk}&sid=${sid}&type=tcp&headerType=none#${tag}"
