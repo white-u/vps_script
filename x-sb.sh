@@ -1,12 +1,12 @@
 #!/bin/bash
 #
-# Xray 多协议管理脚本 (星辰大海架构复刻版 v1.2 Refined)
-# - 修复: Reality 公钥计算方式 (从 Stdin 改为 Arg 传参)
-# - 修复: 脚本自更新改为原子操作 (防断网损坏)
-# - 修复: SNI 选择索引错位 / SS 分享链接格式 / 路由规则幂等性
-# - 修复: safe_save_config 返回值 / delete_node 精确匹配
-# - 优化: 移除 set -euo pipefail, 节点遍历提取公共函数
-# - 进阶功能: 链式代理 (Chain Proxy) + 路由分流
+# Xray 多协议管理脚本 (星辰大海架构复刻版 v1.3)
+# v1.3:
+# - 修复: publicKey 存入配置(不再运行时计算), 兼容 Xray 26.x (Password=PublicKey)
+# - 修复: freedom outbound 加 domainStrategy:UseIPv4v6 (修复部分站点不通)
+# - 修复: SS inbound 移除不必要的 sniffing
+# - 安全: 配置文件 chmod 640 权限保护
+# - 增强: 端口三重校验(范围+占用+配置冲突), 多源IP获取+IPv6, 分享链接IPv6方括号
 #
 # Usage: sudo bash x-sb.sh
 
@@ -19,7 +19,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SHORTCUT_NAME="x-sb"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
 # 脚本自身的下载地址
@@ -183,7 +183,10 @@ init_config_if_missing() {
   "outbounds": [
     {
       "protocol": "freedom",
-      "tag": "direct"
+      "tag": "direct",
+      "settings": {
+        "domainStrategy": "UseIPv4v6"
+      }
     },
     {
       "protocol": "blackhole",
@@ -238,6 +241,7 @@ safe_save_config() {
     
     # 4. 写入新配置并重启
     cp "$tmp_json" "$XRAY_CONF_FILE"
+    chmod 640 "$XRAY_CONF_FILE"
     systemctl restart xray
     sleep 1
     
@@ -267,11 +271,30 @@ get_random_port() {
     local port
     while true; do
         port=$((RANDOM % 55000 + 10000))
-        if ! ss -tuln | grep -q ":$port "; then
+        if is_port_available "$port"; then
             echo $port
             return
         fi
     done
+}
+
+# 端口可用性检查: 范围 + 系统占用 + 配置冲突
+is_port_available() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${RED}端口号无效 (1-65535)。${PLAIN}"; return 1
+    fi
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "${RED}端口 $port 已被系统占用。${PLAIN}"; return 1
+    fi
+    if [[ -f "$XRAY_CONF_FILE" ]]; then
+        local existing
+        existing=$(jq -r '.inbounds[]?.port // empty' "$XRAY_CONF_FILE" 2>/dev/null)
+        if echo "$existing" | grep -q "^${port}$"; then
+            echo -e "${RED}端口 $port 已在 Xray 配置中使用。${PLAIN}"; return 1
+        fi
+    fi
+    return 0
 }
 
 # ==================== 节点管理逻辑 ====================
@@ -282,9 +305,7 @@ add_reality() {
     read -p "请输入端口 [默认443]: " port
     port=$(strip_cr "$port")
     [[ -z "$port" ]] && port=443
-    if ss -tuln | grep -q ":$port "; then
-        echo -e "${RED}端口 $port 已被占用。${PLAIN}"; return
-    fi
+    if ! is_port_available "$port"; then return; fi
     
     echo -e "正在测试 SNI 连通性..."
     local valid_snis=()
@@ -320,13 +341,18 @@ add_reality() {
     
     local uuid=$($XRAY_BIN uuid)
     local keys=$($XRAY_BIN x25519)
-    local pk=$(echo "$keys" | grep -i "private" | awk '{print $NF}')
-    if [[ -z "$pk" ]]; then
+    local pk=$(echo "$keys" | awk '/PrivateKey:/{print $2}')
+    local pubk=$(echo "$keys" | awk '/Password:/{print $2}')
+    if [[ -z "$pk" || -z "$pubk" ]]; then
+        # 兼容旧版 Xray (Private key: / Public key:)
+        pk=$(echo "$keys" | grep -i "private" | awk '{print $NF}')
+        pubk=$(echo "$keys" | grep -i "public" | awk '{print $NF}')
+    fi
+    if [[ -z "$pk" || -z "$pubk" ]]; then
         echo -e "${RED}错误: 无法生成 Reality 密钥对，请检查 Xray 版本。${PLAIN}"
         echo -e "${YELLOW}x25519 输出: ${keys}${PLAIN}"
         return
     fi
-    # 注意: 这里只需要存 PrivateKey 到配置文件, PublicKey 后续通过 pk 计算
     local short_id=$(openssl rand -hex 4)
     local tag="reality_$port"
     
@@ -335,7 +361,7 @@ add_reality() {
     _CLEANUP_FILES+=("$tmp")
     cp "$XRAY_CONF_FILE" "$tmp"
     
-    jq --arg port "$port" --arg uuid "$uuid" --arg pk "$pk" --arg sni "$target_sni" --arg dest "$target_dest" --arg sid "$short_id" --arg tag "$tag" \
+    jq --arg port "$port" --arg uuid "$uuid" --arg pk "$pk" --arg pubk "$pubk" --arg sni "$target_sni" --arg dest "$target_dest" --arg sid "$short_id" --arg tag "$tag" \
     '.inbounds += [{
       "tag": $tag,
       "port": ($port|tonumber),
@@ -343,6 +369,10 @@ add_reality() {
       "settings": {
         "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
         "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
       },
       "streamSettings": {
         "network": "tcp",
@@ -353,6 +383,7 @@ add_reality() {
           "xver": 0,
           "serverNames": [$sni],
           "privateKey": $pk,
+          "publicKey": $pubk,
           "shortIds": [$sid]
         }
       }
@@ -362,9 +393,12 @@ add_reality() {
         apply_chain_routing "$tmp" "$tag"
     fi
     
-    safe_save_config "$tmp"
-    rm -f "$tmp"
-    show_node_info "$tag"
+    if safe_save_config "$tmp"; then
+        rm -f "$tmp"
+        show_node_info "$tag"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 add_ss2022() {
@@ -373,6 +407,7 @@ add_ss2022() {
     read -p "请输入端口 [随机 $port]: " input_port
     input_port=$(strip_cr "$input_port")
     [[ -n "$input_port" ]] && port=$input_port
+    if ! is_port_available "$port"; then return; fi
     
     local key=$(openssl rand -base64 16)
     local tag="ss_$port"
@@ -398,9 +433,12 @@ add_ss2022() {
         apply_chain_routing "$tmp" "$tag"
     fi
     
-    safe_save_config "$tmp"
-    rm -f "$tmp"
-    show_node_info "$tag"
+    if safe_save_config "$tmp"; then
+        rm -f "$tmp"
+        show_node_info "$tag"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 # ==================== 进阶功能：链式代理与路由 ====================
@@ -550,9 +588,45 @@ get_node_tag_by_id() {
     done <<< "$nodes"
 }
 
+# 用 openssl 从 x25519 私钥推算公钥 (兼容所有 Xray 版本)
+# Xray 26.x 移除了 PublicKey 输出, 必须自行计算
+get_x25519_pubkey() {
+    local priv_key=$1
+    # base64url → standard base64 (补 padding)
+    local b64=$(echo "$priv_key" | tr '_-' '/+')
+    local mod=$((${#b64} % 4))
+    if [[ $mod -eq 2 ]]; then b64="${b64}=="
+    elif [[ $mod -eq 3 ]]; then b64="${b64}="
+    fi
+    # 构建 DER: RFC 8410 ASN.1 header (16 bytes) + 32 bytes raw key
+    local tmp_der=$(mktemp)
+    printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20' > "$tmp_der"
+    echo "$b64" | base64 -d >> "$tmp_der" 2>/dev/null
+    # openssl 提取公钥 → DER → 取末尾 32 字节 → base64url
+    local pubk
+    pubk=$(openssl pkey -inform DER -in "$tmp_der" -pubout -outform DER 2>/dev/null | \
+           tail -c 32 | base64 | tr '/+' '_-' | tr -d '=\n')
+    rm -f "$tmp_der"
+    echo "$pubk"
+}
+
 show_node_info() {
     local tag=$1
-    local ip=$(curl -s4m3 ip.sb || echo "YOUR_IP")
+    local ip=""
+    local url
+    for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        ip=$(curl -4s --max-time 3 "$url" 2>/dev/null) && [[ -n "$ip" ]] && break
+    done
+    # IPv6 fallback
+    if [[ -z "$ip" ]]; then
+        for url in "https://api64.ipify.org" "https://ip.sb"; do
+            ip=$(curl -6s --max-time 3 "$url" 2>/dev/null) && [[ -n "$ip" ]] && break
+        done
+    fi
+    [[ -z "$ip" ]] && ip="YOUR_IP"
+    # IPv6 地址在 URI 中需要方括号
+    local display_ip="$ip"
+    [[ "$ip" == *:* ]] && display_ip="[$ip]"
     local node=$(jq -c --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$XRAY_CONF_FILE")
     local port=$(echo "$node" | jq -r '.port')
     local proto=$(echo "$node" | jq -r '.protocol')
@@ -564,11 +638,14 @@ show_node_info() {
         local flow=$(echo "$node" | jq -r '.settings.clients[0].flow')
         local sni=$(echo "$node" | jq -r '.streamSettings.realitySettings.serverNames[0]')
         local pbk=$(echo "$node" | jq -r '.streamSettings.realitySettings.privateKey')
-        # [修复] 正确计算公钥: 使用参数而非管道
-        local pubk=$($XRAY_BIN x25519 -i "$pbk" | grep -i "public" | awk '{print $NF}')
+        # 优先读配置中的 publicKey, 降级用 openssl 计算 (兼容旧配置)
+        local pubk=$(echo "$node" | jq -r '.streamSettings.realitySettings.publicKey // empty')
+        if [[ -z "$pubk" ]]; then
+            pubk=$(get_x25519_pubkey "$pbk")
+        fi
         local sid=$(echo "$node" | jq -r '.streamSettings.realitySettings.shortIds[0]')
         
-        local link="vless://${uuid}@${ip}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${pubk}&sid=${sid}&type=tcp&headerType=none#${tag}"
+        local link="vless://${uuid}@${display_ip}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${pubk}&sid=${sid}&type=tcp&headerType=none#${tag}"
         
         echo -e "地址: $ip"
         echo -e "端口: $port"
@@ -585,7 +662,7 @@ show_node_info() {
         local method=$(echo "$node" | jq -r '.settings.method')
         local pass=$(echo "$node" | jq -r '.settings.password')
         local raw="${method}:${pass}"
-        local link="ss://$(echo -n "$raw" | base64 | tr -d '\n')@${ip}:${port}#${tag}"
+        local link="ss://$(echo -n "$raw" | base64 | tr -d '\n')@${display_ip}:${port}#${tag}"
         
         echo -e "地址: $ip"
         echo -e "端口: $port"
