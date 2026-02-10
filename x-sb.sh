@@ -1,0 +1,685 @@
+#!/bin/bash
+#
+# Xray 多协议管理脚本 (星辰大海架构复刻版 v1.2 Refined)
+# - 修复: Reality 公钥计算方式 (从 Stdin 改为 Arg 传参)
+# - 修复: 脚本自更新改为原子操作 (防断网损坏)
+# - 修复: SNI 选择索引错位 / SS 分享链接格式 / 路由规则幂等性
+# - 修复: safe_save_config 返回值 / delete_node 精确匹配
+# - 优化: 移除 set -euo pipefail, 节点遍历提取公共函数
+# - 进阶功能: 链式代理 (Chain Proxy) + 路由分流
+#
+# Usage: sudo bash x-sb.sh
+
+# 注意: 不使用 set -euo pipefail, 交互式菜单脚本需要容错而非崩溃退出
+
+# ==================== 全局变量 ====================
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+PLAIN='\033[0m'
+
+SCRIPT_VERSION="1.2.0"
+SHORTCUT_NAME="x-sb"
+INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
+# 脚本自身的下载地址
+SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/x-sb.sh"
+
+# Xray 官方标准路径
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONF_DIR="/usr/local/etc/xray"
+XRAY_CONF_FILE="$XRAY_CONF_DIR/config.json"
+SYSTEMD_FILE="/etc/systemd/system/xray.service"
+DAT_DIR="/usr/local/share/xray"
+
+# 默认 SNI 列表
+SNI_LIST=(
+    "addons.mozilla.org"
+    "www.microsoft.com"
+    "www.amazon.com"
+    "swdist.apple.com"
+    "updates.cdn-apple.com"
+)
+
+# 临时资源清理
+_CLEANUP_FILES=()
+cleanup() {
+    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+        rm -rf "$f" 2>/dev/null
+    done
+}
+trap cleanup EXIT INT TERM
+
+# Windows 换行符清洗
+strip_cr() { echo "${1//$'\r'/}"; }
+
+# ==================== 基础检查 ====================
+check_root() {
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}错误: 必须使用 root 权限运行。${PLAIN}"; exit 1; }
+}
+
+map_arch() {
+    case $(uname -m) in
+        x86_64) echo "64" ;;
+        aarch64|armv8*) echo "arm64-v8a" ;;
+        *) echo -e "${RED}不支持的架构: $(uname -m)${PLAIN}"; exit 1 ;;
+    esac
+}
+
+check_deps() {
+    local deps=("curl" "wget" "unzip" "jq" "openssl" "qrencode")
+    local need_install=0
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then need_install=1; break; fi
+    done
+    
+    if [[ $need_install -eq 1 ]]; then
+        echo -e "${YELLOW}安装必要依赖 (${deps[*]})...${PLAIN}"
+        if [ -f /etc/debian_version ]; then
+            apt-get update && apt-get install -y "${deps[@]}"
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y "${deps[@]}"
+        elif [ -f /etc/alpine-release ]; then
+            # Alpine: qrencode 命令在 libqrencode-tools 包中
+            apk add curl wget unzip jq openssl libqrencode-tools
+        fi
+    fi
+}
+
+# ==================== Xray 核心管理 ====================
+
+install_xray() {
+    echo -e "${BLUE}>>> 检查 Xray 核心...${PLAIN}"
+    mkdir -p "$XRAY_CONF_DIR" "$DAT_DIR"
+    
+    local arch=$(map_arch)
+    local latest_tag
+    latest_tag=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    local latest_ver="${latest_tag#v}"  # 去掉 v 前缀, 对齐 xray version 输出格式
+    
+    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+        echo -e "${RED}无法获取 Xray 最新版本。${PLAIN}"
+        if [[ -f "$XRAY_BIN" ]]; then return; else exit 1; fi
+    fi
+    
+    local curr_ver="none"
+    [[ -f "$XRAY_BIN" ]] && curr_ver=$($XRAY_BIN version | head -1 | awk '{print $2}')
+    
+    if [[ "$curr_ver" == "$latest_ver" ]]; then
+        echo -e "${GREEN}当前已是最新版 ($curr_ver)，跳过安装。${PLAIN}"
+    else
+        echo -e "${YELLOW}正在安装 Xray $latest_ver ($arch)...${PLAIN}"
+        local zip_url="https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${arch}.zip"
+        local tmp_file=$(mktemp)
+        local tmp_dir=$(mktemp -d)
+        _CLEANUP_FILES+=("$tmp_file" "$tmp_dir")
+        
+        if ! curl -L --max-time 120 -o "$tmp_file" --progress-bar "$zip_url"; then
+            echo -e "${RED}下载失败。${PLAIN}"; exit 1
+        fi
+        
+        unzip -q "$tmp_file" -d "$tmp_dir"
+        
+        systemctl stop xray 2>/dev/null || true
+        mv "$tmp_dir/xray" "$XRAY_BIN"
+        mv "$tmp_dir/geoip.dat" "$DAT_DIR/" 2>/dev/null || true
+        mv "$tmp_dir/geosite.dat" "$DAT_DIR/" 2>/dev/null || true
+        chmod +x "$XRAY_BIN"
+        echo -e "${GREEN}Xray 核心更新成功。${PLAIN}"
+    fi
+    
+    cat > "$SYSTEMD_FILE" <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=$XRAY_BIN run -c $XRAY_CONF_FILE
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    
+    init_config_if_missing
+    install_shortcut_cmd
+}
+
+install_shortcut_cmd() {
+    if [[ "$(realpath "$0" 2>/dev/null)" == "$INSTALL_PATH" ]]; then return; fi
+    
+    # 优先从远程下载(防止管道运行时 $0 指向 /dev/fd/XX)
+    local tmp_dl=$(mktemp /tmp/x-sb_install.XXXXXX.sh)
+    _CLEANUP_FILES+=("$tmp_dl")
+    if curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_dl" 2>/dev/null && [ -s "$tmp_dl" ]; then
+        mv -f "$tmp_dl" "$INSTALL_PATH"
+        chmod +x "$INSTALL_PATH"
+        echo -e "${GREEN}快捷命令 '$SHORTCUT_NAME' 已安装。${PLAIN}"
+    elif [[ -f "$0" ]]; then
+        # 降级: 本地复制
+        cp "$0" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+        echo -e "${GREEN}快捷命令 '$SHORTCUT_NAME' 已安装 (本地)。${PLAIN}"
+    fi
+}
+
+init_config_if_missing() {
+    if [[ ! -f "$XRAY_CONF_FILE" ]] || [[ ! -s "$XRAY_CONF_FILE" ]]; then
+        cat > "$XRAY_CONF_FILE" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+EOF
+        mkdir -p /var/log/xray
+        echo -e "${GREEN}初始化默认配置完成。${PLAIN}"
+    fi
+}
+
+# ==================== JSON 辅助操作 ====================
+
+safe_save_config() {
+    local tmp_json=$1
+    if jq . "$tmp_json" >/dev/null 2>&1; then
+        cp "$tmp_json" "$XRAY_CONF_FILE"
+        systemctl restart xray
+        # 健康检查: 等待 1 秒后确认服务状态
+        sleep 1
+        if systemctl is-active --quiet xray; then
+            echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
+        else
+            echo -e "${RED}警告: 配置已保存但 Xray 启动失败，请检查日志: journalctl -u xray${PLAIN}"
+            return 1
+        fi
+    else
+        echo -e "${RED}JSON 配置生成校验失败，未保存。${PLAIN}"
+        return 1
+    fi
+}
+
+get_random_port() {
+    local port
+    while true; do
+        port=$((RANDOM % 55000 + 10000))
+        if ! ss -tuln | grep -q ":$port "; then
+            echo $port
+            return
+        fi
+    done
+}
+
+# ==================== 节点管理逻辑 ====================
+
+add_reality() {
+    echo -e "${BLUE}>>> 添加 VLESS-Vision-Reality 节点 (⭐ 推荐)${PLAIN}"
+    
+    read -p "请输入端口 [默认443]: " port
+    port=$(strip_cr "$port")
+    [[ -z "$port" ]] && port=443
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "${RED}端口 $port 已被占用。${PLAIN}"; return
+    fi
+    
+    echo -e "正在测试 SNI 连通性..."
+    local valid_snis=()
+    for sni in "${SNI_LIST[@]}"; do
+        if curl -m 3 -sI "https://$sni" >/dev/null 2>&1; then
+            valid_snis+=("$sni")
+            echo -e " ${#valid_snis[@]}. $sni \t${GREEN}[可用]${PLAIN}"
+        else
+            echo -e "    $sni \t${RED}[失败,已跳过]${PLAIN}"
+        fi
+    done
+    local manual_idx=$(( ${#valid_snis[@]} + 1 ))
+    echo -e " $manual_idx. 手动输入"
+    
+    read -p "请选择目标域名 [1]: " sni_idx
+    sni_idx=$(strip_cr "$sni_idx")
+    [[ -z "$sni_idx" ]] && sni_idx=1
+    
+    local target_dest=""
+    local target_sni=""
+    
+    if [[ "$sni_idx" =~ ^[0-9]+$ ]] && [ "$sni_idx" -ge 1 ] && [ "$sni_idx" -le "${#valid_snis[@]}" ]; then
+        target_sni="${valid_snis[$((sni_idx-1))]}"
+    else
+        read -p "请输入域名 (如 www.apple.com): " target_sni
+        target_sni=$(strip_cr "$target_sni")
+    fi
+    
+    if [[ -z "$target_sni" ]]; then
+        echo -e "${RED}未选择有效域名。${PLAIN}"; return
+    fi
+    target_dest="${target_sni}:443"
+    
+    local uuid=$($XRAY_BIN uuid)
+    local keys=$($XRAY_BIN x25519)
+    local pk=$(echo "$keys" | grep "Private" | awk '{print $3}')
+    # 注意: 这里只需要存 PrivateKey 到配置文件, PublicKey 后续通过 pk 计算
+    local short_id=$(openssl rand -hex 4)
+    local tag="reality_$port"
+    
+    local chain_setting=$(ask_chain_proxy)
+    local tmp=$(mktemp)
+    _CLEANUP_FILES+=("$tmp")
+    cp "$XRAY_CONF_FILE" "$tmp"
+    
+    jq --arg port "$port" --arg uuid "$uuid" --arg pk "$pk" --arg sni "$target_sni" --arg dest "$target_dest" --arg sid "$short_id" --arg tag "$tag" \
+    '.inbounds += [{
+      "tag": $tag,
+      "port": ($port|tonumber),
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": $dest,
+          "xver": 0,
+          "serverNames": [$sni],
+          "privateKey": $pk,
+          "shortIds": [$sid]
+        }
+      }
+    }]' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+    
+    if [[ -n "$chain_setting" ]]; then
+        apply_chain_routing "$tmp" "$tag"
+    fi
+    
+    safe_save_config "$tmp"
+    rm -f "$tmp"
+    show_node_info "$tag"
+}
+
+add_ss2022() {
+    echo -e "${BLUE}>>> 添加 Shadowsocks-2022 节点${PLAIN}"
+    local port=$(get_random_port)
+    read -p "请输入端口 [随机 $port]: " input_port
+    input_port=$(strip_cr "$input_port")
+    [[ -n "$input_port" ]] && port=$input_port
+    
+    local key=$(openssl rand -base64 16)
+    local tag="ss_$port"
+    
+    local chain_setting=$(ask_chain_proxy)
+    local tmp=$(mktemp)
+    _CLEANUP_FILES+=("$tmp")
+    cp "$XRAY_CONF_FILE" "$tmp"
+    
+    jq --arg port "$port" --arg key "$key" --arg tag "$tag" \
+    '.inbounds += [{
+      "tag": $tag,
+      "port": ($port|tonumber),
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": $key,
+        "network": "tcp,udp"
+      }
+    }]' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+    
+    if [[ -n "$chain_setting" ]]; then
+        apply_chain_routing "$tmp" "$tag"
+    fi
+    
+    safe_save_config "$tmp"
+    rm -f "$tmp"
+    show_node_info "$tag"
+}
+
+# ==================== 进阶功能：链式代理与路由 ====================
+
+ask_chain_proxy() {
+    local has_chain=$(jq '.outbounds[] | select(.tag=="chain_proxy")' "$XRAY_CONF_FILE")
+    if [[ -z "$has_chain" ]]; then echo ""; return; fi
+    
+    echo -e "${YELLOW}进阶: 是否为此节点启用 SOCKS5 链式转发 (解锁/分流)? [y/N]${PLAIN}" >&2
+    read -p "选择: " sel
+    [[ "${sel,,}" == "y" ]] && echo "yes"
+}
+
+apply_chain_routing() {
+    local json_file=$1
+    local inbound_tag=$2
+    jq --arg itag "$inbound_tag" \
+    '.routing.rules = ([{
+      "type": "field",
+      "inboundTag": [$itag],
+      "outboundTag": "chain_proxy"
+    }] + .routing.rules)' "$json_file" > "${json_file}.r" && mv "${json_file}.r" "$json_file"
+}
+
+configure_advanced() {
+    while true; do
+        clear
+        echo -e "${BLUE}=== 进阶功能配置 (Advanced) ===${PLAIN}"
+        local chain_out=$(jq -r '.outbounds[] | select(.tag=="chain_proxy") | .settings.servers[0] | "\(.address):\(.port)"' "$XRAY_CONF_FILE" 2>/dev/null)
+        
+        echo -e " 1. 配置上游 SOCKS5 代理 (Chain Proxy)"
+        echo -e "    当前状态: $([[ -n "$chain_out" ]] && echo "${GREEN}开启 -> $chain_out${PLAIN}" || echo "${YELLOW}未配置${PLAIN}")"
+        echo -e " 2. 配置 全局路由规则 (屏蔽广告/回国流量)"
+        echo -e " 0. 返回"
+        echo -e "----------------------------------------"
+        read -p "请选择: " choice
+        
+        case $choice in
+            1) 
+                read -p "请输入上游 SOCKS5 地址 (如 127.0.0.1:40000): " addr
+                addr=$(strip_cr "$addr")
+                if [[ -z "$addr" ]]; then
+                    local tmp=$(mktemp)
+                    _CLEANUP_FILES+=("$tmp")
+                    # 同时删除 outbound 和引用它的路由规则
+                    jq 'del(.outbounds[] | select(.tag=="chain_proxy")) |
+                        .routing.rules |= [.[] | select(.outboundTag != "chain_proxy")]
+                    ' "$XRAY_CONF_FILE" > "$tmp"
+                    safe_save_config "$tmp" && rm -f "$tmp"
+                else
+                    local ip=${addr%:*}
+                    local port=${addr#*:}
+                    local tmp=$(mktemp)
+                    _CLEANUP_FILES+=("$tmp")
+                    jq 'del(.outbounds[] | select(.tag=="chain_proxy"))' "$XRAY_CONF_FILE" > "$tmp"
+                    jq --arg ip "$ip" --arg port "$port" \
+                    '.outbounds += [{
+                        "tag": "chain_proxy",
+                        "protocol": "socks",
+                        "settings": {
+                            "servers": [{"address": $ip, "port": ($port|tonumber)}]
+                        }
+                    }]' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+                    safe_save_config "$tmp" && rm -f "$tmp"
+                fi
+                ;;
+            2)
+                local tmp=$(mktemp)
+                _CLEANUP_FILES+=("$tmp")
+                echo -e "正在应用: 屏蔽广告 + 屏蔽CN + 屏蔽局域网..."
+                # 先删除已有的同类规则(幂等), 再追加
+                jq '
+                  .routing.rules |= [.[] | select(
+                    (.domain // [] | any(startswith("geosite:"))) or
+                    (.ip // [] | any(startswith("geoip:")))
+                    | not
+                  )] |
+                  .routing.rules = [
+                    {
+                        "type": "field",
+                        "outboundTag": "block",
+                        "domain": ["geosite:category-ads-all", "geosite:cn"]
+                    },
+                    {
+                        "type": "field",
+                        "outboundTag": "block",
+                        "ip": ["geoip:private", "geoip:cn"]
+                    }
+                  ] + .routing.rules
+                ' "$XRAY_CONF_FILE" > "$tmp"
+                safe_save_config "$tmp" && rm -f "$tmp"
+                sleep 1
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ==================== 查看与分享 ====================
+
+# 全局节点计数 (list_nodes 设置)
+_NODE_COUNT=0
+
+list_nodes() {
+    echo -e "${BLUE}================================================================${PLAIN}"
+    echo -e "   当前已配置节点列表"
+    echo -e "${BLUE}================================================================${PLAIN}"
+    printf " %-4s %-20s %-12s %-8s\n" "ID" "标签(Tag)" "协议" "端口"
+    echo -e "----------------------------------------------------------------"
+    
+    _NODE_COUNT=0
+    local nodes
+    nodes=$(jq -c '.inbounds[]' "$XRAY_CONF_FILE" 2>/dev/null) || true
+    [ -z "$nodes" ] && { echo -e " (无节点)"; echo -e "----------------------------------------------------------------"; return; }
+    
+    while IFS= read -r node; do
+        [ -z "$node" ] && continue
+        local tag=$(echo "$node" | jq -r '.tag' 2>/dev/null)
+        local proto=$(echo "$node" | jq -r '.protocol' 2>/dev/null)
+        local port=$(echo "$node" | jq -r '.port' 2>/dev/null)
+        if [[ "$tag" == *"reality"* || "$tag" == *"ss"* ]]; then
+            _NODE_COUNT=$((_NODE_COUNT+1))
+            printf " [%d]  %-20s %-12s %-8s\n" "$_NODE_COUNT" "$tag" "$proto" "$port"
+        fi
+    done <<< "$nodes"
+    echo -e "----------------------------------------------------------------"
+}
+
+# 按编号获取节点 tag (编号从 1 开始, 与 list_nodes 一致)
+get_node_tag_by_id() {
+    local target_id=$1
+    local i=0
+    local nodes
+    nodes=$(jq -c '.inbounds[]' "$XRAY_CONF_FILE" 2>/dev/null) || true
+    [ -z "$nodes" ] && return
+    
+    while IFS= read -r node; do
+        [ -z "$node" ] && continue
+        local tag=$(echo "$node" | jq -r '.tag' 2>/dev/null)
+        if [[ "$tag" == *"reality"* || "$tag" == *"ss"* ]]; then
+            i=$((i+1))
+            if [ "$i" -eq "$target_id" ]; then
+                echo "$tag"
+                return
+            fi
+        fi
+    done <<< "$nodes"
+}
+
+show_node_info() {
+    local tag=$1
+    local ip=$(curl -s4m3 ip.sb || echo "YOUR_IP")
+    local node=$(jq -c --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$XRAY_CONF_FILE")
+    local port=$(echo "$node" | jq -r '.port')
+    local proto=$(echo "$node" | jq -r '.protocol')
+    
+    echo -e "\n${BLUE}--- 节点详情: $tag ---${PLAIN}"
+    
+    if [[ "$proto" == "vless" ]]; then
+        local uuid=$(echo "$node" | jq -r '.settings.clients[0].id')
+        local flow=$(echo "$node" | jq -r '.settings.clients[0].flow')
+        local sni=$(echo "$node" | jq -r '.streamSettings.realitySettings.serverNames[0]')
+        local pbk=$(echo "$node" | jq -r '.streamSettings.realitySettings.privateKey')
+        # [修复] 正确计算公钥: 使用参数而非管道
+        local pubk=$($XRAY_BIN x25519 -i "$pbk" | grep "Public" | awk '{print $3}')
+        local sid=$(echo "$node" | jq -r '.streamSettings.realitySettings.shortIds[0]')
+        
+        local link="vless://${uuid}@${ip}:${port}?encryption=none&flow=${flow}&security=reality&sni=${sni}&fp=chrome&pbk=${pubk}&sid=${sid}&type=tcp&headerType=none#${tag}"
+        
+        echo -e "地址: $ip"
+        echo -e "端口: $port"
+        echo -e "UUID: $uuid"
+        echo -e "流控: $flow"
+        echo -e "SNI : $sni"
+        echo -e "PbKey: $pubk"
+        echo -e "\n${GREEN}>>> 分享链接:${PLAIN}"
+        echo "$link"
+        echo -e "\n${YELLOW}>>> 二维码:${PLAIN}"
+        qrencode -t ANSIUTF8 "$link"
+        
+    elif [[ "$proto" == "shadowsocks" ]]; then
+        local method=$(echo "$node" | jq -r '.settings.method')
+        local pass=$(echo "$node" | jq -r '.settings.password')
+        local raw="${method}:${pass}"
+        local link="ss://$(echo -n "$raw" | base64 | tr -d '\n')@${ip}:${port}#${tag}"
+        
+        echo -e "地址: $ip"
+        echo -e "端口: $port"
+        echo -e "加密: $method"
+        echo -e "密码: $pass"
+        echo -e "\n${GREEN}>>> 分享链接:${PLAIN}"
+        echo "$link"
+        echo -e "\n${YELLOW}>>> 二维码:${PLAIN}"
+        qrencode -t ANSIUTF8 "$link"
+    fi
+    echo
+}
+
+delete_node() {
+    list_nodes
+    [[ "$_NODE_COUNT" -eq 0 ]] && return
+    read -p "请输入要删除的节点 ID (0 返回): " id
+    id=$(strip_cr "$id")
+    if [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -gt 0 ] && [ "$id" -le "$_NODE_COUNT" ]; then
+        local target_tag
+        target_tag=$(get_node_tag_by_id "$id")
+        
+        if [[ -n "$target_tag" ]]; then
+            echo -e "${YELLOW}正在删除节点: $target_tag ...${PLAIN}"
+            local tmp=$(mktemp)
+            _CLEANUP_FILES+=("$tmp")
+            jq --arg t "$target_tag" 'del(.inbounds[] | select(.tag==$t))' "$XRAY_CONF_FILE" > "$tmp"
+            jq --arg t "$target_tag" 'del(.routing.rules[] | select(.inboundTag and (.inboundTag[] == $t)))' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+            safe_save_config "$tmp" && rm -f "$tmp"
+        fi
+    fi
+}
+
+# ==================== 主菜单 & 更新 ====================
+
+update_script() {
+    echo -e "\n ${BLUE}>>> 更新管理脚本${PLAIN}"
+    local tmp_script=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if ! curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
+        echo -e "${RED}下载失败。${PLAIN}"; return
+    fi
+    
+    if [ ! -s "$tmp_script" ]; then
+        echo -e "${RED}下载文件为空。${PLAIN}"; return
+    fi
+
+    # 简单版本校验
+    local remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2)
+    if [ "$remote_ver" == "$SCRIPT_VERSION" ]; then
+        echo -e "${GREEN}已是最新 (v${SCRIPT_VERSION})。${PLAIN}"; return
+    fi
+
+    mv -f "$tmp_script" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    echo -e "${GREEN}更新完成 (v${remote_ver})! 请重新运行。${PLAIN}"
+    exit 0
+}
+
+uninstall_script() {
+    echo -e "${RED}!!! 危险操作警告 !!!${PLAIN}"
+    read -p "确认彻底卸载 Xray 及所有配置? (输入 yes 确认): " cf
+    cf=$(strip_cr "$cf")
+    if [[ "${cf,,}" == "yes" ]]; then
+       systemctl stop xray 2>/dev/null
+       systemctl disable xray 2>/dev/null
+       rm -f "$SYSTEMD_FILE"
+       systemctl daemon-reload
+       rm -rf "$XRAY_CONF_DIR" "$XRAY_BIN" "$DAT_DIR" /var/log/xray
+       rm -f "$INSTALL_PATH"
+       echo -e "${GREEN}卸载完成。${PLAIN}"
+       exit 0
+    fi
+}
+
+main_menu() {
+    check_deps
+    while true; do
+        clear
+        echo -e "${BLUE}================================================================${PLAIN}"
+        echo -e "   Xray 多协议管理脚本 (v${SCRIPT_VERSION}) - 星辰大海复刻版"
+        echo -e "${BLUE}================================================================${PLAIN}"
+        
+        local status="${RED}未运行${PLAIN}"
+        if systemctl is-active --quiet xray; then
+            local ver=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}')
+            status="${GREEN}✅ 运行中 ($ver)${PLAIN}"
+        fi
+        
+        echo -e " 核心状态: $status"
+        echo -e " 配置文件: $XRAY_CONF_FILE"
+        echo -e "----------------------------------------------------------------"
+        echo -e "  1. 安装 / 更新 Xray 核心"
+        echo -e "  2. 添加 VLESS-Vision-Reality 节点 (⭐ 推荐)"
+        echo -e "  3. 添加 Shadowsocks-2022 节点 (🚀 性能)"
+        echo -e "  4. 查看节点配置 / 分享链接"
+        echo -e "  5. 删除节点"
+        echo -e "  6. 进阶配置 (链式代理 / 路由)"
+        echo -e "  7. 更新脚本"
+        echo -e "  8. 卸载脚本"
+        echo -e "  0. 退出"
+        echo -e "${BLUE}================================================================${PLAIN}"
+        read -p "请输入选项: " choice
+        
+        case $choice in
+            1) install_xray; read -p "按回车继续..." ;;
+            2) add_reality; read -p "按回车继续..." ;;
+            3) add_ss2022; read -p "按回车继续..." ;;
+            4) 
+                list_nodes
+                read -p "输入节点 ID 查看详情 (0 返回): " nid
+                nid=$(strip_cr "$nid")
+                if [[ "$nid" =~ ^[0-9]+$ ]] && [ "$nid" -gt 0 ] && [ "$nid" -le "$_NODE_COUNT" ]; then
+                    local target_tag
+                    target_tag=$(get_node_tag_by_id "$nid")
+                    [[ -n "$target_tag" ]] && show_node_info "$target_tag"
+                fi
+                read -p "按回车继续..."
+                ;;
+            5) delete_node; read -p "按回车继续..." ;;
+            6) configure_advanced ;;
+            7) update_script ;;
+            8) uninstall_script ;;
+            0) exit 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+# 入口
+check_root
+if [[ "${1:-}" == "install" ]]; then
+    install_xray
+else
+    main_menu
+fi
