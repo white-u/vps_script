@@ -9,7 +9,7 @@
 SHORTCUT_NAME="pm"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
 # [注意] 如果您 Fork 了此脚本，请修改下方的更新源地址
-DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh"
+DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"

@@ -6,7 +6,7 @@
 
 ## 1. 概述
 
-vps.sh 是一个基于 Nftables + TC 的端口级流量管理工具，适用于多用户 VPS 场景（如代理节点分发）。核心能力：按端口独立计量流量、设定配额并自动封禁、出站限速、动态突发惩罚（DynQoS）、Telegram 实时通知。
+pm.sh 是一个基于 Nftables + TC 的端口级流量管理工具，适用于多用户 VPS 场景（如代理节点分发）。核心能力：按端口独立计量流量、设定配额并自动封禁、出站限速、动态突发惩罚（DynQoS）、Telegram 实时通知。
 
 ### 1.1 适用场景
 
@@ -35,7 +35,7 @@ vps.sh 是一个基于 Nftables + TC 的端口级流量管理工具，适用于�
 ### 2.1 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vps.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh)
 ```
 
 安装流程：下载到临时文件 → 校验完整性 → `mv` 到 `/usr/local/bin/pm` → `exec` 启动。如果网络不通，会尝试本地复制降级。
@@ -85,7 +85,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vps.
 ### 3.1 模块划分
 
 ```
-vps.sh (1540 行)
+pm.sh (1540 行)
 ├── 模块 1: 基础架构 (安装/依赖/配置初始化)
 │   ├── check_root()          # root 权限检查
 │   ├── install_shortcut()    # 安装快捷命令 (mktemp → 校验 → mv)
