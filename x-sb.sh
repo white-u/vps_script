@@ -1,14 +1,7 @@
 #!/bin/bash
 #
-# Xray 多协议管理脚本 (星辰大海架构复刻版 v1.3)
-# v1.3:
-# - 修复: publicKey 存入配置(不再运行时计算), 兼容 Xray 26.x (Password=PublicKey)
-# - 修复: freedom outbound 加 domainStrategy:UseIPv4v6 (修复部分站点不通)
-# - 修复: SS inbound 移除不必要的 sniffing
-# - 安全: 配置文件 chmod 640 权限保护
-# - 增强: 端口三重校验(范围+占用+配置冲突), 多源IP获取+IPv6, 分享链接IPv6方括号
+# Xray 多协议管理脚本
 #
-# Usage: sudo bash x-sb.sh
 
 # 注意: 不使用 set -euo pipefail, 交互式菜单脚本需要容错而非崩溃退出
 
@@ -19,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SHORTCUT_NAME="x-sb"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
 # 脚本自身的下载地址
@@ -148,6 +141,7 @@ LimitNOFILE=51200
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
+    systemctl enable xray 2>/dev/null
     
     init_config_if_missing
     install_shortcut_cmd
@@ -744,7 +738,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}================================================================${PLAIN}"
-        echo -e "   Xray 多协议管理脚本 (v${SCRIPT_VERSION}) - 星辰大海复刻版"
+        echo -e "   Xray 多协议管理脚本 (v${SCRIPT_VERSION})"
         echo -e "${BLUE}================================================================${PLAIN}"
         
         local status="${RED}未运行${PLAIN}"
