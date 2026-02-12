@@ -14,7 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="4.3"
+SCRIPT_VERSION="4.4"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -133,12 +133,24 @@ install_deps() {
     fi
     # 强制完整性检查：如果文件损坏或为空，重置它
     if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo '{"interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' > "$CONFIG_FILE"
+        echo '{"node_id": "'"$(hostname 2>/dev/null || echo unknown)"'", "interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' > "$CONFIG_FILE"
     fi
     # 确保存在 telegram 字段 (旧版本升级兼容)
     if ! jq -e '.telegram' "$CONFIG_FILE" >/dev/null 2>&1; then
         local tmp=$(mktemp)
         jq '.telegram = {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        rm -f "$tmp"
+    fi
+    # 确保存在 node_id 字段 (旧版本升级兼容)
+    if ! jq -e '.node_id' "$CONFIG_FILE" >/dev/null 2>&1; then
+        local tmp=$(mktemp)
+        jq --arg nid "$(hostname 2>/dev/null || echo unknown)" '.node_id = $nid' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        rm -f "$tmp"
+    fi
+    # 确保存在 push 字段 (v4.4+ 云端推送)
+    if ! jq -e '.push' "$CONFIG_FILE" >/dev/null 2>&1; then
+        local tmp=$(mktemp)
+        jq '.push = {"enable": false, "worker_url": "", "secret": "", "node_key": ""}' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
         rm -f "$tmp"
     fi
     # 保护配置文件 (含 bot_token)
@@ -482,6 +494,40 @@ ${status_icon} ${port_title}
 ${report_lines}"
 }
 
+# 推送端口数据到 Cloudflare Worker (D1)
+# 在 cron_task 末尾调用，开启后每分钟随 Cron 推送一次
+push_to_worker() {
+    local push_conf=$(jq -r '.push // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$push_conf" ] && return
+
+    local enabled=$(echo "$push_conf" | jq -r '.enable // false')
+    [ "$enabled" != "true" ] && return
+
+    local worker_url=$(echo "$push_conf" | jq -r '.worker_url // empty')
+    local secret=$(echo "$push_conf" | jq -r '.secret // empty')
+    local node_key=$(echo "$push_conf" | jq -r '.node_key // empty')
+    [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ] && return
+
+    # 脱敏: 仅推送端口数据，剥离 telegram/push 配置段（含密钥）
+    local payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$payload" ] && return
+
+    # HMAC-SHA256 签名 (timestamp + body)
+    local timestamp=$(date +%s)
+    local signature=$(printf '%s%s' "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
+    [ -z "$signature" ] && return
+
+    # 异步推送，不阻塞 Cron，超时 10 秒
+    curl -sf --max-time 10 \
+        -X PUT "${worker_url}" \
+        -H "Content-Type: application/json" \
+        -H "X-Node: ${node_key}" \
+        -H "X-Timestamp: ${timestamp}" \
+        -H "X-Signature: ${signature}" \
+        -d "$payload" \
+        >/dev/null 2>&1 &
+}
+
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 
 cron_task() {
@@ -731,6 +777,9 @@ cron_task() {
             rm -f "$_tmp_rpt"
         fi
     fi
+
+    # --- 推送到 Cloudflare Worker (D1) ---
+    push_to_worker
 }
 
 setup_cron() {
@@ -845,12 +894,18 @@ show_main_menu() {
     local tg_enabled=$(jq -r '.telegram.enable // false' "$CONFIG_FILE" 2>/dev/null)
     [ "$tg_enabled" == "true" ] && tg_status="${GREEN}✅ 已开启${PLAIN}"
 
+    # 云端推送状态指示
+    local push_status="${YELLOW}⚪ 未配置${PLAIN}"
+    local push_enabled=$(jq -r '.push.enable // false' "$CONFIG_FILE" 2>/dev/null)
+    [ "$push_enabled" == "true" ] && push_status="${GREEN}✅ 已开启${PLAIN}"
+
     echo -e " 1. 添加 监控端口 (服务扫描)"
     echo -e " 2. 配置 端口 (修改/动态QoS/重置)"
     echo -e " 3. 删除 监控端口"
     echo -e " 4. 通知设置 (Telegram) $tg_status"
-    echo -e " 5. 更新 脚本"
-    echo -e " 6. ${RED}卸载 脚本${PLAIN}"
+    echo -e " 5. 云端推送 (Cloudflare) $push_status"
+    echo -e " 6. 更新 脚本"
+    echo -e " 7. ${RED}卸载 脚本${PLAIN}"
     echo -e " 0. 退出"
     echo -e "========================================================================================="
     read -p "请输入选项: " choice
@@ -861,8 +916,9 @@ show_main_menu() {
         2) config_port_menu "${port_list[@]}" ;;
         3) delete_port_flow "${port_list[@]}" ;;
         4) configure_telegram ;;
-        5) update_script ;;
-        6) uninstall_script ;;
+        5) configure_push ;;
+        6) update_script ;;
+        7) uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
         *) ;; # 无效输入, 循环重新显示菜单
     esac
@@ -1377,6 +1433,166 @@ configure_telegram() {
                 ;;
         esac
         
+        rm -f "$tmp"
+        [ "$success" == "true" ] && sleep 0.5 || sleep 1.5
+    done
+}
+
+# ==============================================================================
+# 云端推送配置菜单 (Cloudflare D1)
+# ==============================================================================
+
+configure_push() {
+    while true; do
+        local push_conf=$(jq '.push // {}' "$CONFIG_FILE")
+        local push_enable=$(echo "$push_conf" | jq -r '.enable // false')
+        local push_url=$(echo "$push_conf" | jq -r '.worker_url // ""')
+        local push_secret=$(echo "$push_conf" | jq -r '.secret // ""')
+        local push_node=$(echo "$push_conf" | jq -r '.node_key // ""')
+
+        # 脱敏显示
+        local secret_display="未配置"
+        if [ -n "$push_secret" ] && [ ${#push_secret} -gt 10 ]; then
+            secret_display="${push_secret:0:6}...${push_secret: -4}"
+        elif [ -n "$push_secret" ]; then
+            secret_display="已配置"
+        fi
+
+        clear
+        echo -e "========================================"
+        echo -e "   云端推送配置 (Cloudflare D1)"
+        echo -e "========================================"
+        if [ "$push_enable" == "true" ]; then
+            echo -e " 状态:    ${GREEN}✅ 已启用${PLAIN}"
+        else
+            echo -e " 状态:    ${YELLOW}⚪ 未启用${PLAIN}"
+        fi
+        echo -e " Worker:  ${push_url:-未配置}"
+        echo -e " 密钥:    $secret_display"
+        echo -e " 节点 Key: ${push_node:-未配置}"
+        echo -e "========================================"
+        echo -e " 1. 配置 Worker URL"
+        echo -e " 2. 配置 通信密钥"
+        echo -e " 3. 配置 节点 Key (如 hk, us, sg)"
+        echo -e " 4. 开启/关闭 推送"
+        echo -e " 5. 测试推送"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " p_choice
+        p_choice=$(strip_cr "$p_choice")
+
+        local tmp=$(mktemp)
+        local success=false
+
+        case $p_choice in
+            1)
+                echo -e "\n输入 Worker 推送地址"
+                echo -e "格式: https://your-worker.your-domain.workers.dev/api/push"
+                read -p "URL: " new_url
+                new_url=$(strip_cr "$new_url")
+                new_url="${new_url%/}"
+                if [ -n "$new_url" ]; then
+                    if jq --arg v "$new_url" '.push.worker_url = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        echo -e "${GREEN}URL 已保存。${PLAIN}"; success=true
+                    fi
+                else
+                    echo -e "${RED}输入不能为空!${PLAIN}"
+                fi
+                ;;
+            2)
+                echo -e "\n输入通信密钥 (必须与 Worker 环境变量 SHARED_SECRET 一致)"
+                echo -e "建议: 使用 openssl rand -hex 32 生成"
+                read -p "密钥: " new_secret
+                new_secret=$(strip_cr "$new_secret")
+                if [ -n "$new_secret" ]; then
+                    if jq --arg v "$new_secret" '.push.secret = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        echo -e "${GREEN}密钥已保存。${PLAIN}"; success=true
+                    fi
+                else
+                    echo -e "${RED}输入不能为空!${PLAIN}"
+                fi
+                ;;
+            3)
+                echo -e "\n输入节点标识 (简短英文, 如 hk, us, sg, jp)"
+                read -p "Node Key: " new_node
+                new_node=$(strip_cr "$new_node")
+                new_node=$(echo "$new_node" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+                if [ -n "$new_node" ]; then
+                    if jq --arg v "$new_node" '.push.node_key = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                        echo -e "${GREEN}节点 Key 已保存: $new_node${PLAIN}"; success=true
+                    fi
+                else
+                    echo -e "${RED}输入不能为空!${PLAIN}"
+                fi
+                ;;
+            4)
+                local new_state="true"
+                [ "$push_enable" == "true" ] && new_state="false"
+
+                if [ "$new_state" == "true" ]; then
+                    if [ -z "$push_url" ] || [ -z "$push_secret" ] || [ -z "$push_node" ]; then
+                        echo -e "${RED}请先配置 Worker URL、密钥和节点 Key!${PLAIN}"
+                        sleep 1; rm -f "$tmp"; continue
+                    fi
+                    # 检查 openssl 是否可用 (签名依赖)
+                    if ! command -v openssl &>/dev/null; then
+                        echo -e "${RED}错误: 推送功能需要 openssl, 请安装后重试!${PLAIN}"
+                        echo -e "${YELLOW}  Debian/Ubuntu: apt install openssl${PLAIN}"
+                        echo -e "${YELLOW}  CentOS/RHEL:   yum install openssl${PLAIN}"
+                        echo -e "${YELLOW}  Alpine:         apk add openssl${PLAIN}"
+                        sleep 3; rm -f "$tmp"; continue
+                    fi
+                fi
+
+                if jq --argjson v "$new_state" '.push.enable = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                    if [ "$new_state" == "true" ]; then
+                        echo -e "${GREEN}✅ 推送已开启 (下次 Cron 周期生效)${PLAIN}"
+                    else
+                        echo -e "${YELLOW}⚪ 推送已关闭${PLAIN}"
+                    fi
+                    success=true
+                fi
+                ;;
+            5)
+                echo -e "\n${YELLOW}正在测试推送...${PLAIN}"
+                local t_url=$(jq -r '.push.worker_url // ""' "$CONFIG_FILE")
+                local t_secret=$(jq -r '.push.secret // ""' "$CONFIG_FILE")
+                local t_node=$(jq -r '.push.node_key // ""' "$CONFIG_FILE")
+
+                if [ -z "$t_url" ] || [ -z "$t_secret" ] || [ -z "$t_node" ]; then
+                    echo -e "${RED}请先完成所有配置!${PLAIN}"; sleep 1; rm -f "$tmp"; continue
+                fi
+
+                if ! command -v openssl &>/dev/null; then
+                    echo -e "${RED}错误: 未安装 openssl!${PLAIN}"; sleep 1; rm -f "$tmp"; continue
+                fi
+
+                local t_payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
+                local t_ts=$(date +%s)
+                local t_sig=$(printf '%s%s' "$t_ts" "$t_payload" | openssl dgst -sha256 -hmac "$t_secret" 2>/dev/null | awk '{print $NF}')
+
+                local t_http_code=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" \
+                    -X PUT "$t_url" \
+                    -H "Content-Type: application/json" \
+                    -H "X-Node: $t_node" \
+                    -H "X-Timestamp: $t_ts" \
+                    -H "X-Signature: $t_sig" \
+                    -d "$t_payload" 2>&1)
+
+                if [ "$t_http_code" == "200" ]; then
+                    echo -e "${GREEN}✅ 推送成功! (HTTP $t_http_code)${PLAIN}"
+                elif [ "$t_http_code" == "403" ]; then
+                    echo -e "${RED}❌ 签名验证失败 (HTTP 403), 请检查密钥是否一致!${PLAIN}"
+                elif [ "$t_http_code" == "000" ]; then
+                    echo -e "${RED}❌ 连接失败, 请检查 Worker URL 是否正确!${PLAIN}"
+                else
+                    echo -e "${RED}❌ 推送失败 (HTTP $t_http_code)${PLAIN}"
+                fi
+                ;;
+            0)
+                rm -f "$tmp"; break ;;
+        esac
+
         rm -f "$tmp"
         [ "$success" == "true" ] && sleep 0.5 || sleep 1.5
     done

@@ -21,23 +21,42 @@ echo -e "${BLUE}=================================================${NC}"
 # ==============================
 # 1. 系统更新与清理
 # ==============================
-echo -e "${YELLOW}[1/5] 正在更新系统并清理旧依赖...${NC}"
+echo -e "${YELLOW}[1/6] 正在更新系统并清理旧依赖...${NC}"
 apt update -y && apt upgrade -y
 apt autoremove -y
 apt clean
 echo -e "${GREEN}系统更新完成。${NC}"
 
 # ==============================
-# 2. 安装必备工具 (无 ufw/net-tools)
+# 2. 修改主机名
 # ==============================
-echo -e "${YELLOW}[2/5] 正在安装必备工具 (curl, wget, vim, unzip, nano)...${NC}"
+echo -e "${YELLOW}[2/6] 主机名设置${NC}"
+CURRENT_HOSTNAME=$(hostname)
+echo -e "当前主机名: ${BLUE}${CURRENT_HOSTNAME}${NC}"
+read -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
+if [ ! -z "$NEW_HOSTNAME" ]; then
+    hostnamectl set-hostname "$NEW_HOSTNAME"
+    sed -i "s/127.0.1.1.*/127.0.1.1\t$NEW_HOSTNAME/" /etc/hosts
+    if ! grep -q "127.0.1.1" /etc/hosts; then
+        echo -e "127.0.1.1\t$NEW_HOSTNAME" >> /etc/hosts
+    fi
+    echo -e "${GREEN}主机名已修改为: ${NEW_HOSTNAME}${NC}"
+else
+    NEW_HOSTNAME="$CURRENT_HOSTNAME"
+    echo -e "跳过主机名修改，保持: ${BLUE}${CURRENT_HOSTNAME}${NC}"
+fi
+
+# ==============================
+# 3. 安装必备工具 (无 ufw/net-tools)
+# ==============================
+echo -e "${YELLOW}[3/6] 正在安装必备工具 (curl, wget, vim, unzip, nano)...${NC}"
 apt install -y curl wget unzip nano vim
 echo -e "${GREEN}工具安装完成。${NC}"
 
 # ==============================
-# 3. 内核 BBR 加速
+# 4. 内核 BBR 加速
 # ==============================
-echo -e "${YELLOW}[3/5] 检查并开启 BBR 加速...${NC}"
+echo -e "${YELLOW}[4/6] 检查并开启 BBR 加速...${NC}"
 if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
     if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
@@ -50,14 +69,26 @@ else
 fi
 
 # ==============================
-# 4. SSH 安全加固 (交互式)
+# 5. SSH 安全加固 (交互式)
 # ==============================
-echo -e "${YELLOW}[4/5] SSH 安全配置${NC}"
+echo -e "${YELLOW}[5/6] SSH 安全配置${NC}"
 
 # 备份配置
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%F_%T)"
 cp /etc/ssh/sshd_config "$SSHD_BACKUP"
 echo -e "已备份 SSH 配置文件至 ${SSHD_BACKUP}。"
+
+# 辅助函数：替换或追加 sshd_config 配置项
+# 用法: sshd_set "Key" "Value"
+sshd_set() {
+    local key="$1"
+    local value="$2"
+    if grep -qE "^#?\s*${key}\b" /etc/ssh/sshd_config; then
+        sed -i "s/^#\?\s*${key}\b.*/${key} ${value}/" /etc/ssh/sshd_config
+    else
+        echo "${key} ${value}" >> /etc/ssh/sshd_config
+    fi
+}
 
 # --- 修改端口 ---
 while true; do
@@ -84,7 +115,7 @@ if [[ "$IMPORT_KEY" =~ ^[Yy]$ ]]; then
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
         if ! grep -qF "$PUB_KEY" ~/.ssh/authorized_keys 2>/dev/null; then
-            echo "$PUB_KEY" >> ~/.ssh/authorized_keys
+            printf '%s\n' "$PUB_KEY" >> ~/.ssh/authorized_keys
             chmod 600 ~/.ssh/authorized_keys
             echo -e "${GREEN}公钥已导入。${NC}"
         else
@@ -103,8 +134,8 @@ if [ -s ~/.ssh/authorized_keys ]; then
     echo -e "${GREEN}检测到已有 SSH 密钥。${NC}"
     read -p "是否禁用密码登录 (推荐)? [y/n]: " DISABLE_PWD
     if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
-        sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-        sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+        sshd_set "PasswordAuthentication" "no"
+        sshd_set "ChallengeResponseAuthentication" "no"
         echo -e "${GREEN}密码登录已禁用。${NC}"
     else
         echo -e "${YELLOW}保留密码登录。${NC}"
@@ -113,21 +144,15 @@ else
     echo -e "${YELLOW}未检测到 SSH 密钥，保留密码登录。${NC}"
 fi
 
-# 应用 SSH 端口配置
-if grep -q "^#\?Port" /etc/ssh/sshd_config; then
-    sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-else
-    echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
-fi
-
-# 确保允许 root 登录 (按需)
-sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+# 应用 SSH 配置
+sshd_set "Port" "$SSH_PORT"
+sshd_set "PermitRootLogin" "yes"
+sshd_set "PubkeyAuthentication" "yes"
 
 # ==============================
-# 5. 重启服务与提示
+# 6. 重启服务与提示
 # ==============================
-echo -e "${YELLOW}[5/5] 正在重启 SSH 服务以应用更改...${NC}"
+echo -e "${YELLOW}[6/6] 正在重启 SSH 服务以应用更改...${NC}"
 systemctl restart sshd
 
 if [ $? -eq 0 ]; then
@@ -142,14 +167,15 @@ fi
 echo -e "${BLUE}=================================================${NC}"
 echo -e "${GREEN}   配置已完成   ${NC}"
 echo -e "${BLUE}=================================================${NC}"
-echo -e "1. 新 SSH 端口: ${RED}$SSH_PORT${NC}"
-echo -e "2. BBR 加速: ${GREEN}已开启${NC}"
-echo -e "3. 系统更新: ${GREEN}已完成${NC}"
+echo -e "1. 主机名: ${BLUE}$NEW_HOSTNAME${NC}"
+echo -e "2. 新 SSH 端口: ${RED}$SSH_PORT${NC}"
+echo -e "3. BBR 加速: ${GREEN}已开启${NC}"
+echo -e "4. 系统更新: ${GREEN}已完成${NC}"
 
 if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
-    echo -e "4. 登录方式: ${GREEN}仅密钥${NC}"
+    echo -e "5. 登录方式: ${GREEN}仅密钥${NC}"
 else
-    echo -e "4. 登录方式: ${YELLOW}密码 + 密钥${NC}"
+    echo -e "5. 登录方式: ${YELLOW}密码 + 密钥${NC}"
 fi
 
 echo -e "${RED}!!! 特别注意 !!!${NC}"
