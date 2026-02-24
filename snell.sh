@@ -122,12 +122,14 @@ check_deps() {
         if [ -f /etc/debian_version ]; then
             apt-get update && apt-get install -y "${deps[@]}"
         elif [ -f /etc/redhat-release ]; then
-            yum install -y "${deps[@]}"
+            yum install -y "${deps[@]}" || true
         elif [ -f /etc/alpine-release ]; then
-            apk add "${deps[@]}"
-        else
-            err "无法自动安装依赖，请手动安装: curl wget unzip"
+            apk add "${deps[@]}" || true
         fi
+        # 验证关键依赖是否真正可用
+        local dep; for dep in "${deps[@]}"; do
+            command -v "$dep" &>/dev/null || err "依赖安装失败: $dep，请手动安装"
+        done
     fi
 }
 

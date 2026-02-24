@@ -76,6 +76,15 @@ check_deps() {
             # Alpine: qrencode 命令在 libqrencode-tools 包中
             apk add curl wget unzip jq openssl libqrencode-tools
         fi
+        # 验证关键依赖是否真正可用
+        local failed=()
+        for dep in "curl" "jq" "openssl"; do
+            command -v "$dep" &>/dev/null || failed+=("$dep")
+        done
+        if [[ ${#failed[@]} -gt 0 ]]; then
+            echo -e "${RED}依赖安装失败: ${failed[*]}，请手动安装后重试。${PLAIN}"
+            exit 1
+        fi
     fi
 }
 
@@ -443,6 +452,7 @@ ask_chain_proxy() {
     
     echo -e "${YELLOW}进阶: 是否为此节点启用 SOCKS5 链式转发 (解锁/分流)? [y/N]${PLAIN}" >&2
     read -p "选择: " sel
+    sel=$(strip_cr "$sel")
     [[ "${sel,,}" == "y" ]] && echo "yes"
 }
 
@@ -469,6 +479,7 @@ configure_advanced() {
         echo -e " 0. 返回"
         echo -e "----------------------------------------"
         read -p "请选择: " choice
+        choice=$(strip_cr "$choice")
         
         case $choice in
             1) 
@@ -713,8 +724,8 @@ update_script() {
 
     mv -f "$tmp_script" "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
-    echo -e "${GREEN}更新完成 (v${remote_ver})! 请重新运行。${PLAIN}"
-    exit 0
+    echo -e "${GREEN}更新完成 (v${remote_ver})! 正在重新加载...${PLAIN}"
+    exec "$INSTALL_PATH"
 }
 
 uninstall_script() {
@@ -761,6 +772,7 @@ main_menu() {
         echo -e "  0. 退出"
         echo -e "${BLUE}================================================================${PLAIN}"
         read -p "请输入选项: " choice
+        choice=$(strip_cr "$choice")
         
         case $choice in
             1) install_xray; read -p "按回车继续..." ;;

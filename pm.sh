@@ -125,6 +125,15 @@ install_deps() {
                     echo -e "${RED}系统不受支持，请手动安装: ${deps[*]}${PLAIN}" && exit 1 ;;
             esac
         fi
+        # 验证关键依赖是否真正可用
+        local failed=()
+        for dep in "nft" "tc" "jq" "bc"; do
+            command -v "$dep" &>/dev/null || failed+=("$dep")
+        done
+        if [[ ${#failed[@]} -gt 0 ]]; then
+            echo -e "${RED}依赖安装失败: ${failed[*]}，请手动安装后重试。${PLAIN}"
+            exit 1
+        fi
     fi
 
     # 初始化配置目录与文件
