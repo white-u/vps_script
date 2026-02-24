@@ -5,7 +5,7 @@
 # 子脚本: snell (Snell代理), x-sb (Xray多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="1.0"
+VT_VERSION="2.0"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"

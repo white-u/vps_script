@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v1.0
+# 端口转发管理脚本 (基于 realm) v2.0
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -26,7 +26,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="2.0"
 REALM_VERSION="2.7.0"
 
 REALM_BIN="/usr/local/bin/realm"
@@ -311,7 +311,7 @@ reload_realm() {
 add_forward() {
     local src_port=$1 dst_ip=$2 dst_port=$3 comment=${4:-""}
 
-    validate_port "$src_port" "源端口" || return 1
+    validate_port "$src_port" "转发端口" || return 1
     validate_port "$dst_port" "目标端口" || return 1
     validate_ipv4 "$dst_ip" || return 1
 
@@ -321,7 +321,7 @@ add_forward() {
 
     init_meta
     if jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        warn "源端口 ${src_port} 已存在"; return 1
+        warn "转发端口 ${src_port} 已存在"; return 1
     fi
 
     # 检查端口占用 (TCP + UDP, 排除 realm 自身)
@@ -356,12 +356,12 @@ add_forward() {
 delete_forward() {
     local src_port=$1
 
-    validate_port "$src_port" "源端口" || return 1
+    validate_port "$src_port" "转发端口" || return 1
     src_port=$((10#$src_port))
     init_meta
 
     if ! jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        warn "源端口 ${src_port} 不存在"; return 1
+        warn "转发端口 ${src_port} 不存在"; return 1
     fi
 
     local tmp
@@ -369,7 +369,7 @@ delete_forward() {
         && echo "$tmp" > "$META_FILE"
 
     reload_realm true
-    info "转发已删除: 源端口 ${src_port}"
+    info "转发已删除: 转发端口 ${src_port}"
     echo -e " ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
 }
 
@@ -481,7 +481,7 @@ menu_add() {
     echo -e "\n${BLUE}>>> 添加转发规则${PLAIN}\n"
     local src_port dst_ip dst_port comment
 
-    read -rp " 源端口 (本机监听): " src_port || return
+    read -rp " 转发端口 (本机): " src_port || return
     src_port=$(strip_cr "$src_port")
     [[ -n "$src_port" ]] || return
 
@@ -615,7 +615,7 @@ menu() {
     local count
     count=$(rule_count)
     if [[ "$count" -gt 0 ]]; then
-        printf " %-4s %-10s %-24s %-s\n" "序号" "源端口" "目标" "备注"
+        printf " %-4s %-10s %-24s %-s\n" "序号" "转发端口" "目标" "备注"
         echo -e " ─────────────────────────────────────────────────────────────────────────────────────"
 
         local i=1 rules
@@ -692,11 +692,11 @@ if [[ $# -gt 0 ]]; then
         update)    update_script ;;
         add)
             realm_installed || err "realm 未安装，请先: $0 install"
-            [[ $# -ge 4 ]] || err "用法: $0 add <源端口> <目标IP> <目标端口> [备注]"
+            [[ $# -ge 4 ]] || err "用法: $0 add <转发端口> <目标IP> <目标端口> [备注]"
             add_forward "$2" "$3" "$4" "${5:-}"
             ;;
         del|delete|rm)
-            [[ $# -ge 2 ]] || err "用法: $0 del <源端口>"
+            [[ $# -ge 2 ]] || err "用法: $0 del <转发端口>"
             delete_forward "$2"
             ;;
         -h|--help|help)
