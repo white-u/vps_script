@@ -2,7 +2,7 @@
 #
 # VPS Toolbox — 调度器 & 状态监视器
 # 纯调度, 不包含子脚本业务逻辑
-# 子脚本: snell (Snell代理), x-sb (Xray多协议), pm (端口流量监控)
+# 子脚本: snell (Snell代理), x-sb (Xray多协议), pm (端口流量监控), fw (端口转发)
 #
 
 VT_VERSION="1.0"
@@ -14,6 +14,7 @@ VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
 SNELL_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
 XSB_URL="https://raw.githubusercontent.com/white-u/vps_script/main/x-sb.sh"
 PM_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
+FW_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
 
 # 颜色
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; DIM='\033[2m'; PLAIN='\033[0m'
@@ -48,11 +49,13 @@ install_self() {
 snell_installed() { [[ -f /usr/local/bin/snell-server ]]; }
 xray_installed()  { [[ -f /usr/local/bin/xray ]]; }
 pm_installed()    { [[ -d /etc/port_monitor ]]; }
+fw_installed()    { [[ -x /usr/local/bin/realm ]]; }
 
 # 获取版本号
 snell_version() { cat /etc/snell/.version 2>/dev/null || echo "?"; }
 xray_version()  { /usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "?"; }
 pm_version()    { grep -oP 'SCRIPT_VERSION="\K[^"]+' /usr/local/bin/pm 2>/dev/null || echo "?"; }
+fw_version()    { /usr/local/bin/realm --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
 
 # 格式化状态行
 status_line() {
@@ -84,7 +87,7 @@ nuke_all() {
     echo -e "${RED}  警告: 即将卸载所有组件并清除全部数据!${PLAIN}"
     echo -e "${RED}════════════════════════════════════════${PLAIN}"
     echo ""
-    echo " 将清除: Snell 实例 / Xray 节点 / PM 流量监控 / 内核规则"
+    echo " 将清除: Snell 实例 / Xray 节点 / PM 流量监控 / FW 端口转发 / 内核规则"
     echo ""
     read -p " 输入 yes 确认: " cf
     [[ "${cf,,}" != "yes" ]] && { echo " 已取消。"; return; }
@@ -131,6 +134,17 @@ nuke_all() {
         rm -rf /etc/port_monitor
         rm -f /usr/local/bin/pm /var/run/pm.lock /tmp/pm_user_editing
         echo -e " ${GREEN}  PM 已清除${PLAIN}"
+    fi
+
+    # === FW (realm) ===
+    if fw_installed || [[ -d /etc/realm ]]; then
+        echo -e " ${YELLOW}清理 FW (realm)...${PLAIN}"
+        systemctl stop realm 2>/dev/null || true
+        systemctl disable realm 2>/dev/null || true
+        rm -f /etc/systemd/system/realm.service
+        rm -rf /etc/realm
+        rm -f /usr/local/bin/realm /usr/local/bin/fw
+        echo -e " ${GREEN}  FW 已清除${PLAIN}"
     fi
 
     systemctl daemon-reload 2>/dev/null
@@ -194,11 +208,13 @@ main_menu() {
         status_line "Snell 代理管理  " snell_installed "$(snell_version)" "snell"
         status_line "Xray  多协议管理" xray_installed  "$(xray_version)"  "x-sb"
         status_line "PM    端口流量  " pm_installed     "$(pm_version)"    "pm"
+        status_line "FW    端口转发  " fw_installed     "$(fw_version)"    "fw"
         echo -e " ──────────────────────────────────────────────"
         echo ""
         echo -e "  1. Snell 代理管理"
         echo -e "  2. Xray 多协议管理"
         echo -e "  3. 端口流量监控"
+        echo -e "  4. 端口转发管理"
         echo -e " ──────────────────────────────────────────────"
         echo -e "  8. ${RED}全部卸载 (暴力清空)${PLAIN}"
         echo -e "  9. 更新工具箱"
@@ -210,6 +226,7 @@ main_menu() {
             1) dispatch "Snell" "snell" "$SNELL_URL" ;;
             2) dispatch "Xray"  "x-sb"  "$XSB_URL"  ;;
             3) dispatch "PM"    "pm"    "$PM_URL"    ;;
+            4) dispatch "FW"    "fw"    "$FW_URL"    ;;
             8) nuke_all ;;
             9) update_self; read -p " 按回车继续..." ;;
             0) exit 0 ;;
