@@ -880,7 +880,7 @@ show_main_menu() {
         if [ "$is_blocked" == true ]; then
             echo -e " ${RED}[${i}]  ${port}         [已阻断]  配额用尽，端口已封禁${PLAIN}"
         else
-            printf " [%d]  %-12s %-10s %-30s %-24s %-15s\n" $i "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
+            printf " [%d]  %-12s %-10s %-30s %-24b %-15s\n" $i "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
         fi
         
         port_list[$i]=$port
@@ -1350,6 +1350,21 @@ configure_telegram() {
                     
                     if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
                         echo -e "${GREEN}✅ 发送成功! 请检查 Telegram。${PLAIN}"
+                        # 如果通知未启用，提醒并提供一键开启
+                        if [ "$tg_enable" != "true" ]; then
+                            echo -e "\n${RED}⚠️  注意: 通知功能当前未开启!${PLAIN}"
+                            echo -e "${YELLOW}   测试消息可以发送，但配额预警/限速通知不会生效。${PLAIN}"
+                            read -p "   是否立即开启通知? [Y/n] " auto_enable
+                            auto_enable=$(strip_cr "$auto_enable")
+                            if [[ ! "$auto_enable" =~ ^[nN] ]]; then
+                                local tmp_en=$(mktemp)
+                                if jq '.telegram.enable = true' "$CONFIG_FILE" > "$tmp_en" && safe_write_config_from_file "$tmp_en"; then
+                                    echo -e "${GREEN}   ✅ 通知已开启${PLAIN}"
+                                    tg_enable="true"  # 更新循环变量
+                                fi
+                                rm -f "$tmp_en"
+                            fi
+                        fi
                     else
                         local err_desc=$(echo "$result" | jq -r '.description // "连接失败或超时"' 2>/dev/null)
                         echo -e "${RED}❌ 发送失败: $err_desc${PLAIN}"
