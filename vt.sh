@@ -19,6 +19,9 @@ FW_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
 # 颜色
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; DIM='\033[2m'; PLAIN='\033[0m'
 
+# Windows 终端兼容: 清洗 \r
+strip_cr() { echo "${1//$'\r'/}"; }
+
 # ─────────────────── 基础函数 ───────────────────
 
 check_root() {
@@ -90,6 +93,7 @@ nuke_all() {
     echo " 将清除: Snell 实例 / Xray 节点 / PM 流量监控 / FW 端口转发 / 内核规则"
     echo ""
     read -p " 输入 yes 确认: " cf
+    cf=$(strip_cr "$cf")
     [[ "${cf,,}" != "yes" ]] && { echo " 已取消。"; return; }
 
     echo ""
@@ -152,6 +156,7 @@ nuke_all() {
     echo ""
     echo -e "${GREEN}全部清除完成。${PLAIN}"
     read -p " 是否同时卸载工具箱自身? [y/N]: " rm_self
+    rm_self=$(strip_cr "$rm_self")
     if [[ "${rm_self,,}" == "y" ]]; then
         rm -f "$VT_INSTALL_PATH"
         echo -e "${GREEN}工具箱已卸载。${PLAIN}"
@@ -221,6 +226,7 @@ main_menu() {
         echo -e "  0. 退出"
         echo -e "${BLUE}================================================================${PLAIN}"
         read -p " 请选择: " choice
+        choice=$(strip_cr "$choice")
 
         case $choice in
             1) dispatch "Snell" "snell" "$SNELL_URL" ;;

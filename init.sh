@@ -7,6 +7,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Windows 终端兼容: 清洗 \r
+strip_cr() { echo "${1//$'\r'/}"; }
+
 # 检查 Root 权限
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}错误：请使用 root 权限运行此脚本。${NC}" 
@@ -34,6 +37,7 @@ echo -e "${YELLOW}[2/6] 主机名设置${NC}"
 CURRENT_HOSTNAME=$(hostname)
 echo -e "当前主机名: ${BLUE}${CURRENT_HOSTNAME}${NC}"
 read -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
+NEW_HOSTNAME=$(strip_cr "$NEW_HOSTNAME")
 if [ ! -z "$NEW_HOSTNAME" ]; then
     hostnamectl set-hostname "$NEW_HOSTNAME"
     sed -i "s/127.0.1.1.*/127.0.1.1\t$NEW_HOSTNAME/" /etc/hosts
@@ -93,6 +97,7 @@ sshd_set() {
 # --- 修改端口 ---
 while true; do
     read -p "请输入新的 SSH 端口号 (建议 10000-65535): " SSH_PORT
+    SSH_PORT=$(strip_cr "$SSH_PORT")
     if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
         if [ "$SSH_PORT" -eq 22 ]; then
             echo -e "${RED}不允许使用默认端口 22，请重新输入。${NC}"
@@ -108,9 +113,11 @@ done
 # --- 配置密钥登录 ---
 echo -e "${YELLOW}--- 密钥登录设置 ---${NC}"
 read -p "是否导入 SSH 公钥 (Public Key)? [y/n]: " IMPORT_KEY
+IMPORT_KEY=$(strip_cr "$IMPORT_KEY")
 if [[ "$IMPORT_KEY" =~ ^[Yy]$ ]]; then
     echo -e "请粘贴您的公钥 (ssh-rsa AAAA...):"
     read -r PUB_KEY
+    PUB_KEY=$(strip_cr "$PUB_KEY")
     if [ ! -z "$PUB_KEY" ]; then
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
@@ -133,6 +140,7 @@ fi
 if [ -s ~/.ssh/authorized_keys ]; then
     echo -e "${GREEN}检测到已有 SSH 密钥。${NC}"
     read -p "是否禁用密码登录 (推荐)? [y/n]: " DISABLE_PWD
+    DISABLE_PWD=$(strip_cr "$DISABLE_PWD")
     if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
         sshd_set "PasswordAuthentication" "no"
         sshd_set "ChallengeResponseAuthentication" "no"
@@ -182,6 +190,7 @@ echo -e "${RED}!!! 特别注意 !!!${NC}"
 echo -e "请务必在【云服务商安全组】中放行端口 ${RED}$SSH_PORT${NC} 之后再关闭当前会话。"
 
 read -p "是否立即重启服务器? [y/n]: " REBOOT_NOW
+REBOOT_NOW=$(strip_cr "$REBOOT_NOW")
 if [[ "$REBOOT_NOW" =~ ^[Yy]$ ]]; then
     echo -e "正在重启..."
     reboot

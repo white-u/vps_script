@@ -71,18 +71,16 @@ sync_script() {
 
 # 依赖检查
 check_deps() {
-    if ! command -v jq &>/dev/null; then
-        info "安装必要依赖..."
-        if [ -f /etc/debian_version ]; then
-            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1
-        elif [ -f /etc/redhat-release ]; then
-            yum install -y jq >/dev/null 2>&1
-        elif [ -f /etc/alpine-release ]; then
-            apk add jq >/dev/null 2>&1
-        else
-            err "无法自动安装 jq，请手动安装"
-        fi
+    command -v jq &>/dev/null && return 0
+    info "安装必要依赖..."
+    if [ -f /etc/debian_version ]; then
+        apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y jq >/dev/null 2>&1 || true
+    elif [ -f /etc/alpine-release ]; then
+        apk add jq >/dev/null 2>&1 || true
     fi
+    command -v jq &>/dev/null || err "jq 安装失败，请手动安装"
 }
 
 # 架构检测
