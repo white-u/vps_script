@@ -1,28 +1,33 @@
 #!/bin/bash
 #
-# fw.sh — 端口转发管理器 (基于 realm)
-# 版本: v1.0
+# 端口转发管理脚本 (基于 realm) v1.0
+# - 支持 TCP/UDP 端口转发
+# - 与 pm.sh 流量监控无缝协作
+# - 基于 realm 用户态转发，无需内核 FORWARD 链
 #
-# 架构:
-#   realm 作为用户态进程监听本机端口，将流量转发到目标 IP:Port
-#   流量路径: 客户端 → INPUT → realm 进程 → OUTPUT → 目标
-#   因此 pm.sh 的 OUTPUT 链配额/限速规则天然命中转发端口
-#
-# 文件布局:
-#   /usr/local/bin/realm           realm 二进制
-#   /usr/local/bin/fw              本脚本快捷命令
-#   /etc/realm/config.toml         realm 配置 (自动生成)
-#   /etc/realm/fw.json             转发元数据 (备注等)
-#   /etc/systemd/system/realm.service
-#
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh)
 
-# --- 全局配置 ---
+set -euo pipefail
+
+# 临时资源清理 (Ctrl+C / 异常退出时自动清理)
+_CLEANUP_FILES=()
+cleanup() {
+    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+        rm -rf "$f" 2>/dev/null
+    done
+}
+trap cleanup EXIT INT TERM
+
+# ==================== 变量定义 ====================
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+DIM="\033[2m"
+PLAIN="\033[0m"
+
 SCRIPT_VERSION="1.0"
 REALM_VERSION="2.7.0"
-SHORTCUT_NAME="fw"
-INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
-DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
-SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
 
 REALM_BIN="/usr/local/bin/realm"
 CONFIG_DIR="/etc/realm"
@@ -31,62 +36,87 @@ META_FILE="${CONFIG_DIR}/fw.json"
 SERVICE_NAME="realm"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# --- 颜色 (与 vt.sh/pm.sh 统一) ---
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'
-DIM='\033[2m'; BOLD='\033[1m'; PLAIN='\033[0m'
+# 快捷命令路径
+SCRIPT_PATH="/usr/local/bin/fw"
+# 脚本远程地址 (用于管道运行时自动下载安装快捷命令)
+SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
 
-# --- 临时资源清理 ---
-_CLEANUP_FILES=()
-_global_cleanup() {
-    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
-        rm -rf "$f" 2>/dev/null
-    done
-}
-trap _global_cleanup EXIT INT TERM
-
-# --- 输入清洗 (Windows 终端 \r) ---
+# ==================== 基础函数 ====================
+err() { echo -e "${RED}❌ 错误: $1${PLAIN}"; exit 1; }
+info() { echo -e "${GREEN}INFO: $1${PLAIN}"; }
+warn() { echo -e "${YELLOW}警告: $1${PLAIN}"; }
 strip_cr() { echo "${1//$'\r'/}"; }
-
-# --- 日志 ---
-info() { echo -e "${GREEN}[✓]${PLAIN} $*"; }
-warn() { echo -e "${YELLOW}[!]${PLAIN} $*"; }
-err()  { echo -e "${RED}[✗]${PLAIN} $*"; }
-die()  { err "$@"; exit 1; }
-
-# ============================================================================
-# 基础函数
-# ============================================================================
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}错误: 必须使用 root 权限运行此脚本。${PLAIN}"
-        exit 1
+        err "请使用 root 用户运行此脚本: sudo bash fw.sh"
     fi
 }
 
-check_jq() {
-    command -v jq &>/dev/null && return 0
-    warn "jq 未安装，正在安装..."
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq jq >/dev/null 2>&1 || die "jq 安装失败"
-    info "jq 已安装"
+# 同步快捷命令 (入口处调用, 确保 /usr/local/bin/fw 与运行版本一致)
+sync_script() {
+    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
+        # 文件模式: 直接复制 (跳过从快捷命令自身运行的情况)
+        if [[ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]]; then
+            cp "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+        fi
+    else
+        # 管道/进程替换模式: 从远程下载覆盖
+        if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" 2>/dev/null; then
+            chmod +x "$SCRIPT_PATH"
+        fi
+    fi
 }
 
-# 安装快捷方式 (与 pm.sh/vt.sh 统一模式)
-install_shortcut() {
-    [[ "$0" == "$INSTALL_PATH" ]] && return
-    # 管道模式检测 (curl | bash 时 $0 = bash)
-    local base
-    base=$(basename "$0" 2>/dev/null)
-    if [[ "$base" == "bash" || "$base" == "sh" ]]; then
-        warn "管道运行模式，跳过快捷命令安装。"
-        return
-    fi
-    if [[ -n "$SCRIPT_PATH" ]] && [[ -f "$SCRIPT_PATH" ]]; then
-        cp "$SCRIPT_PATH" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
-        info "快捷命令 '${SHORTCUT_NAME}' 已安装。"
+# 依赖检查
+check_deps() {
+    if ! command -v jq &>/dev/null; then
+        info "安装必要依赖..."
+        if [ -f /etc/debian_version ]; then
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y jq >/dev/null 2>&1
+        elif [ -f /etc/alpine-release ]; then
+            apk add jq >/dev/null 2>&1
+        else
+            err "无法自动安装 jq，请手动安装"
+        fi
     fi
 }
+
+# 架构检测
+detect_arch() {
+    case $(uname -m) in
+        x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+        armv7*)        echo "armv7-unknown-linux-gnueabihf" ;;
+        *) err "不支持的架构: $(uname -m)" ;;
+    esac
+}
+
+realm_installed() { [[ -x "$REALM_BIN" ]]; }
+realm_running()   { systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }
+
+# 获取 realm 运行状态 (带颜色)
+get_realm_status() {
+    if ! realm_installed; then
+        echo -e "${RED}未安装${PLAIN}"
+    elif realm_running; then
+        echo -e "${GREEN}运行中${PLAIN}"
+    else
+        echo -e "${YELLOW}已停止${PLAIN}"
+    fi
+}
+
+# 获取已安装的 realm 版本
+get_realm_version() {
+    if realm_installed; then
+        "$REALM_BIN" --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || true
+    fi
+}
+
+# ==================== JSON 元数据 ====================
 
 init_meta() {
     mkdir -p "$CONFIG_DIR"
@@ -107,72 +137,79 @@ rule_count() {
     jq '.rules | length' "$META_FILE" 2>/dev/null || echo 0
 }
 
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-        armv7*)        echo "armv7-unknown-linux-gnueabihf" ;;
-        *)             die "不支持的架构: $(uname -m)" ;;
-    esac
+# ==================== 输入校验 ====================
+
+validate_port() {
+    local port=$1 label=$2
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        warn "无效${label}: $port"; return 1
+    fi
+    # 去掉前导零 (jq --argjson 不接受 JSON 非法数字如 "08080")
+    port=$((10#$port))
+    if [[ $port -lt 1 || $port -gt 65535 ]]; then
+        warn "无效${label}: $port (范围 1-65535)"; return 1
+    fi
 }
 
-realm_installed() { [[ -x "$REALM_BIN" ]]; }
-realm_running()   { systemctl is-active "$SERVICE_NAME" &>/dev/null; }
+validate_ipv4() {
+    local ip=$1
+    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        warn "无效 IP: $ip"; return 1
+    fi
+    local IFS='.'; local -a parts=($ip); IFS=' '
+    local p; for p in "${parts[@]}"; do
+        if [[ $((10#$p)) -gt 255 ]]; then
+            warn "无效 IP: $ip"; return 1
+        fi
+    done
+}
 
-# ============================================================================
-# realm 安装
-# ============================================================================
+# ==================== 核心逻辑 ====================
 
+# 1. 安装/更新 realm 核心二进制
 install_realm() {
     if realm_installed; then
         local cur_ver
-        cur_ver=$("$REALM_BIN" --version 2>/dev/null | grep -oP '[\d.]+' || true)
-        cur_ver=$(echo "$cur_ver" | head -1)
-        info "realm 已安装 (v${cur_ver:-unknown})"
-        read -rp "  是否重新安装 v${REALM_VERSION}? [y/N] " confirm || return
+        cur_ver=$(get_realm_version)
+        echo -e " 当前版本: ${GREEN}v${cur_ver:-unknown}${PLAIN}"
+        read -rp " 是否重新安装 v${REALM_VERSION}? [y/N] " confirm || return
         confirm=$(strip_cr "$confirm")
         [[ "$confirm" =~ ^[yY] ]] || return 0
     fi
 
+    echo -e "${BLUE}>>> 准备安装 realm v${REALM_VERSION}${PLAIN}"
+
     local arch_name url tmp_dir
     arch_name=$(detect_arch)
     url="https://github.com/zhboner/realm/releases/download/v${REALM_VERSION}/realm-${arch_name}.tar.gz"
-    tmp_dir=$(mktemp -d)
+
+    tmp_dir=$(mktemp -d /tmp/realm_install.XXXXXX)
     _CLEANUP_FILES+=("$tmp_dir")
 
-    info "下载 realm v${REALM_VERSION} (${arch_name})..."
     if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "${tmp_dir}/realm.tar.gz" "$url"; then
-        die "下载失败: $url"
+        err "下载失败，请检查网络。"
     fi
 
-    tar -xzf "${tmp_dir}/realm.tar.gz" -C "$tmp_dir"
+    # 解压到临时目录，只提取二进制
+    if ! tar -xzf "${tmp_dir}/realm.tar.gz" -C "$tmp_dir"; then
+        err "解压失败。"
+    fi
 
     local bin_path
     bin_path=$(find "$tmp_dir" -name "realm" -type f -perm -111 2>/dev/null | head -1)
     [[ -n "$bin_path" ]] || bin_path=$(find "$tmp_dir" -maxdepth 1 -type f ! -name "*.tar.gz" ! -name "*.sha256" | head -1)
-    [[ -n "$bin_path" ]] || die "解压后未找到 realm 二进制"
+    [[ -n "$bin_path" ]] || err "解压后未找到 realm 二进制"
 
     # 正在运行则先停止
     if realm_running; then
+        warn "正在暂停 realm 以更新核心..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     fi
 
     cp "$bin_path" "$REALM_BIN"
     chmod +x "$REALM_BIN"
 
-    info "realm v${REALM_VERSION} 已安装到 ${REALM_BIN}"
-
-    install_service
-
-    # 如果已有规则, 生成配置并启动
-    local count
-    count=$(rule_count)
-    if [[ "$count" -gt 0 ]]; then
-        reload_realm
-    fi
-}
-
-install_service() {
+    # 安装 Systemd 服务文件
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Realm Port Forwarding
@@ -189,15 +226,21 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    # 不在此处 enable, 由 reload_realm 根据规则数量决定
-    info "systemd 服务已安装"
+    if ! systemctl daemon-reload; then
+        err "systemctl daemon-reload 失败，请检查 systemd 状态。"
+    fi
+
+    # 如果已有规则, 生成配置并启动
+    local count
+    count=$(rule_count)
+    if [[ "$count" -gt 0 ]]; then
+        reload_realm true
+    fi
+
+    info "realm v${REALM_VERSION} 已安装完成"
 }
 
-# ============================================================================
-# 配置生成与重载
-# ============================================================================
-
+# 2. 配置生成
 generate_config() {
     init_meta
     cat > "$CONFIG_TOML" <<'HEADER'
@@ -227,6 +270,7 @@ EOF
     done <<< "$rules"
 }
 
+# 3. 重载 realm
 reload_realm() {
     local quiet=${1:-false}
     generate_config
@@ -261,43 +305,11 @@ reload_realm() {
     if realm_running; then
         [[ "$quiet" == "true" ]] || info "realm 已重载 (${count} 条规则)"
     else
-        err "realm 启动失败，请检查: journalctl -u ${SERVICE_NAME} -n 20"
+        warn "realm 启动失败，请检查: journalctl -u ${SERVICE_NAME} -n 20"
     fi
 }
 
-# ============================================================================
-# 输入校验
-# ============================================================================
-
-validate_port() {
-    local port=$1 label=$2
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        err "无效${label}: $port"; return 1
-    fi
-    # 去掉前导零 (jq --argjson 不接受 JSON 非法数字如 "08080")
-    port=$((10#$port))
-    if [[ $port -lt 1 || $port -gt 65535 ]]; then
-        err "无效${label}: $port (范围 1-65535)"; return 1
-    fi
-}
-
-validate_ipv4() {
-    local ip=$1
-    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        err "无效 IP: $ip"; return 1
-    fi
-    local IFS='.'; local -a parts=($ip); IFS=' '
-    local p; for p in "${parts[@]}"; do
-        if [[ $p -gt 255 ]]; then
-            err "无效 IP: $ip"; return 1
-        fi
-    done
-}
-
-# ============================================================================
-# 转发规则 CRUD
-# ============================================================================
-
+# 4. 添加转发规则
 add_forward() {
     local src_port=$1 dst_ip=$2 dst_port=$3 comment=${4:-""}
 
@@ -311,13 +323,12 @@ add_forward() {
 
     init_meta
     if jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        err "源端口 ${src_port} 已存在"; return 1
+        warn "源端口 ${src_port} 已存在"; return 1
     fi
 
     # 检查端口占用 (TCP + UDP, 排除 realm 自身)
     local port_in_use=false
-    if ss -tlnp 2>/dev/null | grep -qE ":${src_port}\b" || \
-       ss -ulnp 2>/dev/null | grep -qE ":${src_port}\b"; then
+    if ss -tlnp 2>/dev/null | grep -qE ":${src_port}\b"; then
         if ! ss -tulnp 2>/dev/null | grep -E ":${src_port}\b" | grep -q "realm"; then
             port_in_use=true
         fi
@@ -340,9 +351,10 @@ add_forward() {
     reload_realm true
     echo ""
     info "转发已添加: :${src_port} → ${dst_ip}:${dst_port}"
-    echo -e "  ${DIM}提示: 如需配额/限速，在 pm.sh 中为端口 ${src_port} 添加监控${PLAIN}"
+    echo -e " ${DIM}提示: 如需配额/限速，在 pm.sh 中为端口 ${src_port} 添加监控${PLAIN}"
 }
 
+# 5. 删除转发规则
 delete_forward() {
     local src_port=$1
 
@@ -351,7 +363,7 @@ delete_forward() {
     init_meta
 
     if ! jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        err "源端口 ${src_port} 不存在"; return 1
+        warn "源端口 ${src_port} 不存在"; return 1
     fi
 
     local tmp
@@ -360,101 +372,115 @@ delete_forward() {
 
     reload_realm true
     info "转发已删除: 源端口 ${src_port}"
-    echo -e "  ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
+    echo -e " ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
 }
 
-list_forwards() {
-    echo ""
+# 6. 查看所有配置
+show_all_configs() {
     init_meta
     local count
     count=$(rule_count)
 
-    local status_icon status_text
-    if ! realm_installed; then
-        status_icon="${RED}●${PLAIN}"; status_text="未安装"
-    elif realm_running; then
-        status_icon="${GREEN}●${PLAIN}"; status_text="运行中"
-    else
-        status_icon="${YELLOW}●${PLAIN}"; status_text="已停止"
-    fi
-
-    echo -e "  ${BOLD}realm${PLAIN}  ${status_icon} ${status_text}   ${DIM}规则: ${count}${PLAIN}"
-    if realm_installed; then
-        local ver
-        ver=$("$REALM_BIN" --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || true)
-        [[ -n "$ver" ]] && echo -e "  ${DIM}版本: v${ver}${PLAIN}"
-    fi
-    echo ""
-
     if [[ "$count" -eq 0 ]]; then
-        echo -e "  ${DIM}(无转发规则)${PLAIN}"
-        echo ""
+        warn "暂无转发规则。"
         return
     fi
 
-    printf "  %-3s  %-8s  %-24s  %s\n" "#" "源端口" "目标" "备注"
-    echo -e "  -------------------------------------------------------"
+    echo -e " ${BLUE}>>> 转发规则清单${PLAIN}"
+    echo -e " ════════════════════════════════════════════════════════════════"
 
-    local i=1 rules
+    local rules
     rules=$(jq -c '.rules[]' "$META_FILE" 2>/dev/null) || return
 
+    local i=1
     while IFS= read -r rule; do
         local sp dip dp cmt
         sp=$(echo "$rule"  | jq -r '.src_port')
         dip=$(echo "$rule" | jq -r '.dst_ip')
         dp=$(echo "$rule"  | jq -r '.dst_port')
         cmt=$(echo "$rule" | jq -r '.comment // ""')
-        printf "  %-3s  %-8s  %-24s  %s\n" "$i" ":${sp}" "${dip}:${dp}" "$cmt"
+
+        local cmt_str=""
+        [[ -n "$cmt" ]] && cmt_str=" ${DIM}(${cmt})${PLAIN}"
+
+        echo -e " ${GREEN}▶ :${sp} → ${dip}:${dp}${PLAIN}${cmt_str}"
+        echo -e " ────────────────────────────────────────────────────────────────"
         i=$((i + 1))
     done <<< "$rules"
-    echo ""
+
+    echo -e " ${DIM}提示: 配额/限速请在 pm.sh 中为对应端口添加监控。${PLAIN}"
 }
 
-# ============================================================================
-# 完整卸载
-# ============================================================================
+# 7. 更新管理脚本
+update_script() {
+    echo
+    echo -e " ${BLUE}>>> 更新管理脚本${PLAIN}"
+    echo -e " 当前版本: v${SCRIPT_VERSION}"
+    echo -e " 远程地址: ${DIM}${SCRIPT_URL}${PLAIN}"
+    echo
 
-full_uninstall() {
-    echo ""
-    echo -e "${RED}========================================${PLAIN}"
-    echo -e "${RED}  警告: 即将卸载 realm 并清除全部配置!${PLAIN}"
-    echo -e "${RED}========================================${PLAIN}"
-    echo ""
-    echo " 将清除: realm 二进制 / 所有转发配置 / systemd 服务 / fw 快捷命令"
-    echo ""
-    read -rp " 输入 yes 确认: " confirm || return
+    local tmp_script
+    tmp_script=$(mktemp /tmp/fw_update.XXXXXX.sh)
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
+        err "下载失败，请检查网络。"
+    fi
+
+    # 提取远程版本号
+    local remote_ver
+    remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2 || true)
+
+    if [[ -z "$remote_ver" ]]; then
+        warn "无法解析远程版本号，继续更新..."
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+        info "已是最新版本 (v${SCRIPT_VERSION})，无需更新。"
+        rm -f "$tmp_script"
+        return
+    else
+        echo -e " 发现新版本: ${GREEN}v${remote_ver}${PLAIN}"
+    fi
+
+    mv -f "$tmp_script" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    info "脚本已更新完成! 正在重新加载..."
+    echo
+    exec "$SCRIPT_PATH"
+}
+
+# 8. 完整卸载
+uninstall_all() {
+    echo
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo -e " ${RED}  警告: 即将卸载 realm 并清除全部配置!${PLAIN}"
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo
+    read -rp " 确认执行? (输入 yes 确认): " confirm
     confirm=$(strip_cr "$confirm")
-    [[ "${confirm,,}" == "yes" ]] || { echo " 已取消。"; return; }
+    [[ "${confirm,,}" != "yes" ]] && { echo " 已取消。"; return; }
 
-    echo ""
     if realm_running; then
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-        info "realm 已停止"
     fi
 
     if [[ -f "$SERVICE_FILE" ]]; then
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
         rm -f "$SERVICE_FILE"
-        systemctl daemon-reload
-        info "systemd 服务已删除"
+        systemctl daemon-reload 2>/dev/null || true
     fi
 
     rm -f "$REALM_BIN"
     rm -rf "$CONFIG_DIR"
-    rm -f "$INSTALL_PATH"
-    info "完整卸载完成"
-    echo -e "  ${DIM}提示: pm.sh 中的相关端口监控需手动移除${PLAIN}"
+    rm -f "$SCRIPT_PATH"
+
+    info "realm 已彻底卸载。"
+    exit 0
 }
 
-# ============================================================================
-# 交互菜单
-# ============================================================================
+# ==================== 交互菜单 ====================
 
 menu_add() {
-    echo ""
-    echo -e " ${BOLD}添加转发规则${PLAIN}"
-    echo ""
-
+    echo -e "\n${BLUE}>>> 添加转发规则${PLAIN}\n"
     local src_port dst_ip dst_port comment
 
     read -rp " 源端口 (本机监听): " src_port || return
@@ -472,28 +498,25 @@ menu_add() {
     read -rp " 备注 (可选): " comment || true
     comment=$(strip_cr "$comment")
 
-    echo ""
-    echo -e " :${src_port} → ${dst_ip}:${dst_port}  ${DIM}${comment}${PLAIN}"
+    echo -e "\n :${src_port} → ${dst_ip}:${dst_port}  ${DIM}${comment}${PLAIN}"
     read -rp " 确认? [Y/n] " confirm || return
     confirm=$(strip_cr "$confirm")
     [[ "$confirm" =~ ^[nN] ]] && { echo " 已取消"; return; }
 
-    echo ""
+    echo
     add_forward "$src_port" "$dst_ip" "$dst_port" "$comment"
 }
 
 menu_delete() {
-    echo ""
     local count
     count=$(rule_count)
 
     if [[ "$count" -eq 0 ]]; then
-        echo -e " ${DIM}(无转发规则)${PLAIN}"
+        warn "暂无转发规则。"
         return
     fi
 
-    echo -e " ${BOLD}删除转发规则${PLAIN}"
-    echo ""
+    echo -e "\n${BLUE}>>> 删除转发规则${PLAIN}\n"
 
     local i=1 rules
     rules=$(jq -c '.rules[]' "$META_FILE" 2>/dev/null) || return
@@ -504,43 +527,51 @@ menu_delete() {
         dip=$(echo "$rule" | jq -r '.dst_ip')
         dp=$(echo "$rule"  | jq -r '.dst_port')
         cmt=$(echo "$rule" | jq -r '.comment // ""')
-        echo -e " [${i}]  :${sp} → ${dip}:${dp}  ${DIM}${cmt}${PLAIN}"
+        printf "  [%d]  :%-8s → %s:%s  %s\n" $i "$sp" "$dip" "$dp" "$cmt"
         i=$((i + 1))
     done <<< "$rules"
 
-    echo ""
-    read -rp " 输入序号删除 (0=取消): " choice || return
+    echo
+    read -rp " 请选择要删除的序号 (输入 0 取消): " choice
     choice=$(strip_cr "$choice")
+    [[ "$choice" == "0" ]] && return
     [[ "$choice" =~ ^[0-9]+$ ]] || { warn "输入无效"; return; }
-    [[ "$choice" -eq 0 ]] && return
-    if [[ "$choice" -lt 1 || "$choice" -gt "$count" ]]; then
-        warn "序号超出范围"; return
+
+    local idx=$((choice - 1))
+    if [[ $idx -ge $count ]]; then
+        warn "序号超出范围"
+        return
     fi
 
-    local src_port
-    src_port=$(jq -r ".rules[$(( choice - 1 ))].src_port" "$META_FILE")
+    local target_port
+    target_port=$(jq -r ".rules[$idx].src_port" "$META_FILE")
 
-    echo ""
-    delete_forward "$src_port"
+    read -rp " 确认删除源端口 $target_port 的转发? [y/N]: " confirm
+    confirm=$(strip_cr "$confirm")
+    if [[ "${confirm,,}" == "y" ]]; then
+        echo
+        delete_forward "$target_port"
+    else
+        echo " 已取消。"
+    fi
 }
 
 menu_status() {
-    echo ""
-    echo -e " ${BOLD}服务状态${PLAIN}"
-    echo ""
+    echo
+    echo -e " ${BLUE}>>> 服务状态${PLAIN}"
+    echo
 
     if ! realm_installed; then
         echo -e " realm: ${RED}未安装${PLAIN}"
-        echo ""
         return
     fi
 
     local ver
-    ver=$("$REALM_BIN" --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || true)
-    echo -e " 版本: ${BOLD}v${ver:-unknown}${PLAIN}"
+    ver=$(get_realm_version)
+    echo -e " 版本:  v${ver:-unknown}"
     echo -e " 二进制: ${REALM_BIN}"
-    echo -e " 配置: ${CONFIG_TOML}"
-    echo ""
+    echo -e " 配置:  ${CONFIG_TOML}"
+    echo
 
     if realm_running; then
         echo -e " 状态: ${GREEN}● 运行中${PLAIN}"
@@ -550,118 +581,145 @@ menu_status() {
             mem=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
             echo -e " PID: ${pid}  内存: ${mem}"
         fi
-        echo ""
+        echo
         echo -e " ${DIM}监听端口:${PLAIN}"
-        ss -tlnp 2>/dev/null | grep realm | awk '{print "   " $4}' | head -20
+        ss -tlnp 2>/dev/null | grep realm | awk '{print "   " $4}' | head -20 || true
     else
         echo -e " 状态: ${YELLOW}● 已停止${PLAIN}"
-        echo ""
+        echo
         if journalctl -u "$SERVICE_NAME" -n 1 &>/dev/null 2>&1; then
             echo -e " ${DIM}最近日志:${PLAIN}"
-            journalctl -u "$SERVICE_NAME" -n 5 --no-pager 2>/dev/null | sed 's/^/   /'
+            journalctl -u "$SERVICE_NAME" -n 5 --no-pager 2>/dev/null | sed 's/^/   /' || true
         fi
     fi
-    echo ""
 }
 
-show_menu() {
-    while true; do
-        clear
-        local count status_str
-        count=$(rule_count)
+# ==================== 菜单 ====================
+menu() {
+    clear
+    echo -e "========================================================================================="
+    echo -e "   端口转发管理脚本 (v${SCRIPT_VERSION})"
+    echo -e "========================================================================================="
 
-        if ! realm_installed; then
-            status_str="${RED}未安装${PLAIN}"
-        elif realm_running; then
-            status_str="${GREEN}运行中${PLAIN}"
-        else
-            status_str="${YELLOW}已停止${PLAIN}"
-        fi
+    # ---- 状态面板 ----
+    local realm_status
+    realm_status=$(get_realm_status)
+    local ver_str=""
+    if realm_installed; then
+        local ver
+        ver=$(get_realm_version)
+        [[ -n "$ver" ]] && ver_str=" v${ver}"
+    fi
+    echo -e " realm 状态: ${realm_status}${ver_str}    规则: $(rule_count) 条"
+    echo -e "-----------------------------------------------------------------------------------------"
 
-        echo -e "${BLUE}================================================================${PLAIN}"
-        echo -e "   端口转发管理 (v${SCRIPT_VERSION}) - realm ${status_str}  ${DIM}规则: ${count}${PLAIN}"
-        echo -e "${BLUE}================================================================${PLAIN}"
+    # ---- 规则列表 ----
+    local count
+    count=$(rule_count)
+    if [[ "$count" -gt 0 ]]; then
+        printf " %-4s %-10s %-24s %-s\n" "序号" "源端口" "目标" "备注"
+        echo -e " ─────────────────────────────────────────────────────────────────────────────────────"
 
-        list_forwards
+        local i=1 rules
+        rules=$(jq -c '.rules[]' "$META_FILE" 2>/dev/null) || true
 
-        echo -e " 1. 添加转发规则"
-        echo -e " 2. 删除转发规则"
-        echo -e " 3. 服务状态"
+        while IFS= read -r rule; do
+            [[ -z "$rule" ]] && continue
+            local sp dip dp cmt
+            sp=$(echo "$rule"  | jq -r '.src_port')
+            dip=$(echo "$rule" | jq -r '.dst_ip')
+            dp=$(echo "$rule"  | jq -r '.dst_port')
+            cmt=$(echo "$rule" | jq -r '.comment // ""')
 
-        if ! realm_installed; then
-            echo -e " 4. ${GREEN}安装 realm${PLAIN}"
-        else
-            echo -e " 4. 重新安装 realm"
-        fi
+            printf " [%d]  %-10s %-24s %-s\n" $i ":${sp}" "${dip}:${dp}" "$cmt"
+            i=$((i + 1))
+        done <<< "$rules"
+    else
+        echo -e " ${DIM}暂无转发规则，请先安装 realm 并添加规则。${PLAIN}"
+    fi
 
-        echo -e " 5. ${RED}完整卸载${PLAIN}"
-        echo -e " 0. 退出"
-        echo -e "${BLUE}================================================================${PLAIN}"
-        read -rp " 请选择: " choice || break
-        choice=$(strip_cr "$choice")
+    echo -e "========================================================================================="
+    echo
+    echo -e " 1. ${GREEN}添加转发规则${PLAIN}"
+    echo -e " 2. 删除转发规则"
+    echo -e " 3. 查看规则配置"
+    echo -e " 4. 服务状态"
 
-        case $choice in
-            1)
-                if ! realm_installed; then
-                    warn "realm 未安装"
-                    read -rp " 现在安装? [Y/n] " c || continue
-                    c=$(strip_cr "$c")
-                    [[ "$c" =~ ^[nN] ]] && continue
-                    install_realm
-                fi
-                menu_add
-                ;;
-            2) menu_delete ;;
-            3) menu_status; read -rp " 按回车继续..." _ || true ;;
-            4) install_realm; read -rp " 按回车继续..." _ || true ;;
-            5) full_uninstall; read -rp " 按回车继续..." _ || true ;;
-            0|"") echo ""; break ;;
-            *) ;;
-        esac
-    done
+    if ! realm_installed; then
+        echo -e " 5. ${GREEN}安装 realm${PLAIN}"
+    else
+        echo -e " 5. 重新安装 realm"
+    fi
+
+    echo -e " 6. 更新管理脚本"
+    echo -e " 7. ${RED}卸载全部${PLAIN}"
+    echo -e " 0. 退出"
+    echo -e "========================================================================================="
+    read -rp " 请输入选项: " choice
+    choice=$(strip_cr "$choice")
+
+    case $choice in
+        1)
+            if ! realm_installed; then
+                warn "realm 未安装"
+                read -rp " 现在安装? [Y/n] " c || return
+                c=$(strip_cr "$c")
+                [[ "$c" =~ ^[nN] ]] && return
+                install_realm
+            fi
+            menu_add; read -rp " 按回车返回..." ;;
+        2) menu_delete; read -rp " 按回车返回..." ;;
+        3) show_all_configs; read -rp " 按回车返回..." ;;
+        4) menu_status; read -rp " 按回车返回..." ;;
+        5) install_realm; read -rp " 按回车返回..." ;;
+        6) update_script; read -rp " 按回车返回..." ;;
+        7) uninstall_all ;;
+        0) exit 0 ;;
+        *) ;;
+    esac
 }
 
-# ============================================================================
-# 入口
-# ============================================================================
-
+# ==================== 入口 ====================
 check_root
-check_jq
-install_shortcut
+check_deps
+sync_script
 init_meta
 
-case "${1:-}" in
-    install)      install_realm ;;
-    uninstall)    full_uninstall ;;
-    list|ls)      list_forwards ;;
-    status)       menu_status ;;
-    add)
-        if ! realm_installed; then
-            die "realm 未安装，请先: $0 install"
-        fi
-        [[ $# -ge 4 ]] || die "用法: $0 add <源端口> <目标IP> <目标端口> [备注]"
-        add_forward "$2" "$3" "$4" "${5:-}"
-        ;;
-    del|delete|rm)
-        [[ $# -ge 2 ]] || die "用法: $0 del <源端口>"
-        delete_forward "$2"
-        ;;
-    -h|--help|help)
-        echo ""
-        echo " fw.sh — 端口转发管理器 (基于 realm) v${SCRIPT_VERSION}"
-        echo ""
-        echo " 用法:"
-        echo "   fw                交互菜单"
-        echo "   fw install        安装 realm"
-        echo "   fw list           列出转发规则"
-        echo "   fw add SP DIP DP [备注]"
-        echo "   fw del SP         删除转发"
-        echo "   fw status         服务状态"
-        echo "   fw uninstall      完整卸载"
-        echo ""
-        echo " 配额/限速: 在 pm.sh 中为相同端口添加监控"
-        echo ""
-        ;;
-    "") show_menu ;;
-    *)  die "未知命令: $1 ($0 help 查看帮助)" ;;
-esac
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        install)   install_realm ;;
+        uninstall) uninstall_all ;;
+        list|ls)   show_all_configs ;;
+        status)    menu_status ;;
+        update)    update_script ;;
+        add)
+            realm_installed || err "realm 未安装，请先: $0 install"
+            [[ $# -ge 4 ]] || err "用法: $0 add <源端口> <目标IP> <目标端口> [备注]"
+            add_forward "$2" "$3" "$4" "${5:-}"
+            ;;
+        del|delete|rm)
+            [[ $# -ge 2 ]] || err "用法: $0 del <源端口>"
+            delete_forward "$2"
+            ;;
+        -h|--help|help)
+            echo
+            echo " fw.sh — 端口转发管理器 (基于 realm) v${SCRIPT_VERSION}"
+            echo
+            echo " 用法:"
+            echo "   fw                交互菜单"
+            echo "   fw install        安装 realm"
+            echo "   fw list           列出转发规则"
+            echo "   fw add SP DIP DP [备注]"
+            echo "   fw del SP         删除转发"
+            echo "   fw status         服务状态"
+            echo "   fw update         更新脚本"
+            echo "   fw uninstall      完整卸载"
+            echo
+            ;;
+        *) err "未知命令: $1 ($0 help 查看帮助)" ;;
+    esac
+else
+    while true; do
+        menu
+    done
+fi
