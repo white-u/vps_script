@@ -96,11 +96,24 @@ status_line() {
 
 dispatch() {
     local name=$1 cmd=$2 url=$3
-    if command -v "$cmd" &>/dev/null; then
-        "$cmd"
+    local target="/usr/local/bin/${cmd}"
+
+    # 如果快捷命令已存在且可执行, 直接运行
+    if [[ -x "$target" ]] && [[ -s "$target" ]]; then
+        "$target"
+        return
+    fi
+
+    # 否则下载到文件再执行 (避免 bash <(curl) 导致 $0 = /dev/fd/XX)
+    echo -e "${YELLOW}正在下载 ${name} 管理脚本...${PLAIN}"
+    local tmp=$(mktemp /tmp/vt_dl.XXXXXX.sh)
+    if curl -fsSL --max-time 30 "$url" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        mv -f "$tmp" "$target"
+        chmod +x "$target"
+        "$target"
     else
-        echo -e "${YELLOW}正在下载 ${name} 管理脚本...${PLAIN}"
-        bash <(curl -fsSL "$url")
+        rm -f "$tmp"
+        echo -e "${RED}下载失败。${PLAIN}"
     fi
 }
 

@@ -416,18 +416,18 @@ is_port_available() {
 }
 
 pick_sni() {
-  echo -e "${YELLOW}测试 SNI 连通性 (仅用于挑选域名)...${PLAIN}"
+  echo -e "${YELLOW}测试 SNI 连通性 (仅用于挑选域名)...${PLAIN}" >&2
   local valid=()
   for sni in "${SNI_LIST[@]}"; do
     if curl -m 3 -sI "https://${sni}" >/dev/null 2>&1; then
       valid+=("$sni")
-      echo -e " ${#valid[@]}. ${sni}  ${GREEN}[OK]${PLAIN}"
+      echo -e " ${#valid[@]}. ${sni}  ${GREEN}[OK]${PLAIN}" >&2
     else
-      echo -e "    ${sni}  ${RED}[FAIL]${PLAIN}"
+      echo -e "    ${sni}  ${RED}[FAIL]${PLAIN}" >&2
     fi
   done
   local manual=$(( ${#valid[@]} + 1 ))
-  echo -e " ${manual}. 手动输入"
+  echo -e " ${manual}. 手动输入" >&2
 
   read -p "请选择 [1]: " idx
   idx=$(strip_cr "$idx")
