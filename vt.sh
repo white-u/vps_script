@@ -22,6 +22,25 @@ RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; DIM='\033[
 # Windows 终端兼容: 清洗 \r
 strip_cr() { echo "${1//$'\r'/}"; }
 
+# ─────────────────── 防火墙工具 ───────────────────
+
+close_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+}
+
 # ─────────────────── 基础函数 ───────────────────
 
 check_root() {
@@ -106,6 +125,7 @@ nuke_all() {
                 local port=$(basename "$conf" .conf)
                 systemctl stop "snell@${port}" 2>/dev/null || true
                 systemctl disable "snell@${port}" 2>/dev/null || true
+                close_port "$port"
             done
         fi
         rm -f /etc/systemd/system/snell@.service
@@ -118,6 +138,13 @@ nuke_all() {
     # === Xray ===
     if xray_installed || [[ -d /usr/local/etc/xray ]]; then
         echo -e " ${YELLOW}清理 Xray...${PLAIN}"
+        # 关闭防火墙中已放行的端口
+        if [[ -f /usr/local/etc/xray/config.json ]]; then
+            local p
+            for p in $(jq -r '.inbounds[]?.port // empty' /usr/local/etc/xray/config.json 2>/dev/null); do
+                close_port "$p"
+            done
+        fi
         systemctl stop xray 2>/dev/null || true
         systemctl disable xray 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service
@@ -143,6 +170,13 @@ nuke_all() {
     # === FW (realm) ===
     if fw_installed || [[ -d /etc/realm ]]; then
         echo -e " ${YELLOW}清理 FW (realm)...${PLAIN}"
+        # 关闭防火墙中已放行的端口
+        if [[ -f /etc/realm/meta.json ]]; then
+            local p
+            for p in $(jq -r '.rules[].src_port' /etc/realm/meta.json 2>/dev/null); do
+                close_port "$p"
+            done
+        fi
         systemctl stop realm 2>/dev/null || true
         systemctl disable realm 2>/dev/null || true
         rm -f /etc/systemd/system/realm.service

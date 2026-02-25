@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v4.5 Stable
+# 版本: v4.5.1 Stable
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,7 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="4.5"
+SCRIPT_VERSION="4.5.1"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -1725,6 +1725,10 @@ uninstall_script() {
 # ==============================================================================
 check_root
 install_shortcut "${1:-}"
+
+# [修复] Cron 环境 PATH 只有 /usr/bin:/bin, nft/tc 在 /usr/sbin 下会找不到
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 install_deps
 
 if [ "${1:-}" == "--monitor" ]; then

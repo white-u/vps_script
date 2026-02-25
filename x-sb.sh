@@ -88,6 +88,43 @@ check_deps() {
     fi
 }
 
+# ==================== 防火墙工具 ====================
+
+open_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "$port" >/dev/null 2>&1
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        if command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables 2>/dev/null || true
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+}
+
+close_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+}
+
 # ==================== Xray 核心管理 ====================
 
 install_xray() {
@@ -398,6 +435,7 @@ add_reality() {
     
     if safe_save_config "$tmp"; then
         rm -f "$tmp"
+        open_port "$port"
         show_node_info "$tag"
     else
         rm -f "$tmp"
@@ -438,6 +476,7 @@ add_ss2022() {
     
     if safe_save_config "$tmp"; then
         rm -f "$tmp"
+        open_port "$port"
         show_node_info "$tag"
     else
         rm -f "$tmp"
@@ -692,11 +731,19 @@ delete_node() {
         
         if [[ -n "$target_tag" ]]; then
             echo -e "${YELLOW}正在删除节点: $target_tag ...${PLAIN}"
+            # 先取端口号 (删除后就拿不到了)
+            local del_port
+            del_port=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .port' "$XRAY_CONF_FILE" 2>/dev/null)
             local tmp=$(mktemp /tmp/xray_XXXXXX.json)
             _CLEANUP_FILES+=("$tmp")
             jq --arg t "$target_tag" 'del(.inbounds[] | select(.tag==$t))' "$XRAY_CONF_FILE" > "$tmp"
             jq --arg t "$target_tag" 'del(.routing.rules[] | select(.inboundTag and (.inboundTag[] == $t)))' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
-            safe_save_config "$tmp" && rm -f "$tmp"
+            if safe_save_config "$tmp"; then
+                rm -f "$tmp"
+                [[ -n "$del_port" && "$del_port" != "null" ]] && close_port "$del_port"
+            else
+                rm -f "$tmp"
+            fi
         fi
     fi
 }
@@ -733,6 +780,13 @@ uninstall_script() {
     read -p "确认彻底卸载 Xray 及所有配置? (输入 yes 确认): " cf
     cf=$(strip_cr "$cf")
     if [[ "${cf,,}" == "yes" ]]; then
+       # 关闭防火墙中已放行的端口
+       if [[ -f "$XRAY_CONF_FILE" ]]; then
+           local p
+           for p in $(jq -r '.inbounds[]?.port // empty' "$XRAY_CONF_FILE" 2>/dev/null); do
+               close_port "$p"
+           done
+       fi
        systemctl stop xray 2>/dev/null
        systemctl disable xray 2>/dev/null
        rm -f "$SYSTEMD_FILE"

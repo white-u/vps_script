@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.0
+# 端口转发管理脚本 (基于 realm) v2.2
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -26,7 +26,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.2"
 REALM_VERSION="2.7.0"
 
 REALM_BIN="/usr/local/bin/realm"
@@ -162,6 +162,55 @@ validate_ipv4() {
     done
 }
 
+# ==================== 防火墙工具 ====================
+
+open_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "$port" >/dev/null 2>&1
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        if command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables 2>/dev/null || true
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+}
+
+close_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+}
+
+# ==================== IPv6 检测 ====================
+
+# 检测监听地址: IPv6 可用则双栈 [::], 否则仅 IPv4
+detect_listen_addr() {
+    if [[ -f /proc/net/if_inet6 ]] && \
+       [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]]; then
+        echo "[::]"
+    else
+        echo "0.0.0.0"
+    fi
+}
+
 # ==================== 核心逻辑 ====================
 
 # 1. 安装/更新 realm 核心二进制
@@ -254,6 +303,9 @@ HEADER
     local rules
     rules=$(jq -c '.rules[]' "$META_FILE" 2>/dev/null) || return 0
 
+    local listen_addr
+    listen_addr=$(detect_listen_addr)
+
     while IFS= read -r rule; do
         local sp dip dp
         sp=$(echo "$rule"  | jq -r '.src_port')
@@ -262,7 +314,7 @@ HEADER
         cat >> "$CONFIG_TOML" <<EOF
 
 [[endpoints]]
-listen = "0.0.0.0:${sp}"
+listen = "${listen_addr}:${sp}"
 remote = "${dip}:${dp}"
 EOF
     done <<< "$rules"
@@ -311,7 +363,7 @@ reload_realm() {
 add_forward() {
     local src_port=$1 dst_ip=$2 dst_port=$3 comment=${4:-""}
 
-    validate_port "$src_port" "转发端口" || return 1
+    validate_port "$src_port" "源端口" || return 1
     validate_port "$dst_port" "目标端口" || return 1
     validate_ipv4 "$dst_ip" || return 1
 
@@ -321,7 +373,7 @@ add_forward() {
 
     init_meta
     if jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        warn "转发端口 ${src_port} 已存在"; return 1
+        warn "源端口 ${src_port} 已存在"; return 1
     fi
 
     # 检查端口占用 (TCP + UDP, 排除 realm 自身)
@@ -347,6 +399,7 @@ add_forward() {
         && echo "$tmp" > "$META_FILE"
 
     reload_realm true
+    open_port "$src_port"
     echo ""
     info "转发已添加: :${src_port} → ${dst_ip}:${dst_port}"
     echo -e " ${DIM}提示: 如需配额/限速，在 pm.sh 中为端口 ${src_port} 添加监控${PLAIN}"
@@ -356,12 +409,12 @@ add_forward() {
 delete_forward() {
     local src_port=$1
 
-    validate_port "$src_port" "转发端口" || return 1
+    validate_port "$src_port" "源端口" || return 1
     src_port=$((10#$src_port))
     init_meta
 
     if ! jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
-        warn "转发端口 ${src_port} 不存在"; return 1
+        warn "源端口 ${src_port} 不存在"; return 1
     fi
 
     local tmp
@@ -369,7 +422,8 @@ delete_forward() {
         && echo "$tmp" > "$META_FILE"
 
     reload_realm true
-    info "转发已删除: 转发端口 ${src_port}"
+    close_port "$src_port"
+    info "转发已删除: 源端口 ${src_port}"
     echo -e " ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
 }
 
@@ -468,6 +522,16 @@ uninstall_all() {
     fi
 
     rm -f "$REALM_BIN"
+
+    # 关闭防火墙中已放行的端口
+    if [[ -f "$META_FILE" ]]; then
+        local ports p
+        ports=$(jq -r '.rules[].src_port' "$META_FILE" 2>/dev/null)
+        for p in $ports; do
+            close_port "$p"
+        done
+    fi
+
     rm -rf "$CONFIG_DIR"
     rm -f "$SCRIPT_PATH"
 
@@ -481,7 +545,7 @@ menu_add() {
     echo -e "\n${BLUE}>>> 添加转发规则${PLAIN}\n"
     local src_port dst_ip dst_port comment
 
-    read -rp " 转发端口 (本机): " src_port || return
+    read -rp " 源端口 (本机监听): " src_port || return
     src_port=$(strip_cr "$src_port")
     [[ -n "$src_port" ]] || return
 
@@ -615,7 +679,7 @@ menu() {
     local count
     count=$(rule_count)
     if [[ "$count" -gt 0 ]]; then
-        printf " %-4s %-10s %-24s %-s\n" "序号" "转发端口" "目标" "备注"
+        printf " %-4s %-10s %-24s %-s\n" "序号" "源端口" "目标" "备注"
         echo -e " ─────────────────────────────────────────────────────────────────────────────────────"
 
         local i=1 rules
@@ -692,11 +756,11 @@ if [[ $# -gt 0 ]]; then
         update)    update_script ;;
         add)
             realm_installed || err "realm 未安装，请先: $0 install"
-            [[ $# -ge 4 ]] || err "用法: $0 add <转发端口> <目标IP> <目标端口> [备注]"
+            [[ $# -ge 4 ]] || err "用法: $0 add <源端口> <目标IP> <目标端口> [备注]"
             add_forward "$2" "$3" "$4" "${5:-}"
             ;;
         del|delete|rm)
-            [[ $# -ge 2 ]] || err "用法: $0 del <转发端口>"
+            [[ $# -ge 2 ]] || err "用法: $0 del <源端口>"
             delete_forward "$2"
             ;;
         -h|--help|help)

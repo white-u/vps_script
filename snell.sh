@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 v5.1
+# Snell 多实例管理脚本 v5.2
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
@@ -26,7 +26,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="5.1"
+SCRIPT_VERSION="5.2"
 
 SNELL_BIN="/usr/local/bin/snell-server"
 SNELL_CONF_DIR="/etc/snell"
@@ -494,13 +494,14 @@ uninstall_all() {
     confirm=$(strip_cr "$confirm")
     [[ "${confirm,,}" != "yes" ]] && { echo " 已取消。"; return; }
     
-    # 停止并删除所有实例服务
+    # 停止并删除所有实例服务, 关闭防火墙
     local port conf
     if ls "${SNELL_CONF_DIR}"/*.conf >/dev/null 2>&1; then
         for conf in "${SNELL_CONF_DIR}"/*.conf; do
             port=$(basename "$conf" .conf)
             systemctl stop "snell@${port}" 2>/dev/null || true
             systemctl disable "snell@${port}" >/dev/null 2>&1 || true
+            close_port "$port"
         done
     fi
     
