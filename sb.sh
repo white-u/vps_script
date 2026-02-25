@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -194,14 +194,13 @@ init_config_if_missing() {
   "log": { "level": "warn", "timestamp": true },
   "inbounds": [],
   "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block",  "tag": "block" }
+    { "type": "direct", "tag": "direct" }
   ],
   "route": {
     "final": "direct",
     "rules": [
       { "action": "sniff" },
-      { "ip_is_private": true, "action": "route", "outbound": "block" }
+      { "ip_is_private": true, "action": "reject" }
     ]
   }
 }
@@ -826,7 +825,7 @@ configure_advanced() {
         jq '
           .route.rules = [
             { "action":"sniff" },
-            { "ip_is_private": true, "action": "route", "outbound": "block" }
+            { "ip_is_private": true, "action": "reject" }
           ] + ([.route.rules[]?] | map(select(.action? != "sniff" and .ip_is_private? != true and .outbound? != "chain_proxy")))
         ' "$SB_CONF_FILE" > "$tmp"
         safe_save_config "$tmp" && rm -f "$tmp"
