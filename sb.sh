@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -621,6 +621,7 @@ add_reality() {
       }],
       "tls": {
         "enabled": true,
+        "server_name": $sni,
         "reality": {
           "enabled": true,
           "handshake": { "server": $sni, "server_port": 443 },
