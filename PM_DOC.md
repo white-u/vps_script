@@ -1,58 +1,54 @@
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
 
-**版本**: v4.3 Stable | **快捷命令**: `pm` | **安装路径**: `/usr/local/bin/pm`
+**版本**: v4.5.1 Stable | **快捷命令**: `pm` | **安装路径**: `/usr/local/bin/pm`
 
 ---
 
 ## 1. 概述
 
-pm.sh 是一个基于 Nftables + TC 的端口级流量管理工具，适用于多用户 VPS 场景（如代理节点分发）。核心能力：按端口独立计量流量、设定配额并自动封禁、出站限速、动态突发惩罚（DynQoS）、Telegram 实时通知。
+pm.sh 是一个基于 **Nftables + TC** 的端口级流量管理工具，适用于多用户 VPS 场景。它不仅能统计流量，还能进行配额管理、自动封禁、出站限速以及防止滥用的动态 QoS (DynQoS)。
 
-### 1.1 适用场景
+**v4.5 新特性:**
+*   **云端推送 (Cloudflare D1):** 支持将端口流量数据每分钟推送到 Cloudflare Worker，实现多节点集中监控。
+*   **并发安全升级:** 引入了 `flock` 文件锁和 `USER_EDIT_LOCK` 机制，彻底解决了 Cron 后台任务与用户前台编辑时的冲突问题。
+*   **规则自愈:** 每次 Cron 运行时自动检查 Nftables 表状态，防止规则意外丢失。
 
-- 多用户共享 VPS，每人分配独立端口和流量配额
-- 代理节点（Snell / SS / VMess / Trojan 等）流量管控
-- 端口级出站限速 + 突发流量自动惩罚
+### 1.1 核心功能
 
-### 1.2 系统要求
-
-| 依赖 | 用途 |
-|------|------|
-| nftables (nft) | 流量计数 + 端口封禁 |
-| iproute2 (tc) | 出站限速 (HTB) |
-| jq | JSON 配置读写 |
-| bc | 浮点数运算 |
-| curl | 脚本更新 + Telegram 通知 |
-| flock | 并发安全（原子写入 + cron 单例锁） |
-| stat / numfmt | 文件锁龄检测 / 流量格式化 |
-
-脚本会在首次运行时自动检测并安装缺失依赖（apt / yum / apk）。
+*   **流量统计:** 精确统计每个端口的入站/出站流量 (Bytes)。
+*   **配额管理:** 设定月流量配额 (GB)，支持双向计费或仅出站计费。
+*   **自动封禁:** 流量超额后自动阻断端口 (Drop)，每月自动重置。
+*   **基础限速:** 为端口设定固定的出站带宽限制 (Mbps)。
+*   **DynQoS (防滥用):** 检测到持续大流量占用（突发）时，自动触发惩罚性限速，一段时间后恢复。
+*   **通知系统:**
+    *   **Telegram:** 流量预警、封禁通知、限速通知、定时报告。
+    *   **Webhook (Cloudflare):** 支持 HMAC 签名的数据推送。
 
 ---
 
 ## 2. 安装与使用
 
-### 2.1 安装
+### 2.1 一键安装
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh)
 ```
 
-安装流程：下载到临时文件 → 校验完整性 → `mv` 到 `/usr/local/bin/pm` → `exec` 启动。如果网络不通，会尝试本地复制降级。
-
-### 2.2 命令行
+### 2.2 常用命令
 
 | 命令 | 说明 |
 |------|------|
-| `pm` | 进入交互式管理菜单 |
+| `pm` | 进入交互式管理菜单 (主入口) |
 | `pm update` | 检查并更新到最新版本 |
-| `pm --monitor` | Cron 内部调用，手动执行无意义 |
+| `pm --monitor` | **请勿手动运行** (这是 Cron 后台任务专用的参数) |
 
-### 2.3 主菜单
+### 2.3 交互菜单
 
-```
+运行 `pm` 后可以看到如下界面：
+
+```text
 =========================================================================================
-   Linux 端口流量管理 (v4.3) - 后台每分钟刷新
+   Linux 端口流量管理 (v4.5.1) - 后台每分钟刷新
 =========================================================================================
  ID   端口         模式       已用流量 / 总配额             出站限速        备注
 -----------------------------------------------------------------------------------------
@@ -60,451 +56,98 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/pm.s
  2    20000        [仅出站]   [已阻断] / 5 GB              无限制          SS
  3    30000        [双向]     6.5 GB / 10 GB               5Mbps(惩罚中)   VMess
 =========================================================================================
- 1. 添加 监控端口 (服务扫描)
- 2. 配置 端口 (修改/动态QoS/重置)
- 3. 删除 监控端口
- 4. 通知设置 (Telegram)
- 5. 更新 脚本
- 6. 卸载 脚本
- 0. 退出
+ ...
+ 4. 通知设置 (Telegram) ✅ 已开启
+ 5. 云端推送 (Cloudflare) ⚪ 未配置
+ ...
 ```
 
-面板字段说明：
-
-| 字段 | 含义 |
-|------|------|
-| 模式 | `[双向]` 入站+出站合计 / `[仅出站]` 只计出站 |
-| `[已阻断]` | 配额耗尽，端口已被 nft drop |
-| `[R1]` | 每月 1 日自动重置配额 |
-| `(惩罚中)` | DynQoS 触发，临时降速 |
+*   **[R1]:** 表示每月 1 日自动重置流量。
+*   **[已阻断]:** 流量用尽，端口已被防火墙封锁。
+*   **(惩罚中):** 触发了 DynQoS，当前正处于惩罚限速状态。
 
 ---
 
-## 3. 核心架构
+## 3. 高级配置
 
-### 3.1 模块划分
+### 3.1 动态限速 (DynQoS)
 
-```
-pm.sh (1540 行)
-├── 模块 1: 基础架构 (安装/依赖/配置初始化)
-│   ├── check_root()          # root 权限检查
-│   ├── install_shortcut()    # 安装快捷命令 (mktemp → 校验 → mv)
-│   ├── install_deps()        # 依赖安装 + config.json 初始化
-│   └── get_iface()           # 获取主网卡接口
-│
-├── 模块 2: 网络引擎 (Nftables + TC)
-│   ├── init_nft_table()      # 初始化 nft 表/链/集合
-│   ├── init_tc_root()        # 初始化 TC HTB 根队列
-│   ├── apply_port_rules()    # 为端口创建计数器 + 限速规则
-│   ├── reload_all_rules()    # 销毁并重建所有规则 (自愈)
-│   ├── safe_write_config()   # flock 原子写入 JSON
-│   └── safe_write_config_from_file()  # 文件→config 原子写入
-│
-├── 模块 2.5: Telegram 通知引擎
-│   ├── get_host_label()      # 生成标识: hostname (备注)
-│   ├── tg_send()             # 异步发送 (后台 curl &)
-│   ├── tg_notify_quota()     # 配额阈值预警
-│   ├── tg_notify_blocked()   # 端口封禁通知
-│   ├── tg_notify_punish()    # DynQoS 惩罚触发
-│   ├── tg_notify_recover()   # 惩罚恢复通知
-│   ├── tg_notify_reset()     # 配额自动重置通知
-│   └── tg_notify_report()    # 定时流量汇总报告
-│
-├── 模块 3: 守护进程 (Cron Writer)
-│   ├── cron_task()           # 每分钟执行: 流量采集/DynQoS/阈值通知
-│   └── setup_cron()          # 注册 crontab
-│
-├── 模块 4: UI (Reader)
-│   ├── show_main_menu()      # 主菜单面板
-│   ├── add_port_flow()       # 添加端口 (扫描活跃服务)
-│   ├── config_port_menu()    # 端口配置子菜单
-│   ├── configure_dyn_qos()   # DynQoS 参数设置
-│   ├── configure_telegram()  # Telegram 通知配置
-│   ├── delete_port_flow()    # 删除端口监控
-│   ├── update_script()       # 更新脚本
-│   └── uninstall_script()    # 卸载脚本
-│
-└── 入口
-    ├── --monitor  → cron_task()
-    ├── update     → update_script()
-    └── (默认)     → while show_main_menu
-```
+DynQoS 用于防止某个端口长时间占满带宽影响邻居。
 
-### 3.2 Reader-Writer 分离
+*   **触发条件:** 当速率超过 `Trigger Mbps` 且持续 `Trigger Time` 分钟。
+*   **惩罚措施:** 将该端口限速至 `Punish Mbps`，持续 `Punish Time` 分钟。
+*   **恢复机制:** 惩罚时间结束后，自动恢复原有限速。
 
-脚本采用**读写分离**设计，同一份代码的不同入口承担不同角色：
+**配置示例:**
+> 如果某端口连续 **5分钟** 速率超过 **100Mbps**，则将其限速至 **5Mbps**，持续 **60分钟**。
 
-| 角色 | 触发方式 | 职责 | 写 config |
-|------|---------|------|-----------|
-| **Writer** | `pm --monitor` (Cron 每分钟) | 采集内核计数器、计算流量、DynQoS 判定、阈值通知 | ✅ |
-| **Reader** | `pm` (用户交互) | 读取 config 展示面板、接收用户配置操作 | ✅ (用户修改时) |
+### 3.2 Telegram 通知
 
-### 3.3 并发安全
+支持多种通知事件：
+*   **配额预警:** 流量达到 50%, 80%, 100% 时发送通知。
+*   **端口封禁:** 流量耗尽时通知。
+*   **QoS 触发/恢复:** 触发限速和恢复限速时通知。
+*   **定时报告:** 每 N 小时发送一次全端口流量汇总。
 
-| 冲突场景 | 保护机制 |
-|----------|---------|
-| Cron vs 菜单 | `USER_EDIT_LOCK` 文件锁，菜单开启时 Cron 避让 |
-| Cron vs Cron | `CRON_LOCK_FILE` + `flock -n` 单例锁，上一轮未完成则跳过 |
-| JSON 写入竞争 | `LOCK_FILE` + `flock -x` 排他锁保护原子写入 |
-| 死锁防护 | `USER_EDIT_LOCK` 超过 10 分钟自动强制清除 |
+### 3.3 云端推送 (Cloudflare D1)
+
+v4.4+ 新增功能，用于将多台 VPS 的流量数据汇总到一个 Dashboard。
+
+*   **原理:** 每分钟 Cron 任务执行时，将 `config.json` 中的部分数据（脱敏后）通过 HTTP PUT 推送到指定的 Cloudflare Worker。
+*   **安全性:** 使用 `HMAC-SHA256` 对数据进行签名，Worker 端验证签名防止伪造。
+*   **配置参数:**
+    *   `Worker URL`: 你的 Cloudflare Worker 地址。
+    *   `Secret`: 通信密钥 (Shared Secret)。
+    *   `Node Key`: 节点唯一标识 (如 `hk-01`)。
 
 ---
 
-## 4. 数据结构
+## 4. 技术细节
 
-### 4.1 config.json
+### 4.1 流量统计原理
 
-存储路径: `/etc/port_monitor/config.json`
+*   **Nftables:** 使用 `nft` 的 named counter 功能，在内核态统计每个端口的流量包。
+*   **原子性:** 每次读取内核计数器后，计算增量 (Delta)，累加到配置文件中。即使重启服务器，只要配置文件还在，累计流量就不会丢失。
 
-```json
-{
-  "interface": "eth0",
-  "ports": {
-    "10086": {
-      "quota_gb": 10,
-      "quota_mode": "both",
-      "limit_mbps": 100,
-      "reset_day": 1,
-      "last_reset_ts": 1700000000,
-      "comment": "Snell",
-      "stats": {
-        "acc_in": 1073741824,
-        "acc_out": 2147483648,
-        "last_kernel_in": 50000000,
-        "last_kernel_out": 80000000
-      },
-      "dyn_limit": {
-        "enable": true,
-        "trigger_mbps": 100,
-        "trigger_time": 5,
-        "punish_mbps": 5,
-        "punish_time": 60,
-        "is_punished": false,
-        "strike_count": 0,
-        "punish_end_ts": 0
-      },
-      "notify_state": {
-        "quota_level": 50,
-        "punish_notified": false,
-        "recover_notified": true
-      }
-    }
-  },
-  "telegram": {
-    "enable": true,
-    "bot_token": "123456789:ABC...",
-    "chat_id": "-1001234567890",
-    "api_url": "https://api.telegram.org",
-    "thresholds": [50, 80, 100],
-    "report_interval_hours": 6,
-    "last_report_ts": 1700000000
-  }
-}
-```
+### 4.2 限速原理 (TC)
 
-### 4.2 字段说明
+*   **HTB 队列:** 使用 Linux TC 的 HTB (Hierarchical Token Bucket) 队列进行流量控制。
+*   **Nftables Mark:** 使用 `nft` 对特定端口的出站流量打上 Mark (fwmark)。
+*   **TC Filter:** `tc filter` 根据 Mark 将流量导向对应的 Class ID 进行限速。
 
-**端口配置 (ports.\<port\>)**
+### 4.3 并发控制 (Locking)
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `quota_gb` | number | 流量配额 (GB) |
-| `quota_mode` | string | `"both"` 双向 / `"out_only"` 仅出站 |
-| `limit_mbps` | number | 基础出站限速 (Mbps)，0 = 无限制 |
-| `reset_day` | number | 每月自动重置日 (1-31)，0 = 不自动重置 |
-| `last_reset_ts` | number | 上次重置的 Unix 时间戳 |
-| `comment` | string | 备注信息 |
+为了防止 Cron 后台任务与用户在前台编辑配置时发生冲突，pm.sh 实现了严格的锁机制：
 
-**流量统计 (stats)**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `acc_in` | number | 累计入站流量 (字节) |
-| `acc_out` | number | 累计出站流量 (字节) |
-| `last_kernel_in` | number | 上次采集的内核计数器值 (入站) |
-| `last_kernel_out` | number | 上次采集的内核计数器值 (出站) |
-
-**动态 QoS (dyn_limit)**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `enable` | boolean | 是否启用 DynQoS |
-| `trigger_mbps` | number | 触发阈值 (Mbps) |
-| `trigger_time` | number | 连续超标分钟数才触发 |
-| `punish_mbps` | number | 惩罚期限速值 (Mbps) |
-| `punish_time` | number | 惩罚持续时间 (分钟) |
-| `is_punished` | boolean | 当前是否在惩罚期 |
-| `strike_count` | number | 连续超标次数计数器 |
-| `punish_end_ts` | number | 惩罚结束时间戳 |
-
-**通知状态 (notify_state)**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `quota_level` | number | 已通知的最高阈值 (如 50/80/100) |
-| `punish_notified` | boolean | 本轮惩罚是否已通知 |
-| `recover_notified` | boolean | 本轮恢复是否已通知 |
-
-**Telegram 配置 (telegram)**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `enable` | boolean | 通知总开关 |
-| `bot_token` | string | Bot Token |
-| `chat_id` | string | 目标 Chat ID |
-| `api_url` | string | API 地址，支持国内反代 |
-| `thresholds` | number[] | 配额预警阈值 (%) |
-| `report_interval_hours` | number | 定时报告间隔 (小时)，0 = 关闭 |
-| `last_report_ts` | number | 上次报告时间戳 |
+1.  **菜单锁 (`USER_EDIT_LOCK`):** 当用户打开 `pm` 菜单时，创建此锁文件。Cron 任务检测到锁文件后，会直接跳过本次执行 (`exit 0`)，**避让**用户操作。
+2.  **Cron 单例锁 (`CRON_LOCK_FILE`):** 使用 `flock` 确保同一时间只有一个 Cron 任务在运行，防止堆积。
+3.  **写入锁 (`LOCK_FILE`):** 所有对 `config.json` 的写入操作都由 `flock` 保护，确保原子性，防止文件损坏。
 
 ---
 
-## 5. 网络引擎
+## 5. 故障排查
 
-### 5.1 Nftables 规则结构
+**Q: 流量统计不更新？**
+*   检查 Cron 服务是否运行: `systemctl status cron`
+*   检查 Nftables 规则: `nft list table inet port_monitor`
+*   检查是否处于“编辑模式” (菜单未退出)。
 
-```
-table inet port_monitor {
-    set blocked_ports { type inet_service; }     # 封禁端口集合
+**Q: 限速不生效？**
+*   检查是否安装了 `tc`: `tc -V`
+*   某些精简版系统 (Alpine) 可能需要安装 `iproute2` 并加载内核模块 `sch_htb`。
 
-    chain input  { type filter hook input priority -5; }   # 先于 UFW
-    chain output { type filter hook output priority -5; }
-
-    # 每端口规则 (以 10086 为例):
-    counter cnt_in_10086                          # 入站计数器
-    counter cnt_out_10086                         # 出站计数器
-
-    # input 链:
-    tcp dport 10086 counter name "cnt_in_10086"   # TCP 入站计数
-    udp dport 10086 counter name "cnt_in_10086"   # UDP 入站计数
-
-    # output 链:
-    tcp sport 10086 counter name "cnt_out_10086" meta mark set 10086  # 计数+打标
-    udp sport 10086 counter name "cnt_out_10086" meta mark set 10086
-
-    # 封禁规则 (优先):
-    input  tcp dport @blocked_ports drop
-    input  udp dport @blocked_ports drop
-    output tcp sport @blocked_ports drop
-    output udp sport @blocked_ports drop
-}
-```
-
-**优先级 -5**：确保在 UFW / firewalld (优先级 0) 之前计数。
-
-### 5.2 TC 限速结构
-
-```
-qdisc: HTB root handle 1: (default fffe)
-├── class 1:fffe  htb rate 1000mbit    # 默认通道 (不限速)
-├── class 1:276e  htb rate 100mbit     # 端口 10086 (hex=276e) → 100Mbps
-│   └── filter: fw handle 0x276e → flowid 1:276e   # IPv4
-│   └── filter: fw handle 0x276e → flowid 1:276e   # IPv6
-└── class 1:4e20  htb rate 5mbit       # 端口 20000 (hex=4e20) → 5Mbps (惩罚)
-```
-
-**工作原理**：NFT output 链对匹配端口打 mark → TC fw filter 识别 mark → 转入对应 class → HTB 限速。
-
-**默认 class ID**：使用 `0xfffe`（端口 65534），避免与实际监控端口的 hex 值冲突。
+**Q: Telegram 发不出消息？**
+*   检查 Bot Token 和 Chat ID。
+*   国内服务器请配置 API 反代地址。
 
 ---
 
-## 6. Cron 守护进程
+## 6. 卸载
 
-### 6.1 执行流程
-
-每分钟 Cron 触发 `pm --monitor`，执行 `cron_task()`：
-
-```
-cron_task()
-├── flock -n 单例锁 (防并发堆积)
-├── 检查 USER_EDIT_LOCK (避让菜单操作)
-├── 规则自愈 (nft 表不存在则重建)
-├── 遍历所有端口:
-│   ├── 读取内核计数器 (nft -j)
-│   ├── 计算 delta = 当前值 - 上次值
-│   ├── 累加到 acc_in / acc_out
-│   ├── DynQoS 判定:
-│   │   ├── 惩罚中 → 检查是否到期 → 恢复
-│   │   └── 未惩罚 → 检查速率 → 累计 strike → 触发惩罚
-│   ├── 配额自动重置 (到期日检测)
-│   └── 配额阈值通知 (逐级: 50% → 80% → 100% → 封禁)
-├── 写回 config.json (flock 原子写入)
-└── 定时流量报告 (检查间隔是否到达)
-```
-
-### 6.2 流量采集原理
-
-```
-                    Cron T=0             Cron T=1             Cron T=2
-内核计数器:          1000                 1500                 1800
-last_kernel:        (初始化=1000)         1000                 1500
-delta:              0                    500                  300
-acc (累计):         0                    500                  800
-```
-
-- 内核计数器是**单调递增**的绝对值
-- 每次 Cron 计算 `delta = 当前值 - last_kernel`
-- delta 累加到 `acc_in` / `acc_out`
-- 更新 `last_kernel` 为当前值
-- **nft 计数器重置**（如重启）：delta 为负数时按 0 处理
-
-### 6.3 DynQoS 状态机
-
-```
-        ┌──────────────┐
-        │   正常状态    │
-        │ strike_count │
-        └──────┬───────┘
-               │ 速率 > trigger_mbps
-               │ (连续 trigger_time 分钟)
-               ▼
-        ┌──────────────┐
-        │   惩罚状态    │ → 应用 punish_mbps 限速
-        │ is_punished  │ → 发送 tg_notify_punish
-        └──────┬───────┘
-               │ 到达 punish_end_ts
-               ▼
-        ┌──────────────┐
-        │   恢复状态    │ → 恢复原始限速
-        │ strike=0     │ → 发送 tg_notify_recover
-        └──────────────┘
-```
-
----
-
-## 7. Telegram 通知
-
-### 7.1 通知类型
-
-| # | 类型 | 图标 | 触发条件 | 发送模式 |
-|---|------|------|---------|---------|
-| 1 | 配额预警 | ⚠️/🔴 | 流量达到阈值 (默认 50%/80%/100%) | 逐级，每级只发一次 |
-| 2 | 端口封禁 | 🚫 | 流量超 100%，端口被 drop | 封禁时发一次 |
-| 3 | 惩罚触发 | ⚡ | DynQoS 连续超标达标 | 每轮惩罚发一次 |
-| 4 | 惩罚恢复 | ✅ | 惩罚期到期 | 恢复时发一次 |
-| 5 | 配额重置 | 🔄 | 到达每月重置日 | 重置时发一次 |
-| 6 | 定时报告 | 📋 | 用户设置的间隔到达 | 每 N 小时 |
-| 7 | 测试消息 | 🔔 | 用户手动发送 | 手动 |
-
-### 7.2 通知标识格式
-
-标识字段优先级：`hostname + (端口备注)` → `hostname` → `公网 IP`
-
-```
-有备注:  HK-Node1 (Snell)
-无备注:  HK-Node1
-hostname=localhost 且无备注:  1.2.3.4
-```
-
-### 7.3 通知模板示例
-
-**配额预警** (阈值 80%):
-```
-⚠️ *端口流量预警*
-🏷 标识: *HK-Node1 (Snell)*
-🔌 端口: `10086`
-📊 已用: 8.1GB / 10GB (*81.0%*)
-📋 模式: 双向
-⏰ 状态: 已超过 *80%* 阈值
-```
-
-**端口封禁**:
-```
-🚫 *端口已封禁*
-🏷 标识: *HK-Node1 (Snell)*
-🔌 端口: `10086`
-📊 流量配额已耗尽，端口已被封禁
-🔄 重置策略: 每月 1 日自动重置
-```
-
-**DynQoS 惩罚触发**:
-```
-⚡ *动态限速触发*
-🏷 标识: *HK-Node1 (Snell)*
-🔌 端口: `10086`
-📈 平均速率: 120.50 Mbps (阈值 100 Mbps)
-📉 已降速至: *5 Mbps*
-⏱ 持续时间: 60 分钟
-```
-
-**定时流量报告**:
-```
-📋 *定时流量报告*
-🖥 主机: `HK-Node1`
-⏰ 2026-02-10 14:00
-
-✅ `10086` Snell
-   4.2GB / 10GB (42.0%)
-
-⚠️ `20000` SS
-   8.1GB / 10GB (81.0%) 🔒100M
-
-⚡ `30000` VMess
-   6.5GB / 10GB (65.0%) ⚡5M
-
-🚫 `40000` Trojan
-   10.2GB / 10GB (102.0%)
-```
-
-报告状态图标：✅ 正常 (<80%) / ⚠️ 警告 (≥80%) / ⚡ DynQoS 惩罚中 / 🚫 已封禁。限速标记：🔒100M 基础限速 / ⚡5M 惩罚限速。
-
-### 7.4 Telegram 配置菜单
-
-```
-========================================
-   Telegram 通知配置
-========================================
- 状态:   ✅ 已启用
- Token:  123456...wxyz
- ChatID: -1001234567890
- API:    https://api.telegram.org
- 阈值:   50, 80, 100 (%)
- 定时报告: 每 6 小时
-========================================
- 1. 配置 Bot Token
- 2. 配置 Chat ID
- 3. 发送测试消息
- 4. 开启/关闭 通知
- 5. 修改 通知阈值
- 6. 修改 API 地址 (国内反代)
- 7. 配置 定时流量报告
- 0. 返回主菜单
-========================================
-```
-
----
-
-## 8. 文件与路径
-
-| 路径 | 用途 | 持久性 |
-|------|------|--------|
-| `/usr/local/bin/pm` | 脚本主体 + 快捷命令 | 永久 |
-| `/etc/port_monitor/config.json` | 所有配置和运行状态 | 永久 |
-| `/var/run/pm.lock` | flock 写入锁 (FD 200) | 运行时 |
-| `/var/run/pm_cron.lock` | flock cron 单例锁 (FD 9) | 运行时 |
-| `/tmp/pm_user_editing` | 菜单编辑锁 (文件存在即生效) | 运行时 |
-
----
-
-## 9. 安全机制
-
-### 9.1 安装更新安全
-
-`install_shortcut` 和 `update_script` 均使用**临时文件安全模式**：
-
-```
-curl → mktemp 临时文件 → 校验非空(-s) → mv 覆盖 → exec 重载
-```
-
-中途断网时：临时文件被截断，但 `/usr/local/bin/pm` 不受影响，Cron 继续正常运行。
-
-### 9.2 卸载保护
-
-卸载需输入完整的 `yes`（非 `y`），防止误触。卸载操作：清 crontab → 删 TC/NFT 规则 → 删配置目录 → 删脚本。
-
-### 9.3 临时文件清理
-
-全局 `_global_cleanup` trap 在 EXIT/INT/TERM 时自动清理所有注册的临时文件。菜单模式额外清理 `USER_EDIT_LOCK`，Cron 模式不删（防止误删菜单进程的锁）。
-
----
+在菜单中选择 `7. 卸载脚本`，或运行 `pm uninstall`。
+卸载会自动清理：
+*   Cron 任务
+*   Nftables 规则
+*   TC 队列
+*   配置文件和日志
+*   脚本自身
