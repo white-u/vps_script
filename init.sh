@@ -15,8 +15,11 @@ if [ ! -f /etc/debian_version ]; then
     exit 1
 fi
 
+# Windows 终端兼容: 清洗 \r (定义在开头，确保全局可用)
+strip_cr() { echo "${1//$'\r'/}"; }
 
 # 检查 Root 权限
+
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}错误：请使用 root 权限运行此脚本。${NC}" 
    exit 1
