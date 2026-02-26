@@ -49,6 +49,10 @@ strip_cr() { echo "${1//$'\r'/}"; }
 # ==================== 基础检查 ====================
 check_root() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}错误: 必须使用 root 权限运行。${PLAIN}"; exit 1; }
+    if [ ! -f /etc/debian_version ]; then
+        echo -e "${RED}错误：本脚本仅支持 Debian/Ubuntu 系统。${PLAIN}"
+        exit 1
+    fi
 }
 
 map_arch() {
@@ -216,7 +220,7 @@ init_config_if_missing() {
 {
   "log": {
     "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
+    "access": "/dev/null",
     "error": "/var/log/xray/error.log"
   },
   "inbounds": [],
@@ -282,6 +286,10 @@ safe_save_config() {
     # 4. 写入新配置并重启
     cp "$tmp_json" "$XRAY_CONF_FILE"
     chmod 640 "$XRAY_CONF_FILE"
+    
+    # 清理旧日志 (防止积压)
+    truncate -s 0 /var/log/xray/error.log 2>/dev/null
+
     systemctl restart xray
     sleep 1
     

@@ -7,8 +7,14 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Windows 终端兼容: 清洗 \r
-strip_cr() { echo "${1//$'\r'/}"; }
+# ==============================
+# 0. 环境预检
+# ==============================
+if [ ! -f /etc/debian_version ]; then
+    echo -e "${RED}错误：本脚本仅支持 Debian/Ubuntu 系统。${NC}"
+    exit 1
+fi
+
 
 # 检查 Root 权限
 if [[ $EUID -ne 0 ]]; then
@@ -160,7 +166,17 @@ sshd_set "PubkeyAuthentication" "yes"
 # ==============================
 # 6. 重启服务与提示
 # ==============================
-echo -e "${YELLOW}[6/6] 正在重启 SSH 服务以应用更改...${NC}"
+echo -e "${YELLOW}[6/6] 正在验证 SSH 配置并重启服务...${NC}"
+
+# 验证配置语法 (防止重启失败导致失联)
+if ! sshd -t; then
+    echo -e "${RED}错误：SSH 配置文件语法校验失败！${NC}"
+    echo -e "${RED}正在回滚配置至备份...${NC}"
+    cp "$SSHD_BACKUP" /etc/ssh/sshd_config
+    echo -e "${YELLOW}配置已回滚。请检查输入是否正确后重试。${NC}"
+    exit 1
+fi
+
 systemctl restart sshd
 
 if [ $? -eq 0 ]; then
