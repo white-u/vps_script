@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.2.0 (Strict Sync & Validation)
+# 版本: v5.3.0 (Migration System)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,7 +14,9 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.2.0"
+SCRIPT_VERSION="5.3.0"
+# 配置结构版本号 (用于数据迁移)
+CURRENT_CONFIG_VERSION=1
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -164,6 +166,53 @@ install_deps() {
     fi
     # 保护配置文件 (含 bot_token)
     chmod 600 "$CONFIG_FILE"
+    
+    # 执行数据迁移
+    migrate_config
+}
+
+# ==============================================================================
+# 1.5 数据迁移模块 (Schema Migration)
+# ==============================================================================
+
+migrate_config() {
+    local modified=false
+    local tmp_json=$(cat "$CONFIG_FILE")
+    
+    # 获取当前文件内的版本号 (若无则为0)
+    local file_ver=$(echo "$tmp_json" | jq -r '.config_version // 0')
+    
+    # --- 迁移逻辑链 ---
+    
+    # v0 -> v1: 初始化版本号 & 规范化 group_id
+    if [ "$file_ver" -lt 1 ]; then
+        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v1)...${PLAIN}"
+        
+        # 1. 补全 config_version
+        # 2. 遍历所有端口，如果缺 group_id，补全为空字符串 (规范化)
+        # 3. 清理可能存在的废弃字段 (示例: 删除 legacy_field)
+        tmp_json=$(echo "$tmp_json" | jq '
+            .config_version = 1 |
+            .ports |= with_entries(
+                .value.group_id = (.value.group_id // "") |
+                del(.value.legacy_field)
+            )
+        ')
+        modified=true
+    fi
+    
+    # 未来 v1 -> v2 可以继续追加:
+    # if [ "$file_ver" -lt 2 ]; then ... fi
+
+    # --- 写入磁盘 ---
+    if [ "$modified" == "true" ]; then
+        local tmp_file=$(mktemp)
+        printf '%s\n' "$tmp_json" > "$tmp_file"
+        safe_write_config_from_file "$tmp_file"
+        rm -f "$tmp_file"
+        echo -e "${GREEN}配置文件已升级至 v${CURRENT_CONFIG_VERSION}。${PLAIN}"
+        sleep 1
+    fi
 }
 
 # ==============================================================================
