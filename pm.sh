@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.0.1 (Group Traffic Support)
+# 版本: v5.0.2 (Group Traffic Support)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,7 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.0.1"
+SCRIPT_VERSION="5.0.2"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -1146,33 +1146,42 @@ config_port_menu() {
                 read -p "设置分组 ID (留空或0 清除分组): " val
                 val=$(strip_cr "$val")
                 [ "$val" == "0" ] && val=""
+                
+                # 1. 先更新当前端口的 group_id
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].group_id = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                     echo -e "${GREEN}分组 ID 已更新。${PLAIN}"
                     
-                    # 智能同步: 配额 + 重置日
+                    # 2. 只有当设置了有效组名时，才尝试同步
                     if [ -n "$val" ]; then
-                        # 获取同组第一个非自己的端口的配置作为模板
-                        local template=$(jq -r --arg g "$val" --arg p "$port" '.ports | to_entries[] | select(.value.group_id == $g and .key != $p) | .value' "$CONFIG_FILE" | head -1)
+                        # 查找同组的其他端口 (排除自己)
+                        # 使用 -c 紧凑输出，防止多行导致变量赋值混乱
+                        local template_json=$(jq -c --arg g "$val" --arg p "$port" '.ports | to_entries[] | select(.value.group_id == $g and .key != $p) | .value' "$CONFIG_FILE" | head -1)
                         
-                        if [ -n "$template" ] && [ "$template" != "null" ]; then
-                            local t_quota=$(echo "$template" | jq -r '.quota_gb')
-                            local t_reset=$(echo "$template" | jq -r '.reset_day // 0')
+                        # 检查模板是否有效 (非空且包含 quota_gb)
+                        if [ -n "$template_json" ] && echo "$template_json" | jq -e '.quota_gb' >/dev/null 2>&1; then
+                            local t_quota=$(echo "$template_json" | jq -r '.quota_gb')
+                            local t_reset=$(echo "$template_json" | jq -r '.reset_day // 0')
                             
-                            echo -e "${YELLOW}检测到组 [${val}] 现有配置: 配额=${t_quota}GB, 重置日=${t_reset}号${PLAIN}"
-                            read -p "是否同步当前端口至该配置? [Y/n] " sync_q
-                            sync_q=$(strip_cr "$sync_q")
-                            if [[ ! "$sync_q" =~ ^[nN] ]]; then
-                                local tmp2=$(mktemp)
-                                if jq --argjson q "$t_quota" --argjson r "$t_reset" --arg p "$port" \
-                                   '.ports[$p].quota_gb = $q | .ports[$p].reset_day = $r' \
-                                   "$CONFIG_FILE" > "$tmp2" && safe_write_config_from_file "$tmp2"; then
-                                    echo -e "${GREEN}配置已同步。${PLAIN}"
+                            # 再次检查提取的值是否有效
+                            if [ -n "$t_quota" ] && [ "$t_quota" != "null" ]; then
+                                echo -e "${YELLOW}检测到组 [${val}] 现有配置: 配额=${t_quota}GB, 重置日=${t_reset}号${PLAIN}"
+                                read -p "是否同步当前端口至该配置? [Y/n] " sync_q
+                                sync_q=$(strip_cr "$sync_q")
+                                if [[ ! "$sync_q" =~ ^[nN] ]]; then
+                                    local tmp2=$(mktemp)
+                                    if jq --argjson q "$t_quota" --argjson r "$t_reset" --arg p "$port" \
+                                       '.ports[$p].quota_gb = $q | .ports[$p].reset_day = $r' \
+                                       "$CONFIG_FILE" > "$tmp2" && safe_write_config_from_file "$tmp2"; then
+                                        echo -e "${GREEN}配置已同步。${PLAIN}"
+                                    fi
+                                    rm -f "$tmp2"
                                 fi
-                                rm -f "$tmp2"
                             fi
                         fi
                     fi
                     success=true
+                else
+                    echo -e "${RED}写入失败。${PLAIN}"
                 fi
                 ;;
             0) rm -f "$tmp"; break ;;
