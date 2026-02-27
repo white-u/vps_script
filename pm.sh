@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.0.2 (Group Traffic Support)
+# 版本: v5.1.0 (UX Improvement)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,7 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.0.2"
+SCRIPT_VERSION="5.1.0"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -1143,8 +1143,37 @@ config_port_menu() {
                 fi
                 ;;
             8)
-                read -p "设置分组 ID (留空或0 清除分组): " val
-                val=$(strip_cr "$val")
+                # [优化] 自动列出已有分组供选择
+                echo -e "\n--- 设置分组 (Group) ---"
+                # 扫描所有已存在的 group_id 及其配额 (去重)
+                # 输出格式: group_id | quota_gb
+                local existing_groups=$(jq -r '.ports[] | select(.group_id != null and .group_id != "") | "\(.group_id)|\(.quota_gb)"' "$CONFIG_FILE" | sort -u)
+                
+                declare -A group_map
+                local g_idx=1
+                
+                if [ -n "$existing_groups" ]; then
+                    echo -e "当前已有分组:"
+                    while IFS='|' read -r g_name g_quota; do
+                        echo -e " [${g_idx}] ${BLUE}${g_name}${PLAIN} (配额: ${g_quota}GB)"
+                        group_map[$g_idx]="$g_name"
+                        g_idx=$((g_idx + 1))
+                    done <<< "$existing_groups"
+                    echo -e " ------------------------"
+                fi
+                
+                read -p "请输入分组 ID (输入新名称新建，或输入序号选择，留空清除): " input_val
+                input_val=$(strip_cr "$input_val")
+                
+                local val=""
+                # 判断输入是序号还是名称
+                if [[ "$input_val" =~ ^[0-9]+$ ]] && [ -n "${group_map[$input_val]}" ]; then
+                    val="${group_map[$input_val]}"
+                    echo -e "已选择分组: ${BLUE}${val}${PLAIN}"
+                else
+                    val="$input_val"
+                fi
+                
                 [ "$val" == "0" ] && val=""
                 
                 # 1. 先更新当前端口的 group_id
@@ -1154,15 +1183,12 @@ config_port_menu() {
                     # 2. 只有当设置了有效组名时，才尝试同步
                     if [ -n "$val" ]; then
                         # 查找同组的其他端口 (排除自己)
-                        # 使用 -c 紧凑输出，防止多行导致变量赋值混乱
                         local template_json=$(jq -c --arg g "$val" --arg p "$port" '.ports | to_entries[] | select(.value.group_id == $g and .key != $p) | .value' "$CONFIG_FILE" | head -1)
                         
-                        # 检查模板是否有效 (非空且包含 quota_gb)
                         if [ -n "$template_json" ] && echo "$template_json" | jq -e '.quota_gb' >/dev/null 2>&1; then
                             local t_quota=$(echo "$template_json" | jq -r '.quota_gb')
                             local t_reset=$(echo "$template_json" | jq -r '.reset_day // 0')
                             
-                            # 再次检查提取的值是否有效
                             if [ -n "$t_quota" ] && [ "$t_quota" != "null" ]; then
                                 echo -e "${YELLOW}检测到组 [${val}] 现有配置: 配额=${t_quota}GB, 重置日=${t_reset}号${PLAIN}"
                                 read -p "是否同步当前端口至该配置? [Y/n] " sync_q
