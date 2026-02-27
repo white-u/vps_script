@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.1.0 (UX Improvement)
+# 版本: v5.2.0 (Strict Sync & Validation)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,7 +14,7 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.1.0"
+SCRIPT_VERSION="5.2.0"
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -1085,7 +1085,22 @@ config_port_menu() {
                 read -p "新配额 (纯数字, GB): " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ]; then
-                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then success=true; fi
+                    if jq --argjson v "$val" --arg p "$port" '.ports[$p].quota_gb = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then 
+                        success=true
+                        # [Sync Fix] 同步配额给同组端口
+                        local gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
+                        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
+                            local tmp_sync=$(mktemp)
+                            if jq --arg g "$gid" --argjson v "$val" '
+                                .ports |= with_entries(if .value.group_id == $g then .value.quota_gb = $v else . end)
+                            ' "$CONFIG_FILE" > "$tmp_sync" && safe_write_config_from_file "$tmp_sync"; then
+                                echo -e "${GREEN}已同步配额到组 [${gid}] 的所有端口。${PLAIN}"
+                            fi
+                            rm -f "$tmp_sync"
+                        fi
+                    fi
+                else
+                    echo -e "${RED}错误: 必须输入大于0的纯整数!${PLAIN}"; sleep 1
                 fi 
                 ;;
             2) 
@@ -1128,6 +1143,7 @@ config_port_menu() {
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].reset_day = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then 
                         success=true
                         # [Sync Fix] 同步重置日给同组端口
+                        local gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
                         if [ -n "$gid" ] && [ "$gid" != "null" ]; then
                             local tmp_sync=$(mktemp)
                             if jq --arg g "$gid" --argjson v "$val" '
@@ -1145,10 +1161,7 @@ config_port_menu() {
             8)
                 # [优化] 自动列出已有分组供选择
                 echo -e "\n--- 设置分组 (Group) ---"
-                # 扫描所有已存在的 group_id 及其配额 (去重)
-                # 输出格式: group_id | quota_gb
                 local existing_groups=$(jq -r '.ports[] | select(.group_id != null and .group_id != "") | "\(.group_id)|\(.quota_gb)"' "$CONFIG_FILE" | sort -u)
-                
                 declare -A group_map
                 local g_idx=1
                 
@@ -1166,11 +1179,17 @@ config_port_menu() {
                 input_val=$(strip_cr "$input_val")
                 
                 local val=""
-                # 判断输入是序号还是名称
                 if [[ "$input_val" =~ ^[0-9]+$ ]] && [ -n "${group_map[$input_val]}" ]; then
                     val="${group_map[$input_val]}"
                     echo -e "已选择分组: ${BLUE}${val}${PLAIN}"
                 else
+                    # [Sanitization] 输入清洗: 只允许字母数字下划线中划线
+                    if [ -n "$input_val" ] && [ "$input_val" != "0" ]; then
+                        if [[ ! "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                            echo -e "${RED}错误: 组名仅支持字母、数字、下划线(_)和连字符(-)！${PLAIN}"
+                            rm -f "$tmp"; sleep 2; continue
+                        fi
+                    fi
                     val="$input_val"
                 fi
                 
@@ -1180,9 +1199,8 @@ config_port_menu() {
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].group_id = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
                     echo -e "${GREEN}分组 ID 已更新。${PLAIN}"
                     
-                    # 2. 只有当设置了有效组名时，才尝试同步
+                    # 2. 强制同步 (如果加入了有效组)
                     if [ -n "$val" ]; then
-                        # 查找同组的其他端口 (排除自己)
                         local template_json=$(jq -c --arg g "$val" --arg p "$port" '.ports | to_entries[] | select(.value.group_id == $g and .key != $p) | .value' "$CONFIG_FILE" | head -1)
                         
                         if [ -n "$template_json" ] && echo "$template_json" | jq -e '.quota_gb' >/dev/null 2>&1; then
@@ -1190,18 +1208,16 @@ config_port_menu() {
                             local t_reset=$(echo "$template_json" | jq -r '.reset_day // 0')
                             
                             if [ -n "$t_quota" ] && [ "$t_quota" != "null" ]; then
-                                echo -e "${YELLOW}检测到组 [${val}] 现有配置: 配额=${t_quota}GB, 重置日=${t_reset}号${PLAIN}"
-                                read -p "是否同步当前端口至该配置? [Y/n] " sync_q
-                                sync_q=$(strip_cr "$sync_q")
-                                if [[ ! "$sync_q" =~ ^[nN] ]]; then
-                                    local tmp2=$(mktemp)
-                                    if jq --argjson q "$t_quota" --argjson r "$t_reset" --arg p "$port" \
-                                       '.ports[$p].quota_gb = $q | .ports[$p].reset_day = $r' \
-                                       "$CONFIG_FILE" > "$tmp2" && safe_write_config_from_file "$tmp2"; then
-                                        echo -e "${GREEN}配置已同步。${PLAIN}"
-                                    fi
-                                    rm -f "$tmp2"
+                                echo -e "${YELLOW}检测到同组现有配置: 配额=${t_quota}GB, 重置日=${t_reset}号${PLAIN}"
+                                echo -e "${YELLOW}正在强制同步当前端口至该配置...${PLAIN}"
+                                
+                                local tmp2=$(mktemp)
+                                if jq --argjson q "$t_quota" --argjson r "$t_reset" --arg p "$port" \
+                                   '.ports[$p].quota_gb = $q | .ports[$p].reset_day = $r' \
+                                   "$CONFIG_FILE" > "$tmp2" && safe_write_config_from_file "$tmp2"; then
+                                    echo -e "${GREEN}同步完成。${PLAIN}"
                                 fi
+                                rm -f "$tmp2"
                             fi
                         fi
                     fi
