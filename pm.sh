@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.3.0 (Migration System)
+# 版本: v5.4.0 (IP Sentinel)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,9 +14,9 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.3.0"
+SCRIPT_VERSION="5.4.0"
 # 配置结构版本号 (用于数据迁移)
-CURRENT_CONFIG_VERSION=1
+CURRENT_CONFIG_VERSION=2
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -202,7 +202,25 @@ migrate_config() {
     fi
     
     # 未来 v1 -> v2 可以继续追加:
-    # if [ "$file_ver" -lt 2 ]; then ... fi
+    if [ "$file_ver" -lt 2 ]; then
+        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v2)...${PLAIN}"
+        # 为所有端口补全 ip_limit 默认结构 (接入监控)
+        tmp_json=$(echo "$tmp_json" | jq '
+            .config_version = 2 |
+            .ports |= with_entries(
+                .value.ip_limit = (.value.ip_limit // {
+                    "enable": false,
+                    "max_ips": 3,
+                    "action": "alert",
+                    "cooldown_min": 30,
+                    "whitelist": [],
+                    "last_alert_ts": 0,
+                    "last_alert_ips": []
+                })
+            )
+        ')
+        modified=true
+    fi
 
     # --- 写入磁盘 ---
     if [ "$modified" == "true" ]; then
@@ -585,6 +603,224 @@ push_to_worker() {
     curl -sf --max-time 10 -X PUT "${worker_url}" -H "Content-Type: application/json" -H "X-Node: ${node_key}" -H "X-Timestamp: ${timestamp}" -H "X-Signature: ${signature}" -d "$payload" >/dev/null 2>&1 &
 }
 
+# ==============================================================================
+# 2.6 接入监控引擎 (IP Sentinel)
+# ==============================================================================
+
+tg_notify_ip_alert() {
+    local port=$1 comment=$2 ip_count=$3 max_ips=$4 ip_details=$5 group_id=$6
+    local label=$(get_host_label "$comment" "$group_id")
+    tg_send "🚨 *异常接入警报*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📊 状态: 🔴 *${ip_count}* 人在线 (阈值: ${max_ips})
+
+📋 接入详情:
+${ip_details}
+⚠️ 建议检查密码或重启服务
+⏱ $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+# 从 ss 输出中提取端口的独立对端 IP（去重、清洗 IPv4-mapped）
+_sentinel_scan_ips() {
+    local port=$1
+    ss -nt state established "( sport = :$port )" 2>/dev/null | \
+        grep -v 'Address:Port' | awk '{print $4}' | \
+        rev | cut -d: -f2- | rev | \
+        sed 's/^\[//;s/\]$//;s/^::ffff://' | \
+        grep -v '^$' | sort -u
+}
+
+# 阶段四入口: 遍历启用了 ip_limit 的端口执行检测
+check_ip_sentinel() {
+    local current_ts=$1
+    local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$ports" ] && return
+
+    local s_json=$(cat "$CONFIG_FILE")
+    local s_modified=false
+
+    for port in $ports; do
+        local p_conf=$(echo "$s_json" | jq ".ports[\"$port\"]")
+        local ip_enable=$(echo "$p_conf" | jq -r '.ip_limit.enable // false')
+        [ "$ip_enable" != "true" ] && continue
+
+        local max_ips=$(echo "$p_conf" | jq -r '.ip_limit.max_ips // 3')
+        local action=$(echo "$p_conf" | jq -r '.ip_limit.action // "alert"')
+        local cooldown_min=$(echo "$p_conf" | jq -r '.ip_limit.cooldown_min // 30')
+        local last_alert_ts=$(echo "$p_conf" | jq -r '.ip_limit.last_alert_ts // 0')
+        local comment=$(echo "$p_conf" | jq -r '.comment // ""')
+        local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
+
+        # --- 扫描 ---
+        local raw_ips=$(_sentinel_scan_ips "$port")
+        [ -z "$raw_ips" ] && continue
+
+        # --- 过滤白名单 ---
+        local wl_json=$(echo "$p_conf" | jq -r '.ip_limit.whitelist // [] | .[]' 2>/dev/null)
+        local filtered=""
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            local skip=false
+            if [ -n "$wl_json" ]; then
+                while IFS= read -r w; do
+                    [ "$ip" = "$w" ] && { skip=true; break; }
+                done <<< "$wl_json"
+            fi
+            [ "$skip" = "false" ] && filtered+="${ip}"$'\n'
+        done <<< "$raw_ips"
+        filtered=$(echo "$filtered" | grep -v '^$')
+        local ip_count=$(echo "$filtered" | grep -cve '^\s*$')
+        [ "$ip_count" -le "$max_ips" ] && continue
+
+        # --- 冷却: 有新 IP 则强制报警，否则遵守冷却期 ---
+        local last_ips=$(echo "$p_conf" | jq -r '.ip_limit.last_alert_ips // [] | .[]' 2>/dev/null)
+        local has_new=false
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            if [ -z "$last_ips" ] || ! echo "$last_ips" | grep -qxF "$ip"; then
+                has_new=true; break
+            fi
+        done <<< "$filtered"
+        if [ "$has_new" = "false" ] && [ $((current_ts - last_alert_ts)) -lt $((cooldown_min * 60)) ]; then
+            continue
+        fi
+
+        # --- 归属地查询 (降级容错) ---
+        local details="" idx=1
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            local geo=""
+            geo=$(curl -sf --max-time 3 "http://ip-api.com/line/${ip}?fields=country,regionName,isp&lang=zh-CN" 2>/dev/null | tr '\n' ', ' | sed 's/, *$//')
+            [ -z "$geo" ] && geo="(查询失败)"
+            geo=$(echo "$geo" | sed 's/[_*`\[]/\\&/g')
+            details+="${idx}. \`${ip}\` - ${geo}"$'\n'
+            idx=$((idx + 1))
+            [ "$idx" -gt 15 ] && { details+="... 仅显示前 15 条"$'\n'; break; }
+        done <<< "$filtered"
+
+        # --- 通知 ---
+        tg_notify_ip_alert "$port" "$comment" "$ip_count" "$max_ips" "$details" "$gid"
+
+        # --- 自动阻断 (可选, 保留连接数最多的前 N 个 IP) ---
+        if [ "$action" = "block" ]; then
+            local ranked=$(ss -nt state established "( sport = :$port )" 2>/dev/null | \
+                grep -v 'Address:Port' | awk '{print $4}' | \
+                rev | cut -d: -f2- | rev | \
+                sed 's/^\[//;s/\]$//;s/^::ffff://' | \
+                grep -v '^$' | sort | uniq -c | sort -rn)
+            local kept=0
+            while read -r cnt kip; do
+                [ -z "$kip" ] && continue
+                # 跳过白名单
+                local in_wl=false
+                if [ -n "$wl_json" ]; then
+                    while IFS= read -r w; do [ "$kip" = "$w" ] && { in_wl=true; break; }; done <<< "$wl_json"
+                fi
+                [ "$in_wl" = "true" ] && continue
+                kept=$((kept + 1))
+                [ "$kept" -gt "$max_ips" ] && ss -K dst "$kip" sport = ":$port" 2>/dev/null
+            done <<< "$ranked"
+        fi
+
+        # --- 更新状态 ---
+        local ips_arr=$(echo "$filtered" | jq -R . | jq -s .)
+        s_json=$(echo "$s_json" | jq \
+            --argjson ts "$current_ts" --argjson ips "$ips_arr" --arg p "$port" \
+            '.ports[$p].ip_limit.last_alert_ts = $ts | .ports[$p].ip_limit.last_alert_ips = $ips')
+        s_modified=true
+    done
+
+    if [ "$s_modified" = "true" ]; then
+        local _stmp=$(mktemp)
+        printf '%s\n' "$s_json" > "$_stmp"
+        safe_write_config_from_file "$_stmp"
+        rm -f "$_stmp"
+    fi
+}
+
+configure_ip_sentinel() {
+    local port=$1
+    while true; do
+        local conf=$(jq ".ports[\"$port\"].ip_limit // {}" "$CONFIG_FILE")
+        local ip_en=$(echo "$conf" | jq -r '.enable // false')
+        local ip_max=$(echo "$conf" | jq -r '.max_ips // 3')
+        local ip_act=$(echo "$conf" | jq -r '.action // "alert"')
+        local ip_cd=$(echo "$conf" | jq -r '.cooldown_min // 30')
+        local ip_wl=$(echo "$conf" | jq -r '.whitelist // [] | join(", ")')
+        [ -z "$ip_wl" ] && ip_wl="(空)"
+
+        local act_str="仅报警"
+        [ "$ip_act" = "block" ] && act_str="${RED}自动阻断${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e " 接入监控 (IP Sentinel) - 端口 $port"
+        echo -e "========================================"
+        echo -e " 状态:     $([ "$ip_en" = "true" ] && echo "${GREEN}已启用${PLAIN}" || echo "${YELLOW}未启用${PLAIN}")"
+        echo -e " 最大人数: $ip_max"
+        echo -e " 处理策略: $act_str"
+        echo -e " 冷却时间: ${ip_cd} 分钟"
+        echo -e " 白名单:   $ip_wl"
+        echo -e "========================================"
+        echo -e " 1. 启用/禁用"
+        echo -e " 2. 设置 最大人数"
+        echo -e " 3. 设置 处理策略"
+        echo -e " 4. 设置 冷却时间"
+        echo -e " 5. 管理 白名单"
+        echo -e " 0. 返回"
+        echo -e "========================================"
+        read -p "> " sc; sc=$(strip_cr "$sc")
+        local tmp=$(mktemp)
+
+        case $sc in
+            1)  local nv="true"; [ "$ip_en" = "true" ] && nv="false"
+                jq --argjson v "$nv" --arg p "$port" '.ports[$p].ip_limit.enable = $v' \
+                    "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" = "true" ] && echo "启用" || echo "禁用")。${PLAIN}"; sleep 0.5 ;;
+            2)  read -p "最大允许独立 IP 数: " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ]; then
+                    jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.max_ips = $v' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                else echo -e "${RED}无效输入。${PLAIN}"; sleep 1; fi ;;
+            3)  echo -e "1. 仅报警 (alert)  2. 自动阻断 (block)"
+                read -p "> " am; am=$(strip_cr "$am")
+                local nact="alert"; [ "$am" = "2" ] && nact="block"
+                jq --arg v "$nact" --arg p "$port" '.ports[$p].ip_limit.action = $v' \
+                    "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                if [ "$nact" = "block" ]; then
+                    echo -e "${YELLOW}注意: 自动阻断会切断多余 IP 的连接，存在误杀风险。${PLAIN}"
+                    echo -e "${YELLOW}建议先以「仅报警」模式运行一段时间再决定。${PLAIN}"
+                fi
+                echo -e "${GREEN}已更新。${PLAIN}"; sleep 1 ;;
+            4)  read -p "冷却时间 (分钟, IP 不变时抑制重复报警): " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ]; then
+                    jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.cooldown_min = $v' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                else echo -e "${RED}无效输入。${PLAIN}"; sleep 1; fi ;;
+            5)  echo -e "\n当前白名单: $ip_wl"
+                echo -e " 1. 添加 IP  2. 清空白名单  0. 返回"
+                read -p "> " wc; wc=$(strip_cr "$wc")
+                if [ "$wc" = "1" ]; then
+                    read -p "输入 IP 地址 (支持 IPv4/IPv6): " wip; wip=$(strip_cr "$wip")
+                    if [ -n "$wip" ]; then
+                        jq --arg ip "$wip" --arg p "$port" '.ports[$p].ip_limit.whitelist += [$ip] | .ports[$p].ip_limit.whitelist |= unique' \
+                            "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                        echo -e "${GREEN}已添加。${PLAIN}"; sleep 0.5
+                    fi
+                elif [ "$wc" = "2" ]; then
+                    jq --arg p "$port" '.ports[$p].ip_limit.whitelist = []' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已清空。${PLAIN}"; sleep 0.5
+                fi ;;
+            0)  rm -f "$tmp"; break ;;
+        esac
+        rm -f "$tmp"
+    done
+}
+
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 
 cron_task() {
@@ -603,6 +839,12 @@ cron_task() {
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     if ! nft list table $NFT_TABLE &>/dev/null; then reload_all_rules; fi
+
+    # 预校验配置文件完整性 (防御磁盘满等导致的截断损坏)
+    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo "[pm] 配置文件 JSON 损坏，跳过本轮执行" >&2
+        exit 1
+    fi
 
     local tmp_json=$(cat "$CONFIG_FILE")
     local ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
@@ -834,6 +1076,10 @@ cron_task() {
             rm -f "$_tmp_rpt"
         fi
     fi
+
+    # --- 阶段四: 接入 IP 监控 (Sentinel) ---
+    check_ip_sentinel "$current_ts"
+
     push_to_worker
 }
 
@@ -1070,7 +1316,8 @@ add_port_flow() {
         "group_id": "",
         "stats": {"acc_in": 0, "acc_out": 0, "last_kernel_in": 0, "last_kernel_out": 0},
         "dyn_limit": {"enable": false},
-        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true}
+        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true},
+        "ip_limit": {"enable": false, "max_ips": 3, "action": "alert", "cooldown_min": 30, "whitelist": [], "last_alert_ts": 0, "last_alert_ips": []}
     }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
         rm -f "$tmp"
         apply_port_rules "$target_port"
@@ -1121,6 +1368,7 @@ config_port_menu() {
         echo -e " 6. 重置 统计数据 (清零)"
         echo -e " 7. 修改 自动重置日"
         echo -e " 8. 设置/修改 分组 ID (Group)"
+        echo -e " 9. 接入监控 (IP Sentinel)"
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " sub_choice
@@ -1275,6 +1523,7 @@ config_port_menu() {
                     echo -e "${RED}写入失败。${PLAIN}"
                 fi
                 ;;
+            9) rm -f "$tmp"; configure_ip_sentinel "$port" ;;
             0) rm -f "$tmp"; break ;;
         esac
         
@@ -1292,9 +1541,16 @@ configure_dyn_qos() {
     if [ "$s" == "2" ]; then
         if jq --arg p "$port" '.ports[$p].dyn_limit.enable=false|.ports[$p].dyn_limit.is_punished=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then apply_port_rules "$port"; fi
     elif [ "$s" == "1" ]; then
-        read -p "阈值(Mbps): " tm; read -p "触发时长(分): " tt; read -p "惩罚(Mbps): " pm; read -p "惩罚时长(分): " pt
-        jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
-        '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        read -p "阈值(Mbps): " tm; tm=$(strip_cr "$tm")
+        read -p "触发时长(分): " tt; tt=$(strip_cr "$tt")
+        read -p "惩罚(Mbps): " pm; pm=$(strip_cr "$pm")
+        read -p "惩罚时长(分): " pt; pt=$(strip_cr "$pt")
+        if [[ "$tm" =~ ^[0-9]+$ ]] && [[ "$tt" =~ ^[0-9]+$ ]] && [[ "$pm" =~ ^[0-9]+$ ]] && [[ "$pt" =~ ^[0-9]+$ ]]; then
+            jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
+            '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        else
+            echo -e "${RED}错误: 所有参数必须为纯整数!${PLAIN}"; sleep 1
+        fi
     fi
     rm -f "$tmp"
 }
@@ -1306,7 +1562,7 @@ configure_telegram() {
         case $c in
             1) read -p "Token: " t; jq --arg v "$t" '.telegram.bot_token=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
             2) read -p "ChatID: " i; jq --arg v "$i" '.telegram.chat_id=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            3) echo "Sending test..."; local t=$(jq -r '.telegram.bot_token' "$CONFIG_FILE"); local i=$(jq -r '.telegram.chat_id' "$CONFIG_FILE"); curl -s "https://api.telegram.org/bot$t/sendMessage" -d chat_id="$i" -d text="Test OK" ;;
+            3) echo "Sending test..."; local t=$(jq -r '.telegram.bot_token' "$CONFIG_FILE"); local i=$(jq -r '.telegram.chat_id' "$CONFIG_FILE"); local u=$(jq -r '.telegram.api_url // "https://api.telegram.org"' "$CONFIG_FILE"); curl -s "${u}/bot$t/sendMessage" -d chat_id="$i" -d text="Test OK" ;;
             4) local s=$(jq -r '.telegram.enable' "$CONFIG_FILE"); [ "$s" == "true" ] && ns="false" || ns="true"; jq --argjson v "$ns" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
             0) rm -f "$tmp"; break ;;
         esac
@@ -1330,17 +1586,76 @@ configure_push() {
 }
 
 delete_port_flow() {
-    local arr=("$@"); read -p "ID to delete: " id; local port=${arr[$((id-1))]}
-    [ -n "$port" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null && \
-    local tmp=$(mktemp) && jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" && rm -f "$tmp" && reload_all_rules && echo "Deleted." && sleep 1
+    local arr=("$@")
+    read -p "ID to delete: " id
+    id=$(strip_cr "$id")
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
+    local port=${arr[$((id-1))]}
+    if [ -z "$port" ]; then echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return; fi
+
+    read -p "确认删除端口 ${port}? [y/N]: " confirm
+    confirm=$(strip_cr "$confirm")
+    [ "$confirm" != "y" ] && return
+
+    # 1. 从封禁集合移除 (可能不在集合中, 忽略错误)
+    nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
+
+    # 2. 从配置中删除
+    local tmp=$(mktemp)
+    if jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+        rm -f "$tmp"
+        reload_all_rules
+        echo -e "${GREEN}端口 ${port} 已删除。${PLAIN}"; sleep 1
+    else
+        rm -f "$tmp"
+        echo -e "${RED}删除失败。${PLAIN}"; sleep 1
+    fi
 }
 
 update_script() {
-    local tmp=$(mktemp); curl -fsSL "$DOWNLOAD_URL" -o "$tmp" && mv "$tmp" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH" && exec "$INSTALL_PATH"
+    echo -e "${YELLOW}正在检查更新...${PLAIN}"
+    local tmp=$(mktemp /tmp/pm_update.XXXXXX.sh)
+    curl -fsSL --max-time 30 "$DOWNLOAD_URL" -o "$tmp" 2>/dev/null
+    if [ -s "$tmp" ] && head -1 "$tmp" | grep -q '^#!/bin/bash'; then
+        mv -f "$tmp" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+        echo -e "${GREEN}更新成功，正在重启...${PLAIN}"; sleep 1
+        exec "$INSTALL_PATH"
+    else
+        rm -f "$tmp"
+        echo -e "${RED}更新失败: 下载文件无效或网络不可用。${PLAIN}"; sleep 2
+    fi
 }
 
 uninstall_script() {
-    read -p "Uninstall? (yes): " c; [ "$c" == "yes" ] && rm -rf "$CONFIG_DIR" "$INSTALL_PATH" && crontab -l | grep -v "$SHORTCUT_NAME" | crontab - && echo "Done." && exit 0
+    echo -e "${RED}警告: 将删除所有配置和监控规则!${PLAIN}"
+    read -p "确认卸载? (输入 yes): " c
+    c=$(strip_cr "$c")
+    [ "$c" != "yes" ] && return
+
+    echo -e "${YELLOW}正在清理...${PLAIN}"
+
+    # 1. 清除 nftables 规则
+    nft delete table $NFT_TABLE 2>/dev/null
+    echo -e "  nftables 规则已清除"
+
+    # 2. 清除 TC 根队列
+    local iface=$(jq -r '.interface // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$iface" ] && iface=$(get_iface)
+    if [ -n "$iface" ]; then
+        tc qdisc del dev "$iface" root 2>/dev/null
+        echo -e "  TC 限速规则已清除"
+    fi
+
+    # 3. 移除 Cron
+    crontab -l 2>/dev/null | grep -v "$SHORTCUT_NAME" | crontab -
+    echo -e "  Cron 任务已清除"
+
+    # 4. 删除文件
+    rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$CRON_LOCK_FILE" "$USER_EDIT_LOCK" 2>/dev/null
+    echo -e "  文件已清除"
+
+    echo -e "${GREEN}卸载完成。${PLAIN}"
+    exit 0
 }
 
 # ==============================================================================
