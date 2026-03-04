@@ -1532,22 +1532,55 @@ config_port_menu() {
     done
 }
 
-# (省略 configure_dyn_qos, configure_telegram, configure_push 等未变更函数，保持原样)
-# 为保持脚本完整性，以下是这些辅助函数的紧凑版 (实际应包含完整代码)
+# ==============================================================================
+# 4.5 辅助配置函数
+# ==============================================================================
 
 configure_dyn_qos() {
-    local port=$1; local tmp=$(mktemp)
-    echo -e "\n1.启用 2.禁用 0.取消"; read -p "> " s; s=$(strip_cr "$s")
+    local port=$1
+    local conf=$(jq ".ports[\"$port\"].dyn_limit // {}" "$CONFIG_FILE")
+    local d_en=$(echo "$conf" | jq -r '.enable // false')
+    local d_trigger=$(echo "$conf" | jq -r '.trigger_mbps // "-"')
+    local d_trig_t=$(echo "$conf" | jq -r '.trigger_time // "-"')
+    local d_pun_m=$(echo "$conf" | jq -r '.punish_mbps // "-"')
+    local d_pun_t=$(echo "$conf" | jq -r '.punish_time // "-"')
+    local d_punished=$(echo "$conf" | jq -r '.is_punished // false')
+
+    echo -e "\n========================================"
+    echo -e " 动态突发限制 (QoS) - 端口 $port"
+    echo -e "========================================"
+    echo -e " 状态:     $([ "$d_en" == "true" ] && echo "${GREEN}已启用${PLAIN}" || echo "${YELLOW}未启用${PLAIN}")"
+    if [ "$d_en" == "true" ]; then
+        echo -e " 触发阈值: ${d_trigger} Mbps"
+        echo -e " 触发时长: ${d_trig_t} 分钟"
+        echo -e " 惩罚限速: ${d_pun_m} Mbps"
+        echo -e " 惩罚时长: ${d_pun_t} 分钟"
+        echo -e " 惩罚中:   $([ "$d_punished" == "true" ] && echo "${RED}是${PLAIN}" || echo "否")"
+    fi
+    echo -e "========================================"
+    echo -e " 1. 启用 (配置参数)"
+    echo -e " 2. 禁用"
+    echo -e " 0. 取消"
+    echo -e "========================================"
+    read -p "> " s; s=$(strip_cr "$s")
+    local tmp=$(mktemp)
+
     if [ "$s" == "2" ]; then
-        if jq --arg p "$port" '.ports[$p].dyn_limit.enable=false|.ports[$p].dyn_limit.is_punished=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then apply_port_rules "$port"; fi
+        if jq --arg p "$port" '.ports[$p].dyn_limit.enable=false|.ports[$p].dyn_limit.is_punished=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+            apply_port_rules "$port"
+            echo -e "${GREEN}已禁用动态限速。${PLAIN}"; sleep 0.5
+        fi
     elif [ "$s" == "1" ]; then
-        read -p "阈值(Mbps): " tm; tm=$(strip_cr "$tm")
-        read -p "触发时长(分): " tt; tt=$(strip_cr "$tt")
-        read -p "惩罚(Mbps): " pm; pm=$(strip_cr "$pm")
-        read -p "惩罚时长(分): " pt; pt=$(strip_cr "$pt")
+        read -p "触发阈值 (Mbps, 超过此速率开始计数): " tm; tm=$(strip_cr "$tm")
+        read -p "触发时长 (分钟, 连续超标多久触发惩罚): " tt; tt=$(strip_cr "$tt")
+        read -p "惩罚限速 (Mbps, 触发后降速到): " pm; pm=$(strip_cr "$pm")
+        read -p "惩罚时长 (分钟, 降速持续多久): " pt; pt=$(strip_cr "$pt")
         if [[ "$tm" =~ ^[0-9]+$ ]] && [[ "$tt" =~ ^[0-9]+$ ]] && [[ "$pm" =~ ^[0-9]+$ ]] && [[ "$pt" =~ ^[0-9]+$ ]]; then
-            jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
-            '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+            if jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
+                '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' \
+                "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                echo -e "${GREEN}动态限速已启用。${PLAIN}"; sleep 0.5
+            fi
         else
             echo -e "${RED}错误: 所有参数必须为纯整数!${PLAIN}"; sleep 1
         fi
@@ -1557,13 +1590,117 @@ configure_dyn_qos() {
 
 configure_telegram() {
     while true; do
-        clear; echo "Telegram Config"; echo "1.Token 2.ChatID 3.Test 4.On/Off 0.Back"
-        read -p "> " c; c=$(strip_cr "$c"); local tmp=$(mktemp)
+        local tg=$(jq '.telegram' "$CONFIG_FILE")
+        local t_enable=$(echo "$tg" | jq -r '.enable // false')
+        local t_token=$(echo "$tg" | jq -r '.bot_token // ""')
+        local t_chatid=$(echo "$tg" | jq -r '.chat_id // ""')
+        local t_api=$(echo "$tg" | jq -r '.api_url // "https://api.telegram.org"')
+        local t_thr=$(echo "$tg" | jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")')
+        local t_rpt=$(echo "$tg" | jq -r '.report_interval_hours // 0')
+
+        local status_str="${YELLOW}⚪ 未启用${PLAIN}"
+        [ "$t_enable" == "true" ] && status_str="${GREEN}✅ 已启用${PLAIN}"
+        local token_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$t_token" ] && [ "$t_token" != "" ] && token_str="${GREEN}已配置${PLAIN} (${t_token:0:8}...)"
+        local chatid_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$t_chatid" ] && [ "$t_chatid" != "" ] && chatid_str="${GREEN}${t_chatid}${PLAIN}"
+        local rpt_str="${YELLOW}未开启${PLAIN}"
+        [ "$t_rpt" -gt 0 ] 2>/dev/null && rpt_str="${GREEN}每 ${t_rpt} 小时${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e "   Telegram 通知配置"
+        echo -e "========================================"
+        echo -e " 状态:   $status_str"
+        echo -e " Token:  $token_str"
+        echo -e " ChatID: $chatid_str"
+        echo -e " API:    $t_api"
+        echo -e " 阈值:   ${t_thr} (%)"
+        echo -e " 定时报告: $rpt_str"
+        echo -e "========================================"
+        echo -e " 1. 配置 Bot Token"
+        echo -e " 2. 配置 Chat ID"
+        echo -e " 3. 发送测试消息"
+        echo -e " 4. 开启/关闭 通知"
+        echo -e " 5. 修改 通知阈值"
+        echo -e " 6. 修改 API 地址 (国内反代)"
+        echo -e " 7. 配置 定时流量报告"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " c
+        c=$(strip_cr "$c")
+        local tmp=$(mktemp)
+
         case $c in
-            1) read -p "Token: " t; jq --arg v "$t" '.telegram.bot_token=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            2) read -p "ChatID: " i; jq --arg v "$i" '.telegram.chat_id=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            3) echo "Sending test..."; local t=$(jq -r '.telegram.bot_token' "$CONFIG_FILE"); local i=$(jq -r '.telegram.chat_id' "$CONFIG_FILE"); local u=$(jq -r '.telegram.api_url // "https://api.telegram.org"' "$CONFIG_FILE"); curl -s "${u}/bot$t/sendMessage" -d chat_id="$i" -d text="Test OK" ;;
-            4) local s=$(jq -r '.telegram.enable' "$CONFIG_FILE"); [ "$s" == "true" ] && ns="false" || ns="true"; jq --argjson v "$ns" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
+            1)
+                read -p "请输入 Bot Token: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.telegram.bot_token=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}Token 已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            2)
+                read -p "请输入 Chat ID: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.telegram.chat_id=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}Chat ID 已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            3)
+                echo -e "${YELLOW}正在发送测试消息...${PLAIN}"
+                local tk=$(jq -r '.telegram.bot_token' "$CONFIG_FILE")
+                local ci=$(jq -r '.telegram.chat_id' "$CONFIG_FILE")
+                local au=$(jq -r '.telegram.api_url // "https://api.telegram.org"' "$CONFIG_FILE")
+                if [ -z "$tk" ] || [ -z "$ci" ]; then
+                    echo -e "${RED}请先配置 Token 和 Chat ID!${PLAIN}"; sleep 1
+                else
+                    local nid=$(jq -r '.node_id // "unknown"' "$CONFIG_FILE")
+                    local result=$(curl -s --max-time 10 "${au}/bot${tk}/sendMessage" \
+                        -d chat_id="$ci" -d text="✅ PM 测试消息 (节点: ${nid})" -d parse_mode="Markdown")
+                    if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
+                        echo -e "${GREEN}发送成功!${PLAIN}"
+                    else
+                        local err=$(echo "$result" | jq -r '.description // "未知错误"' 2>/dev/null)
+                        echo -e "${RED}发送失败: ${err}${PLAIN}"
+                    fi
+                    sleep 2
+                fi ;;
+            4)
+                local nv="true"; [ "$t_enable" == "true" ] && nv="false"
+                jq --argjson v "$nv" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。${PLAIN}"; sleep 0.5 ;;
+            5)
+                echo -e "当前阈值: ${t_thr} (%)"
+                read -p "请输入新阈值 (用逗号分隔, 如 50,80,100): " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    # 解析逗号分隔为 JSON 数组
+                    local arr_json=$(echo "$val" | tr ',' '\n' | grep -E '^[0-9]+$' | jq -s '.')
+                    if [ -n "$arr_json" ] && [ "$arr_json" != "[]" ]; then
+                        jq --argjson v "$arr_json" '.telegram.thresholds=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                        echo -e "${GREEN}阈值已更新。${PLAIN}"; sleep 0.5
+                    else
+                        echo -e "${RED}格式错误! 请输入纯数字用逗号分隔。${PLAIN}"; sleep 1
+                    fi
+                fi ;;
+            6)
+                echo -e "当前 API: $t_api"
+                echo -e "留空恢复默认 (https://api.telegram.org)"
+                read -p "请输入新 API 地址: " val; val=$(strip_cr "$val")
+                [ -z "$val" ] && val="https://api.telegram.org"
+                jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}API 地址已更新。${PLAIN}"; sleep 0.5 ;;
+            7)
+                echo -e "当前设置: $([ "$t_rpt" -gt 0 ] 2>/dev/null && echo "每 ${t_rpt} 小时" || echo "未开启")"
+                read -p "报告间隔 (小时, 0为关闭): " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    jq --argjson v "$val" '.telegram.report_interval_hours=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    if [ "$val" -eq 0 ]; then
+                        echo -e "${GREEN}定时报告已关闭。${PLAIN}"
+                    else
+                        echo -e "${GREEN}已设置为每 ${val} 小时报告一次。${PLAIN}"
+                    fi
+                    sleep 0.5
+                else
+                    echo -e "${RED}请输入纯整数!${PLAIN}"; sleep 1
+                fi ;;
             0) rm -f "$tmp"; break ;;
         esac
         rm -f "$tmp"
@@ -1572,13 +1709,63 @@ configure_telegram() {
 
 configure_push() {
     while true; do
-        clear; echo "Cloudflare Push"; echo "1.URL 2.Secret 3.NodeKey 4.On/Off 0.Back"
-        read -p "> " c; c=$(strip_cr "$c"); local tmp=$(mktemp)
+        local pc=$(jq '.push // {}' "$CONFIG_FILE")
+        local p_enable=$(echo "$pc" | jq -r '.enable // false')
+        local p_url=$(echo "$pc" | jq -r '.worker_url // ""')
+        local p_secret=$(echo "$pc" | jq -r '.secret // ""')
+        local p_nkey=$(echo "$pc" | jq -r '.node_key // ""')
+
+        local status_str="${YELLOW}⚪ 未启用${PLAIN}"
+        [ "$p_enable" == "true" ] && status_str="${GREEN}✅ 已启用${PLAIN}"
+        local url_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_url" ] && [ "$p_url" != "" ] && url_str="${GREEN}${p_url}${PLAIN}"
+        local secret_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_secret" ] && [ "$p_secret" != "" ] && secret_str="${GREEN}已配置${PLAIN} (${p_secret:0:6}...)"
+        local nkey_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_nkey" ] && [ "$p_nkey" != "" ] && nkey_str="${GREEN}${p_nkey}${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e "   Cloudflare Worker 云端推送"
+        echo -e "========================================"
+        echo -e " 状态:     $status_str"
+        echo -e " Worker:   $url_str"
+        echo -e " Secret:   $secret_str"
+        echo -e " Node Key: $nkey_str"
+        echo -e "========================================"
+        echo -e " 1. 配置 Worker URL"
+        echo -e " 2. 配置 Secret"
+        echo -e " 3. 配置 Node Key"
+        echo -e " 4. 开启/关闭 推送"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " c
+        c=$(strip_cr "$c")
+        local tmp=$(mktemp)
+
         case $c in
-            1) read -p "URL: " u; jq --arg v "$u" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            2) read -p "Secret: " s; jq --arg v "$s" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            3) read -p "Key: " k; jq --arg v "$k" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            4) local s=$(jq -r '.push.enable' "$CONFIG_FILE"); [ "$s" == "true" ] && ns="false" || ns="true"; jq --argjson v "$ns" '.push.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
+            1)
+                read -p "请输入 Worker URL: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            2)
+                read -p "请输入 Secret: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            3)
+                read -p "请输入 Node Key: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            4)
+                local nv="true"; [ "$p_enable" == "true" ] && nv="false"
+                jq --argjson v "$nv" '.push.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。${PLAIN}"; sleep 0.5 ;;
             0) rm -f "$tmp"; break ;;
         esac
         rm -f "$tmp"
