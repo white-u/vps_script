@@ -1458,8 +1458,9 @@ config_port_menu() {
             8)
                 # [优化] 自动列出已有分组供选择
                 echo -e "\n--- 设置分组 (Group) ---"
-                local existing_groups=$(jq -r '.ports[] | select(.group_id != null and .group_id != "") | "\(.group_id)|\(.quota_gb)"' "$CONFIG_FILE" | sort -u)
+                local existing_groups=$(jq -r '.ports | to_entries[] | select(.value.group_id != null and .value.group_id != "") | "\(.value.group_id)|\(.value.quota_gb)"' "$CONFIG_FILE" | sort -t'|' -k1,1 -u)
                 declare -A group_map
+                group_map=()
                 local g_idx=1
                 
                 if [ -n "$existing_groups" ]; then
