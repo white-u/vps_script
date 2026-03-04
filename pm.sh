@@ -64,7 +64,7 @@ check_root() {
 # 智能安装逻辑：兼容管道运行、Loader加载和本地运行
 install_shortcut() {
     # 如果是 Cron 模式，或者当前运行的程序路径($0)已经是安装目标，则跳过安装
-    [[ "$1" == "--monitor" ]] && return
+    [[ "$1" == "--monitor" || "$1" == "--ipl" ]] && return
     [[ "$0" == "$INSTALL_PATH" ]] && return
     
     # 增加逻辑：如果是被 source 加载的 (Loader 模式)，$0 也是 INSTALL_PATH，会自动跳过，无需额外改动
@@ -1855,6 +1855,15 @@ install_deps
 
 if [ "${1:-}" == "--monitor" ]; then
     cron_task
+elif [ "${1:-}" == "--ipl" ]; then
+    echo -e "端口\t在线IP数\tIP列表"
+    echo -e "----\t--------\t------"
+    for p in $(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n); do
+        ips=$(_sentinel_scan_ips "$p")
+        cnt=0; [ -n "$ips" ] && cnt=$(echo "$ips" | wc -l)
+        list="-"; [ -n "$ips" ] && list=$(echo "$ips" | tr '\n' ' ')
+        echo -e "${p}\t${cnt}\t\t${list}"
+    done
 elif [ "${1:-}" == "update" ]; then
     update_script
 else
