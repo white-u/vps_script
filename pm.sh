@@ -852,17 +852,23 @@ cron_task() {
     local current_ts=$(date +%s)
 
     # --- 阶段一：采集数据 + DynQoS (Port Level) ---
-    for port in $ports; do
-        # [OPT-1a] 批量读取 stats + dyn_enable (5次jq → 1次)
-        IFS=$'\t' read -r acc_in acc_out last_k_in last_k_out dyn_enable <<< \
-            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [((.stats.acc_in//0)|floor), ((.stats.acc_out//0)|floor), ((.stats.last_kernel_in//0)|floor), ((.stats.last_kernel_out//0)|floor), (.dyn_limit.enable//false)] | @tsv")"
+    # [OPT-BATCH-R] 循环外一次性读取所有端口 stats+dyn_enable (N次jq → 1次)
+    local _p1_data=$(echo "$tmp_json" | jq -r '
+        .ports | to_entries[] |
+        [.key, ((.value.stats.acc_in//0)|floor), ((.value.stats.acc_out//0)|floor),
+         ((.value.stats.last_kernel_in//0)|floor), ((.value.stats.last_kernel_out//0)|floor),
+         (.value.dyn_limit.enable//false)] | @tsv')
+    # [OPT-BATCH-W] 累积写入表达式，循环结束后一次性 apply (N次jq → 1次)
+    local _jq_acc="."
+
+    while IFS=$'\t' read -r port acc_in acc_out last_k_in last_k_out dyn_enable; do
+        [ -z "$port" ] && continue
 
         local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         [ -z "$curr_k_in" ] && curr_k_in=0
         [ -z "$curr_k_out" ] && curr_k_out=0
 
-        # [OPT-1b] bash 原生算术替代 bc (纯整数运算)
         local delta_in=0
         if (( curr_k_in < last_k_in )); then delta_in=$curr_k_in; else delta_in=$((curr_k_in - last_k_in)); fi
         local delta_out=0
@@ -871,28 +877,24 @@ cron_task() {
         acc_in=$((acc_in + delta_in))
         acc_out=$((acc_out + delta_out))
 
-        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
+        _jq_acc="$_jq_acc | .ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out"
         modified=true
 
         # DynQoS 必须在这里做，因为它依赖 delta_in/delta_out (即实时速率)
         if [ "$dyn_enable" == "true" ]; then
-            # [OPT-1c] 批量读取 DynQoS 字段 (11次jq → 1次)
             IFS=$'\t' read -r dyn_trigger dyn_trig_time dyn_punish_time dyn_punish_mbps strike is_punished end_ts punish_notified recover_notified <<< \
                 "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [.dyn_limit.trigger_mbps, .dyn_limit.trigger_time, .dyn_limit.punish_time, .dyn_limit.punish_mbps, (.dyn_limit.strike_count//0), (.dyn_limit.is_punished//false), (.dyn_limit.punish_end_ts//0), (.notify_state.punish_notified//false), (.notify_state.recover_notified//true)] | @tsv")"
 
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1000000" | bc)
             local rule_changed=false
+            local _notify_type=""
 
             if [ "$is_punished" == "true" ]; then
                 if [ "$current_ts" -ge "$end_ts" ]; then
-                    is_punished="false"; strike=0
-                    tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0")
+                    _jq_acc="$_jq_acc | .ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0"
                     if [ "$recover_notified" != "true" ]; then
-                        # 惰性读取 comment/gid (仅通知时才需要)
-                        local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
-                        local gid=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].group_id // empty")
-                        tg_notify_recover "$port" "$comment" "$gid"
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.recover_notified = true | .ports[\"$port\"].notify_state.punish_notified = false")
+                        _jq_acc="$_jq_acc | .ports[\"$port\"].notify_state.recover_notified = true | .ports[\"$port\"].notify_state.punish_notified = false"
+                        _notify_type="recover"
                     fi
                     rule_changed=true
                 fi
@@ -900,36 +902,48 @@ cron_task() {
                 if [ $(echo "$current_mbps > $dyn_trigger" | bc) -eq 1 ]; then
                     strike=$((strike + 1))
                     if [ "$strike" -ge "$dyn_trig_time" ]; then
-                        is_punished="true"
                         end_ts=$((current_ts + dyn_punish_time * 60))
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
+                        _jq_acc="$_jq_acc | .ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts"
                         if [ "$punish_notified" != "true" ]; then
-                            local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
-                            local gid=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].group_id // empty")
-                            tg_notify_punish "$port" "$comment" "$current_mbps" "$dyn_trigger" "$dyn_punish_mbps" "$dyn_punish_time" "$gid"
-                            tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.punish_notified = true | .ports[\"$port\"].notify_state.recover_notified = false")
+                            _jq_acc="$_jq_acc | .ports[\"$port\"].notify_state.punish_notified = true | .ports[\"$port\"].notify_state.recover_notified = false"
+                            _notify_type="punish"
                         fi
                         rule_changed=true
                     else
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = $strike")
+                        _jq_acc="$_jq_acc | .ports[\"$port\"].dyn_limit.strike_count = $strike"
                     fi
                 else
-                    if [ "$strike" -gt 0 ]; then tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = 0"); fi
+                    if [ "$strike" -gt 0 ]; then _jq_acc="$_jq_acc | .ports[\"$port\"].dyn_limit.strike_count = 0"; fi
                 fi
             fi
             
             if [ "$rule_changed" == "true" ]; then
-                # DynQoS 触发需要立即生效限速，所以这里临时写入并 reload
+                # 刷新累积更新到 tmp_json，然后写盘生效
+                tmp_json=$(echo "$tmp_json" | jq "$_jq_acc")
+                _jq_acc="."
+                if [ -n "$_notify_type" ]; then
+                    local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
+                    local gid=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].group_id // empty")
+                    if [ "$_notify_type" == "recover" ]; then
+                        tg_notify_recover "$port" "$comment" "$gid"
+                    elif [ "$_notify_type" == "punish" ]; then
+                        tg_notify_punish "$port" "$comment" "$current_mbps" "$dyn_trigger" "$dyn_punish_mbps" "$dyn_punish_time" "$gid"
+                    fi
+                fi
                 local _tmp_dyn=$(mktemp)
                 printf '%s\n' "$tmp_json" > "$_tmp_dyn"
                 safe_write_config_from_file "$_tmp_dyn"
                 rm -f "$_tmp_dyn"
                 apply_port_rules "$port"
-                # 重新加载配置以继续后续循环 (虽然效率略低但安全)
                 tmp_json=$(cat "$CONFIG_FILE")
             fi
         fi
-    done
+    done <<< "$_p1_data"
+
+    # 刷新剩余的累积更新 (常规路径: 无 DynQoS 触发时, 所有更新在此一次性写入)
+    if [ "$_jq_acc" != "." ]; then
+        tmp_json=$(echo "$tmp_json" | jq "$_jq_acc")
+    fi
 
     # --- 阶段二：计算组流量 (Aggregation) ---
     declare -A group_usage
@@ -957,15 +971,21 @@ cron_task() {
     rm -f "$tmp_map_file"
 
     # --- 阶段三：执行策略 (Quota Check / Reset) ---
-    # [OPT-3c] 循环外一次性缓存 blocked_ports 集合 (N次nft+jq → 1次)
+    # [OPT-3c] 循环外一次性缓存 blocked_ports 集合
     local blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
-    # [OPT-3d] 循环外一次性读取阈值 (N次jq → 1次)
+    # [OPT-3d] 循环外一次性读取阈值
     local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
+    # [OPT-BATCH-R3] 循环外一次性读取所有端口的阶段三字段 (N次jq → 1次)
+    local _p3_data=$(echo "$tmp_json" | jq -r '
+        .ports | to_entries[] |
+        [.key, .value.quota_gb, .value.quota_mode, (.value.group_id // ""),
+         (.value.reset_day // 0), ((.value.last_reset_ts // 0)|floor),
+         (.value.notify_state.quota_level // 0),
+         ((.value.stats.acc_in // 0)|floor), ((.value.stats.acc_out // 0)|floor),
+         (.value.comment // "")] | @tsv')
 
-    for port in $ports; do
-        # [OPT-3a] 批量读取 8 个字段 (8次jq → 1次)
-        IFS=$'\t' read -r quota_gb mode gid reset_day last_reset_ts quota_level p3_acc_in p3_acc_out <<< \
-            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [.quota_gb, .quota_mode, (.group_id // \"\"), (.reset_day // 0), ((.last_reset_ts // 0)|floor), (.notify_state.quota_level // 0), ((.stats.acc_in // 0)|floor), ((.stats.acc_out // 0)|floor)] | @tsv")"
+    while IFS=$'\t' read -r port quota_gb mode gid reset_day last_reset_ts quota_level p3_acc_in p3_acc_out p3_comment; do
+        [ -z "$port" ] && continue
         
         # 确定用于判断的流量值
         local check_usage=0
@@ -1000,9 +1020,7 @@ cron_task() {
                 
                 nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
                 apply_port_rules "$port"
-                # 惰性读取 comment (仅通知时)
-                local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
-                tg_notify_reset "$port" "$comment" "$quota_gb" "$gid"
+                tg_notify_reset "$port" "$p3_comment" "$quota_gb" "$gid"
                 modified=true
                 
                 # 重置后，check_usage 应视为0 (虽然 group_usage 缓存还没更，但下分钟自会修正)
@@ -1046,16 +1064,15 @@ cron_task() {
 
             if (( new_level > quota_level )); then
                 local used_fmt=$(fmt_bytes_plain "$check_usage")
-                local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
-                tg_notify_quota "$port" "$comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
+                tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
                 if (( new_level >= 100 )); then
-                    tg_notify_blocked "$port" "$comment" "$quota_gb" "$reset_day" "$gid"
+                    tg_notify_blocked "$port" "$p3_comment" "$quota_gb" "$reset_day" "$gid"
                 fi
                 tmp_json=$(echo "$tmp_json" | jq --argjson lv "$new_level" ".ports[\"$port\"].notify_state.quota_level = \$lv")
                 modified=true
             fi
         fi
-    done
+    done <<< "$_p3_data"
 
     if [ "$modified" == "true" ]; then
         local _tmp_final=$(mktemp)
