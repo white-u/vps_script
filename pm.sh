@@ -855,7 +855,7 @@ cron_task() {
     for port in $ports; do
         # [OPT-1a] 批量读取 stats + dyn_enable (5次jq → 1次)
         IFS=$'\t' read -r acc_in acc_out last_k_in last_k_out dyn_enable <<< \
-            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [(.stats.acc_in//0)|floor, (.stats.acc_out//0)|floor, (.stats.last_kernel_in//0)|floor, (.stats.last_kernel_out//0)|floor, (.dyn_limit.enable//false)] | @tsv")"
+            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [((.stats.acc_in//0)|floor), ((.stats.acc_out//0)|floor), ((.stats.last_kernel_in//0)|floor), ((.stats.last_kernel_out//0)|floor), (.dyn_limit.enable//false)] | @tsv")"
 
         local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
