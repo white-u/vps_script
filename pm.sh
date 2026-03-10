@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.3.0 (Migration System)
+# 版本: v5.4.0 (IP Sentinel)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -13,10 +13,11 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+STATE_DIR="$CONFIG_DIR/state"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.3.0"
+SCRIPT_VERSION="5.4.0"
 # 配置结构版本号 (用于数据迁移)
-CURRENT_CONFIG_VERSION=1
+CURRENT_CONFIG_VERSION=3
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -50,6 +51,39 @@ trap _global_cleanup EXIT INT TERM
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
 strip_cr() { echo "${1//$'\r'/}"; }
 
+# --- 端口运行状态 读/写 (零 fork, bash 内置) ---
+# 所有运行时变量使用 s_ 前缀, 避免与其他变量冲突
+_init_port_state_defaults() {
+    s_acc_in=0; s_acc_out=0; s_last_k_in=0; s_last_k_out=0
+    s_last_reset_ts=0; s_strike=0; s_is_punished=false; s_punish_end_ts=0
+    s_quota_level=0; s_punish_notified=false; s_recover_notified=true
+    s_last_alert_ts=0; s_last_alert_ips=""
+}
+
+_load_port_state() {
+    _init_port_state_defaults
+    local sf="$STATE_DIR/${1}.txt"
+    [ -f "$sf" ] && . "$sf"
+}
+
+_save_port_state() {
+    cat > "$STATE_DIR/${1}.txt" << STATEEOF
+s_acc_in=$s_acc_in
+s_acc_out=$s_acc_out
+s_last_k_in=$s_last_k_in
+s_last_k_out=$s_last_k_out
+s_last_reset_ts=$s_last_reset_ts
+s_strike=$s_strike
+s_is_punished=$s_is_punished
+s_punish_end_ts=$s_punish_end_ts
+s_quota_level=$s_quota_level
+s_punish_notified=$s_punish_notified
+s_recover_notified=$s_recover_notified
+s_last_alert_ts=$s_last_alert_ts
+s_last_alert_ips=$s_last_alert_ips
+STATEEOF
+}
+
 # ==============================================================================
 # 1. 基础架构模块 (安装与环境)
 # ==============================================================================
@@ -64,7 +98,7 @@ check_root() {
 # 智能安装逻辑：兼容管道运行、Loader加载和本地运行
 install_shortcut() {
     # 如果是 Cron 模式，或者当前运行的程序路径($0)已经是安装目标，则跳过安装
-    [[ "$1" == "--monitor" ]] && return
+    [[ "$1" == "--monitor" || "$1" == "--ipl" ]] && return
     [[ "$0" == "$INSTALL_PATH" ]] && return
     
     # 增加逻辑：如果是被 source 加载的 (Loader 模式)，$0 也是 INSTALL_PATH，会自动跳过，无需额外改动
@@ -142,6 +176,7 @@ install_deps() {
     if [ ! -d "$CONFIG_DIR" ]; then
         mkdir -p "$CONFIG_DIR"
     fi
+    mkdir -p "$STATE_DIR"
     # 强制完整性检查：如果文件损坏或为空，重置它
     if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
         echo '{"node_id": "'"$(hostname 2>/dev/null || echo unknown)"'", "interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' > "$CONFIG_FILE"
@@ -202,9 +237,64 @@ migrate_config() {
     fi
     
     # 未来 v1 -> v2 可以继续追加:
-    # if [ "$file_ver" -lt 2 ]; then ... fi
+    if [ "$file_ver" -lt 2 ]; then
+        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v2)...${PLAIN}"
+        # 为所有端口补全 ip_limit 默认结构 (接入监控)
+        tmp_json=$(echo "$tmp_json" | jq '
+            .config_version = 2 |
+            .ports |= with_entries(
+                .value.ip_limit = (.value.ip_limit // {
+                    "enable": false,
+                    "max_ips": 3,
+                    "action": "alert",
+                    "cooldown_min": 30,
+                    "whitelist": [],
+                    "last_alert_ts": 0,
+                    "last_alert_ips": []
+                })
+            )
+        ')
+        modified=true
+    fi
 
-    # --- 写入磁盘 ---
+    # v2 -> v3: 运行状态分离至 state/*.txt (cron 零 jq 读写)
+    if [ "$file_ver" -lt 3 ]; then
+        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v3: 状态分离)...${PLAIN}"
+        mkdir -p "$STATE_DIR"
+        # 从 config.json 提取每个端口的运行状态写入 .txt
+        local _mig_ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
+        for _mp in $_mig_ports; do
+            local _sf="$STATE_DIR/${_mp}.txt"
+            [ -f "$_sf" ] && continue  # 已有则跳过
+            IFS=$'\t' read -r _ai _ao _ki _ko _lrt _sc _ip _pet _ql _pn _rn _lat _laips <<< \
+                "$(echo "$tmp_json" | jq -r ".ports[\"$_mp\"] | [
+                    ((.stats.acc_in//0)|floor), ((.stats.acc_out//0)|floor),
+                    ((.stats.last_kernel_in//0)|floor), ((.stats.last_kernel_out//0)|floor),
+                    ((.last_reset_ts//0)|floor),
+                    (.dyn_limit.strike_count//0), (.dyn_limit.is_punished//false), (.dyn_limit.punish_end_ts//0),
+                    (.notify_state.quota_level//0), (.notify_state.punish_notified//false), (.notify_state.recover_notified//true),
+                    (.ip_limit.last_alert_ts//0),
+                    ((.ip_limit.last_alert_ips//[]) | join(\",\"))
+                ] | @tsv")"
+            cat > "$_sf" << MEOF
+s_acc_in=${_ai:-0}
+s_acc_out=${_ao:-0}
+s_last_k_in=${_ki:-0}
+s_last_k_out=${_ko:-0}
+s_last_reset_ts=${_lrt:-0}
+s_strike=${_sc:-0}
+s_is_punished=${_ip:-false}
+s_punish_end_ts=${_pet:-0}
+s_quota_level=${_ql:-0}
+s_punish_notified=${_pn:-false}
+s_recover_notified=${_rn:-true}
+s_last_alert_ts=${_lat:-0}
+s_last_alert_ips=${_laips:-}
+MEOF
+        done
+        tmp_json=$(echo "$tmp_json" | jq '.config_version = 3')
+        modified=true
+    fi
     if [ "$modified" == "true" ]; then
         local tmp_file=$(mktemp)
         printf '%s\n' "$tmp_json" > "$tmp_file"
@@ -265,9 +355,9 @@ apply_port_rules() {
     local iface=$(jq -r '.interface' "$CONFIG_FILE")
     [ -z "$iface" ] && iface=$(get_iface)
     
-    # 检查惩罚状态，优先应用惩罚限速
-    local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
-    if [ "$is_punished" == "true" ]; then
+    # 检查惩罚状态，优先应用惩罚限速 (从 state 文件读取)
+    _load_port_state "$port"
+    if [ "$s_is_punished" == "true" ]; then
         limit_mbps=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps // 50')
     fi
 
@@ -493,17 +583,14 @@ tg_notify_report() {
         [ -z "$gid" ] && continue
         
         local mode=$(echo "$p_conf" | jq -r '.quota_mode')
-        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
+        _load_port_state "$port"
         local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
         
         local used=0
-        if [ "$mode" == "out_only" ]; then used=$acc_out; else used=$(echo "$acc_in + $acc_out" | bc); fi
+        if [ "$mode" == "out_only" ]; then used=$s_acc_out; else used=$((s_acc_in + s_acc_out)); fi
         
-        local exist=${group_usage_cache["$gid"]}
-        [ -z "$exist" ] && exist=0
-        group_usage_cache["$gid"]=$(echo "$exist + $used" | bc)
-        group_quota_cache["$gid"]=$quota_gb # 假设同组配额一致
+        group_usage_cache["$gid"]=$(( ${group_usage_cache["$gid"]:-0} + used ))
+        group_quota_cache["$gid"]=$quota_gb
     done
 
     for port in $ports; do
@@ -511,25 +598,22 @@ tg_notify_report() {
         local comment=$(echo "$p_conf" | jq -r '.comment // ""')
         local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
         local mode=$(echo "$p_conf" | jq -r '.quota_mode')
-        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
+        _load_port_state "$port"
         local limit=$(echo "$p_conf" | jq -r '.limit_mbps // 0')
-        local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
         local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
         
-        local total_used=0
         local display_used=0
         
         # 确定显示用的流量值
         if [ -n "$gid" ]; then
-            display_used=${group_usage_cache["$gid"]}
+            display_used=${group_usage_cache["$gid"]:-0}
             quota_gb=${group_quota_cache["$gid"]}
         else
-            if [ "$mode" == "out_only" ]; then display_used=$acc_out; else display_used=$(echo "$acc_in + $acc_out" | bc); fi
+            if [ "$mode" == "out_only" ]; then display_used=$s_acc_out; else display_used=$((s_acc_in + s_acc_out)); fi
         fi
         
         local used_fmt=$(fmt_bytes_plain "$display_used")
-        local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
+        local quota_bytes=$((quota_gb * 1073741824))
         local percent=0
         if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
             percent=$(echo "scale=1; $display_used * 100 / $quota_bytes" | bc 2>/dev/null)
@@ -539,7 +623,7 @@ tg_notify_report() {
         local status_icon="✅"
         local is_blocked=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)')
         if [ "$is_blocked" == "true" ]; then status_icon="🚫";
-        elif [ "$is_punished" == "true" ]; then status_icon="⚡";
+        elif [ "$s_is_punished" == "true" ]; then status_icon="⚡";
         elif [ $(echo "$percent >= 80" | bc 2>/dev/null) -eq 1 ] 2>/dev/null; then status_icon="⚠️"; fi
         
         local port_title="\`${port}\`"
@@ -550,7 +634,7 @@ tg_notify_report() {
         fi
         
         local speed_info=""
-        if [ "$is_punished" == "true" ]; then
+        if [ "$s_is_punished" == "true" ]; then
             local pun_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps // 0')
             speed_info=" ⚡${pun_mbps}M"
         elif [ "$limit" != "0" ] && [ -n "$limit" ]; then
@@ -585,6 +669,210 @@ push_to_worker() {
     curl -sf --max-time 10 -X PUT "${worker_url}" -H "Content-Type: application/json" -H "X-Node: ${node_key}" -H "X-Timestamp: ${timestamp}" -H "X-Signature: ${signature}" -d "$payload" >/dev/null 2>&1 &
 }
 
+# ==============================================================================
+# 2.6 接入监控引擎 (IP Sentinel)
+# ==============================================================================
+
+tg_notify_ip_alert() {
+    local port=$1 comment=$2 ip_count=$3 max_ips=$4 ip_details=$5 group_id=$6
+    local label=$(get_host_label "$comment" "$group_id")
+    tg_send "🚨 *异常接入警报*
+🏷 标识: *${label}*
+🔌 端口: \`${port}\`
+📊 状态: 🔴 *${ip_count}* 人在线 (阈值: ${max_ips})
+
+📋 接入详情:
+${ip_details}
+⚠️ 建议检查密码或重启服务
+⏱ $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+# 从 ss 输出中提取端口的独立对端 IP（去重、清洗 IPv4-mapped）
+_sentinel_scan_ips() {
+    local port=$1
+    ss -nt state established "( sport = :$port )" 2>/dev/null | \
+        grep -v 'Address:Port' | awk '{print $4}' | \
+        rev | cut -d: -f2- | rev | \
+        sed 's/^\[//;s/\]$//;s/^::ffff://' | \
+        grep -v '^$' | sort -u
+}
+
+# 阶段四入口: 遍历启用了 ip_limit 的端口执行检测
+check_ip_sentinel() {
+    local current_ts=$1
+    # [PERF] 一次性读取所有启用了 ip_limit 的端口配置
+    local _sentinel_cfg=$(jq -r '
+        .ports | to_entries[] | select(.value.ip_limit.enable == true) |
+        [.key, (.value.ip_limit.max_ips // 3), (.value.ip_limit.action // "alert"),
+         (.value.ip_limit.cooldown_min // 30), (.value.comment // ""),
+         (.value.group_id // "")] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$_sentinel_cfg" ] && return
+
+    # 白名单需要单独读 (数组字段无法 @tsv)
+    local _s_json=$(cat "$CONFIG_FILE")
+
+    while IFS=$'\t' read -r port max_ips action cooldown_min comment gid; do
+        [ -z "$port" ] && continue
+
+        # --- 扫描 ---
+        local raw_ips=$(_sentinel_scan_ips "$port")
+        [ -z "$raw_ips" ] && continue
+
+        # --- 过滤白名单 ---
+        local wl_json=$(echo "$_s_json" | jq -r ".ports[\"$port\"].ip_limit.whitelist // [] | .[]" 2>/dev/null)
+        local filtered=""
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            local skip=false
+            if [ -n "$wl_json" ]; then
+                while IFS= read -r w; do
+                    [ "$ip" = "$w" ] && { skip=true; break; }
+                done <<< "$wl_json"
+            fi
+            [ "$skip" = "false" ] && filtered+="${ip}"$'\n'
+        done <<< "$raw_ips"
+        filtered=$(echo "$filtered" | grep -v '^$')
+        local ip_count=$(echo "$filtered" | grep -cve '^\s*$')
+        [ "$ip_count" -le "$max_ips" ] && continue
+
+        # --- 冷却: 从 state 文件读取, 有新 IP 则强制报警 ---
+        _load_port_state "$port"
+        local has_new=false
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            if [ -z "$s_last_alert_ips" ] || [[ ",$s_last_alert_ips," != *",$ip,"* ]]; then
+                has_new=true; break
+            fi
+        done <<< "$filtered"
+        if [ "$has_new" = "false" ] && [ $((current_ts - s_last_alert_ts)) -lt $((cooldown_min * 60)) ]; then
+            continue
+        fi
+
+        # --- 归属地查询 (降级容错) ---
+        local details="" idx=1
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            local geo=""
+            geo=$(curl -sf --max-time 3 "http://ip-api.com/line/${ip}?fields=country,regionName,isp&lang=zh-CN" 2>/dev/null | tr '\n' ', ' | sed 's/, *$//')
+            [ -z "$geo" ] && geo="(查询失败)"
+            geo=$(echo "$geo" | sed 's/[_*`\[]/\\&/g')
+            details+="${idx}. \`${ip}\` - ${geo}"$'\n'
+            idx=$((idx + 1))
+            [ "$idx" -gt 15 ] && { details+="... 仅显示前 15 条"$'\n'; break; }
+        done <<< "$filtered"
+
+        # --- 通知 ---
+        tg_notify_ip_alert "$port" "$comment" "$ip_count" "$max_ips" "$details" "$gid"
+
+        # --- 自动阻断 (可选, 保留连接数最多的前 N 个 IP) ---
+        if [ "$action" = "block" ]; then
+            local ranked=$(ss -nt state established "( sport = :$port )" 2>/dev/null | \
+                grep -v 'Address:Port' | awk '{print $4}' | \
+                rev | cut -d: -f2- | rev | \
+                sed 's/^\[//;s/\]$//;s/^::ffff://' | \
+                grep -v '^$' | sort | uniq -c | sort -rn)
+            local kept=0
+            while read -r cnt kip; do
+                [ -z "$kip" ] && continue
+                local in_wl=false
+                if [ -n "$wl_json" ]; then
+                    while IFS= read -r w; do [ "$kip" = "$w" ] && { in_wl=true; break; }; done <<< "$wl_json"
+                fi
+                [ "$in_wl" = "true" ] && continue
+                kept=$((kept + 1))
+                [ "$kept" -gt "$max_ips" ] && ss -K dst "$kip" sport = ":$port" 2>/dev/null
+            done <<< "$ranked"
+        fi
+
+        # --- 更新状态至 .txt ---
+        s_last_alert_ts=$current_ts
+        s_last_alert_ips=$(echo "$filtered" | tr '\n' ',' | sed 's/,$//')
+        _save_port_state "$port"
+    done <<< "$_sentinel_cfg"
+}
+
+configure_ip_sentinel() {
+    local port=$1
+    while true; do
+        local conf=$(jq ".ports[\"$port\"].ip_limit // {}" "$CONFIG_FILE")
+        local ip_en=$(echo "$conf" | jq -r '.enable // false')
+        local ip_max=$(echo "$conf" | jq -r '.max_ips // 3')
+        local ip_act=$(echo "$conf" | jq -r '.action // "alert"')
+        local ip_cd=$(echo "$conf" | jq -r '.cooldown_min // 30')
+        local ip_wl=$(echo "$conf" | jq -r '.whitelist // [] | join(", ")')
+        [ -z "$ip_wl" ] && ip_wl="(空)"
+
+        local act_str="仅报警"
+        [ "$ip_act" = "block" ] && act_str="${RED}自动阻断${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e " 接入监控 (IP Sentinel) - 端口 $port"
+        echo -e "========================================"
+        echo -e " 状态:     $([ "$ip_en" = "true" ] && echo "${GREEN}已启用${PLAIN}" || echo "${YELLOW}未启用${PLAIN}")"
+        echo -e " 最大人数: $ip_max"
+        echo -e " 处理策略: $act_str"
+        echo -e " 冷却时间: ${ip_cd} 分钟"
+        echo -e " 白名单:   $ip_wl"
+        echo -e "========================================"
+        echo -e " 1. 启用/禁用"
+        echo -e " 2. 设置 最大人数"
+        echo -e " 3. 设置 处理策略"
+        echo -e " 4. 设置 冷却时间"
+        echo -e " 5. 管理 白名单"
+        echo -e " 0. 返回"
+        echo -e "========================================"
+        read -p "> " sc; sc=$(strip_cr "$sc")
+        local tmp=$(mktemp)
+
+        case $sc in
+            1)  local nv="true"; [ "$ip_en" = "true" ] && nv="false"
+                jq --argjson v "$nv" --arg p "$port" '.ports[$p].ip_limit.enable = $v' \
+                    "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" = "true" ] && echo "启用" || echo "禁用")。${PLAIN}"; sleep 0.5 ;;
+            2)  read -p "最大允许独立 IP 数: " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ]; then
+                    jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.max_ips = $v' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                else echo -e "${RED}无效输入。${PLAIN}"; sleep 1; fi ;;
+            3)  echo -e "1. 仅报警 (alert)  2. 自动阻断 (block)"
+                read -p "> " am; am=$(strip_cr "$am")
+                local nact="alert"; [ "$am" = "2" ] && nact="block"
+                jq --arg v "$nact" --arg p "$port" '.ports[$p].ip_limit.action = $v' \
+                    "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                if [ "$nact" = "block" ]; then
+                    echo -e "${YELLOW}注意: 自动阻断会切断多余 IP 的连接，存在误杀风险。${PLAIN}"
+                    echo -e "${YELLOW}建议先以「仅报警」模式运行一段时间再决定。${PLAIN}"
+                fi
+                echo -e "${GREEN}已更新。${PLAIN}"; sleep 1 ;;
+            4)  read -p "冷却时间 (分钟, IP 不变时抑制重复报警): " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ]; then
+                    jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.cooldown_min = $v' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                else echo -e "${RED}无效输入。${PLAIN}"; sleep 1; fi ;;
+            5)  echo -e "\n当前白名单: $ip_wl"
+                echo -e " 1. 添加 IP  2. 清空白名单  0. 返回"
+                read -p "> " wc; wc=$(strip_cr "$wc")
+                if [ "$wc" = "1" ]; then
+                    read -p "输入 IP 地址 (支持 IPv4/IPv6): " wip; wip=$(strip_cr "$wip")
+                    if [ -n "$wip" ]; then
+                        jq --arg ip "$wip" --arg p "$port" '.ports[$p].ip_limit.whitelist += [$ip] | .ports[$p].ip_limit.whitelist |= unique' \
+                            "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                        echo -e "${GREEN}已添加。${PLAIN}"; sleep 0.5
+                    fi
+                elif [ "$wc" = "2" ]; then
+                    jq --arg p "$port" '.ports[$p].ip_limit.whitelist = []' \
+                        "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已清空。${PLAIN}"; sleep 0.5
+                fi ;;
+            0)  rm -f "$tmp"; break ;;
+        esac
+        rm -f "$tmp"
+    done
+}
+
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 
 cron_task() {
@@ -606,221 +894,197 @@ cron_task() {
 
     local tmp_json=$(cat "$CONFIG_FILE")
     local ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
-    local modified=false
     local current_ts=$(date +%s)
 
     # --- 阶段一：采集数据 + DynQoS (Port Level) ---
-    for port in $ports; do
-        local p_conf=$(echo "$tmp_json" | jq ".ports[\"$port\"]")
-        
-        # 数据采集 (逻辑不变)
-        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
-        local last_k_in=$(echo "$p_conf" | jq -r '(.stats.last_kernel_in // 0) | floor')
-        local last_k_out=$(echo "$p_conf" | jq -r '(.stats.last_kernel_out // 0) | floor')
+    # [PERF] 一次性读取全部 nft 计数器 (零循环内 nft 调用)
+    declare -A _ctr_cache
+    while IFS=$'\t' read -r _cn _cb; do
+        [ -n "$_cn" ] && _ctr_cache["$_cn"]=$_cb
+    done <<< "$(nft -j list counters table $NFT_TABLE 2>/dev/null | jq -r '
+        [.nftables[] | select(.counter) | .counter] | .[] | "\(.name)\t\(.bytes)"')"
 
-        local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-        local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-        [ -z "$curr_k_in" ] && curr_k_in=0
-        [ -z "$curr_k_out" ] && curr_k_out=0
+    # [PERF] 一次性读取所有端口的 DynQoS 配置 (仅静态配置字段)
+    local _dyn_cfg_data=$(echo "$tmp_json" | jq -r '
+        .ports | to_entries[] | select(.value.dyn_limit.enable == true) |
+        [.key, .value.dyn_limit.trigger_mbps, .value.dyn_limit.trigger_time,
+         .value.dyn_limit.punish_time, .value.dyn_limit.punish_mbps,
+         (.value.comment // ""), (.value.group_id // "")] | @tsv')
+
+    # 构建 DynQoS 配置查找表 (避免循环内 jq)
+    declare -A _dyn_trigger _dyn_trig_time _dyn_punish_time _dyn_punish_mbps _dyn_comment _dyn_gid
+    while IFS=$'\t' read -r _dp _dt _dtt _dpt _dpm _dc _dg; do
+        [ -z "$_dp" ] && continue
+        _dyn_trigger["$_dp"]=$_dt; _dyn_trig_time["$_dp"]=$_dtt
+        _dyn_punish_time["$_dp"]=$_dpt; _dyn_punish_mbps["$_dp"]=$_dpm
+        _dyn_comment["$_dp"]=$_dc; _dyn_gid["$_dp"]=$_dg
+    done <<< "$_dyn_cfg_data"
+
+    for port in $ports; do
+        _load_port_state "$port"
+
+        local curr_k_in=${_ctr_cache["cnt_in_${port}"]:-0}
+        local curr_k_out=${_ctr_cache["cnt_out_${port}"]:-0}
 
         local delta_in=0
-        if [ $(echo "scale=0; $curr_k_in < $last_k_in" | bc) -eq 1 ]; then delta_in=$curr_k_in; else delta_in=$(echo "scale=0; $curr_k_in - $last_k_in" | bc); fi
+        if (( curr_k_in < s_last_k_in )); then delta_in=$curr_k_in; else delta_in=$((curr_k_in - s_last_k_in)); fi
         local delta_out=0
-        if [ $(echo "scale=0; $curr_k_out < $last_k_out" | bc) -eq 1 ]; then delta_out=$curr_k_out; else delta_out=$(echo "scale=0; $curr_k_out - $last_k_out" | bc); fi
-        
-        acc_in=$(echo "scale=0; $acc_in + $delta_in" | bc)
-        acc_out=$(echo "scale=0; $acc_out + $delta_out" | bc)
+        if (( curr_k_out < s_last_k_out )); then delta_out=$curr_k_out; else delta_out=$((curr_k_out - s_last_k_out)); fi
 
-        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
-        modified=true
+        s_acc_in=$((s_acc_in + delta_in))
+        s_acc_out=$((s_acc_out + delta_out))
+        s_last_k_in=$curr_k_in
+        s_last_k_out=$curr_k_out
 
-        # DynQoS 必须在这里做，因为它依赖 delta_in/delta_out (即实时速率)
-        local dyn_enable=$(echo "$p_conf" | jq -r '.dyn_limit.enable // false')
-        if [ "$dyn_enable" == "true" ]; then
-            local dyn_trigger=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_mbps')
-            local dyn_trig_time=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_time')
-            local dyn_punish_time=$(echo "$p_conf" | jq -r '.dyn_limit.punish_time')
-            local dyn_punish_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps')
-            local strike=$(echo "$p_conf" | jq -r '.dyn_limit.strike_count // 0')
-            local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
-            local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
-            local comment=$(echo "$p_conf" | jq -r '.comment // ""')
-            local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
-
+        # DynQoS (仅已启用的端口有查找表条目)
+        if [ -n "${_dyn_trigger[$port]+x}" ]; then
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1000000" | bc)
             local rule_changed=false
-            local punish_notified=$(echo "$p_conf" | jq -r '.notify_state.punish_notified // false')
-            local recover_notified=$(echo "$p_conf" | jq -r '.notify_state.recover_notified // true')
 
-            if [ "$is_punished" == "true" ]; then
-                if [ "$current_ts" -ge "$end_ts" ]; then
-                    is_punished="false"; strike=0
-                    tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0")
-                    if [ "$recover_notified" != "true" ]; then
-                        tg_notify_recover "$port" "$comment" "$gid"
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.recover_notified = true | .ports[\"$port\"].notify_state.punish_notified = false")
+            if [ "$s_is_punished" == "true" ]; then
+                if (( current_ts >= s_punish_end_ts )); then
+                    s_is_punished=false; s_strike=0
+                    if [ "$s_recover_notified" != "true" ]; then
+                        s_recover_notified=true; s_punish_notified=false
+                        tg_notify_recover "$port" "${_dyn_comment[$port]}" "${_dyn_gid[$port]}"
                     fi
                     rule_changed=true
                 fi
             else
-                if [ $(echo "$current_mbps > $dyn_trigger" | bc) -eq 1 ]; then
-                    strike=$((strike + 1))
-                    if [ "$strike" -ge "$dyn_trig_time" ]; then
-                        is_punished="true"
-                        end_ts=$((current_ts + dyn_punish_time * 60))
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
-                        if [ "$punish_notified" != "true" ]; then
-                            tg_notify_punish "$port" "$comment" "$current_mbps" "$dyn_trigger" "$dyn_punish_mbps" "$dyn_punish_time" "$gid"
-                            tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.punish_notified = true | .ports[\"$port\"].notify_state.recover_notified = false")
+                if [ $(echo "$current_mbps > ${_dyn_trigger[$port]}" | bc) -eq 1 ]; then
+                    s_strike=$((s_strike + 1))
+                    if (( s_strike >= ${_dyn_trig_time[$port]} )); then
+                        s_is_punished=true
+                        s_punish_end_ts=$((current_ts + ${_dyn_punish_time[$port]} * 60))
+                        if [ "$s_punish_notified" != "true" ]; then
+                            s_punish_notified=true; s_recover_notified=false
+                            tg_notify_punish "$port" "${_dyn_comment[$port]}" "$current_mbps" "${_dyn_trigger[$port]}" "${_dyn_punish_mbps[$port]}" "${_dyn_punish_time[$port]}" "${_dyn_gid[$port]}"
                         fi
                         rule_changed=true
-                    else
-                        tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = $strike")
                     fi
                 else
-                    if [ "$strike" -gt 0 ]; then tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.strike_count = 0"); fi
+                    (( s_strike > 0 )) && s_strike=0
                 fi
             fi
-            
+
             if [ "$rule_changed" == "true" ]; then
-                # DynQoS 触发需要立即生效限速，所以这里临时写入并 reload
-                local _tmp_dyn=$(mktemp)
-                printf '%s\n' "$tmp_json" > "$_tmp_dyn"
-                safe_write_config_from_file "$_tmp_dyn"
-                rm -f "$_tmp_dyn"
+                _save_port_state "$port"
                 apply_port_rules "$port"
-                # 重新加载配置以继续后续循环 (虽然效率略低但安全)
-                tmp_json=$(cat "$CONFIG_FILE")
             fi
         fi
+
+        _save_port_state "$port"
     done
 
     # --- 阶段二：计算组流量 (Aggregation) ---
+    # [PERF] 一次性读取 group_id + quota_mode (静态配置)
     declare -A group_usage
-    # 重新遍历 JSON 数据 (因为 acc_in 等已更新)
-    # 使用临时文件传递数据，避开子Shell陷阱
-    local tmp_map_file=$(mktemp)
-    
-    echo "$tmp_json" | jq -c '.ports | to_entries[]' | while IFS= read -r entry; do
-        local gid=$(echo "$entry" | jq -r '.value.group_id // empty')
-        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
-            local mode=$(echo "$entry" | jq -r '.value.quota_mode')
-            local p_in=$(echo "$entry" | jq -r '(.value.stats.acc_in // 0) | floor')
-            local p_out=$(echo "$entry" | jq -r '(.value.stats.acc_out // 0) | floor')
-            local p_total=0
-            if [ "$mode" == "out_only" ]; then p_total=$p_out; else p_total=$(echo "$p_in + $p_out" | bc); fi
-            echo "$gid $p_total" >> "$tmp_map_file"
-        fi
-    done
-    
-    if [ -f "$tmp_map_file" ]; then
-        while read -r g_id g_bytes; do
-            local exist=${group_usage["$g_id"]}
-            [ -z "$exist" ] && exist=0
-            group_usage["$g_id"]=$(echo "$exist + $g_bytes" | bc)
-        done < "$tmp_map_file"
-        rm -f "$tmp_map_file"
-    fi
+    local _grp_cfg=$(echo "$tmp_json" | jq -r '
+        .ports | to_entries[] |
+        select(.value.group_id != null and .value.group_id != "" and .value.group_id != "null") |
+        "\(.key)\t\(.value.group_id)\t\(.value.quota_mode)"')
+
+    while IFS=$'\t' read -r _gp _gid _gmode; do
+        [ -z "$_gp" ] && continue
+        _load_port_state "$_gp"
+        local _gu=0
+        if [ "$_gmode" == "out_only" ]; then _gu=$s_acc_out; else _gu=$((s_acc_in + s_acc_out)); fi
+        group_usage["$_gid"]=$(( ${group_usage["$_gid"]:-0} + _gu ))
+    done <<< "$_grp_cfg"
 
     # --- 阶段三：执行策略 (Quota Check / Reset) ---
-    for port in $ports; do
-        local p_conf=$(echo "$tmp_json" | jq ".ports[\"$port\"]")
-        local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
-        local mode=$(echo "$p_conf" | jq -r '.quota_mode')
-        local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
-        local comment=$(echo "$p_conf" | jq -r '.comment // ""')
-        
+    # [PERF] 循环外缓存
+    local blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
+    local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
+    # [PERF] 一次性读取所有端口的静态配置
+    local _p3_cfg=$(echo "$tmp_json" | jq -r '
+        .ports | to_entries[] |
+        [.key, .value.quota_gb, .value.quota_mode, (.value.group_id // ""),
+         (.value.reset_day // 0), (.value.comment // "")] | @tsv')
+
+    while IFS=$'\t' read -r port quota_gb mode gid reset_day p3_comment; do
+        [ -z "$port" ] && continue
+        _load_port_state "$port"
+
         # 确定用于判断的流量值
         local check_usage=0
         if [ -n "$gid" ] && [ "$gid" != "null" ]; then
-            check_usage=${group_usage["$gid"]}
-            [ -z "$check_usage" ] && check_usage=0
+            check_usage=${group_usage["$gid"]:-0}
         else
-            # 独立端口
-            local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-            local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
-            if [ "$mode" == "out_only" ]; then check_usage=$acc_out; else check_usage=$(echo "$acc_in + $acc_out" | bc); fi
+            if [ "$mode" == "out_only" ]; then check_usage=$s_acc_out; else check_usage=$((s_acc_in + s_acc_out)); fi
         fi
 
-        # 自动重置判断 (同组端口分别判断，避免时区/设置差异导致不同步，通常应保持一致)
-        local reset_day=$(echo "$p_conf" | jq -r '.reset_day // 0')
+        # 自动重置判断
         if [ "$reset_day" -gt 0 ] 2>/dev/null && [ "$reset_day" -le 31 ] 2>/dev/null; then
-            local last_reset_ts=$(echo "$p_conf" | jq -r '(.last_reset_ts // 0) | floor')
             local days_in_month=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%-d 2>/dev/null)
             [ -z "$days_in_month" ] && days_in_month=28
             local effective_day=$reset_day
             [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
             local reset_date=$(printf "%s-%02d 00:00:00" "$(date +%Y-%m)" "$effective_day")
             local reset_ts=$(date -d "$reset_date" +%s 2>/dev/null || echo 0)
-            
-            if [ "$current_ts" -ge "$reset_ts" ] && [ "$last_reset_ts" -lt "$reset_ts" ]; then
-                # 重置
-                local ki=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-                local ko=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-                
-                tmp_json=$(echo "$tmp_json" | jq \
-                    --arg p "$port" --argjson ts "$current_ts" --argjson ki "$ki" --argjson ko "$ko" \
-                    '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 
-                     | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko 
-                     | .ports[$p].last_reset_ts = $ts
-                     | .ports[$p].dyn_limit.is_punished = false | .ports[$p].dyn_limit.strike_count = 0
-                     | .ports[$p].notify_state.quota_level = 0 | .ports[$p].notify_state.punish_notified = false | .ports[$p].notify_state.recover_notified = true')
-                
+
+            if [ "$current_ts" -ge "$reset_ts" ] && [ "$s_last_reset_ts" -lt "$reset_ts" ]; then
+                # 重置: 清零流量, 记录当前内核计数器作为新基准
+                s_acc_in=0; s_acc_out=0
+                s_last_k_in=${_ctr_cache["cnt_in_${port}"]:-0}
+                s_last_k_out=${_ctr_cache["cnt_out_${port}"]:-0}
+                s_last_reset_ts=$current_ts
+                s_is_punished=false; s_strike=0
+                s_quota_level=0; s_punish_notified=false; s_recover_notified=true
+                _save_port_state "$port"
+
                 nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
                 apply_port_rules "$port"
-                tg_notify_reset "$port" "$comment" "$quota_gb" "$gid"
-                modified=true
-                
-                # 重置后，check_usage 应视为0 (虽然 group_usage 缓存还没更，但下分钟自会修正)
-                check_usage=0 
+                tg_notify_reset "$port" "$p3_comment" "$quota_gb" "$gid"
+
+                check_usage=0
+                blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
             fi
         fi
 
         # 配额封禁检查
-        local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
-        local is_blocked_nft=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)')
+        local quota_bytes=$((quota_gb * 1073741824))
+        local is_blocked_nft=false
+        [[ "$blocked_ports_str" == *" $port "* ]] && is_blocked_nft=true
 
-        if (( $(echo "$check_usage > $quota_bytes" | bc -l) )); then
-            [ "$is_blocked_nft" == "false" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
+        if (( check_usage > quota_bytes )); then
+            if [ "$is_blocked_nft" == "false" ]; then
+                nft add element $NFT_TABLE blocked_ports \{ $port \}
+                blocked_ports_str="${blocked_ports_str}${port} "
+            fi
         else
-            [ "$is_blocked_nft" == "true" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \}
+            if [ "$is_blocked_nft" == "true" ]; then
+                nft delete element $NFT_TABLE blocked_ports \{ $port \}
+                blocked_ports_str="${blocked_ports_str/ $port / }"
+            fi
         fi
 
         # 阈值通知
-        local quota_level=$(echo "$p_conf" | jq -r '.notify_state.quota_level // 0')
-        local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
-        
         if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
             local percent=$(echo "scale=1; $check_usage * 100 / $quota_bytes" | bc 2>/dev/null)
             [ -z "$percent" ] && percent=0
-            local used_fmt=$(fmt_bytes_plain "$check_usage")
-            
-            local new_level=$quota_level
+            local percent_int=${percent%.*}
+            [ -z "$percent_int" ] && percent_int=0
+
+            local new_level=$s_quota_level
             for thr in $(echo "$thresholds" | sort -rn); do
                 [ -z "$thr" ] && continue
-                if (( $(echo "$percent >= $thr" | bc -l) )) && [ "$quota_level" -lt "$thr" ]; then
+                if (( percent_int >= thr )) && (( s_quota_level < thr )); then
                     new_level=$thr; break
                 fi
             done
 
-            if [ "$new_level" -gt "$quota_level" ]; then
-                tg_notify_quota "$port" "$comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
-                if [ "$new_level" -ge 100 ]; then
-                    tg_notify_blocked "$port" "$comment" "$quota_gb" "$reset_day" "$gid"
+            if (( new_level > s_quota_level )); then
+                local used_fmt=$(fmt_bytes_plain "$check_usage")
+                tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
+                if (( new_level >= 100 )); then
+                    tg_notify_blocked "$port" "$p3_comment" "$quota_gb" "$reset_day" "$gid"
                 fi
-                tmp_json=$(echo "$tmp_json" | jq --argjson lv "$new_level" ".ports[\"$port\"].notify_state.quota_level = \$lv")
-                modified=true
+                s_quota_level=$new_level
+                _save_port_state "$port"
             fi
         fi
-    done
-
-    if [ "$modified" == "true" ]; then
-        local _tmp_final=$(mktemp)
-        printf '%s\n' "$tmp_json" > "$_tmp_final"
-        safe_write_config_from_file "$_tmp_final"
-        rm -f "$_tmp_final"
-    fi
+    done <<< "$_p3_cfg"
 
     # 周期报告 & 推送 (不变)
     local report_hours=$(jq -r '.telegram.report_interval_hours // 0' "$CONFIG_FILE" 2>/dev/null)
@@ -834,6 +1098,10 @@ cron_task() {
             rm -f "$_tmp_rpt"
         fi
     fi
+
+    # --- 阶段四: 接入 IP 监控 (Sentinel) ---
+    check_ip_sentinel "$current_ts"
+
     push_to_worker
 }
 
@@ -890,16 +1158,16 @@ show_main_menu() {
         local quota=$(echo "$conf" | jq -r '.quota_gb')
         local gid=$(echo "$conf" | jq -r '.group_id // empty')
         
-        local acc_in=$(echo "$conf" | jq -r '(.stats.acc_in // 0) | floor')
-        local acc_out=$(echo "$conf" | jq -r '(.stats.acc_out // 0) | floor')
+        # 从 state 文件读取运行数据
+        _load_port_state "$port"
         
         local mode_str="[双向]"
         local total_used=0
         if [ "$mode" == "out_only" ]; then
             mode_str="[仅出站]"
-            total_used=$acc_out
+            total_used=$s_acc_out
         else
-            total_used=$(echo "scale=0; $acc_in + $acc_out" | bc)
+            total_used=$((s_acc_in + s_acc_out))
         fi
         
         local status_clean=""
@@ -912,13 +1180,12 @@ show_main_menu() {
             status_clean="$(fmt_bytes $total_used)"
         fi
         
-        local is_punished=$(echo "$conf" | jq -r '.dyn_limit.is_punished // false')
         local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
         local quota_str="${status_clean} / ${quota} GB"
         if [ "$reset_day" -gt 0 ] 2>/dev/null; then quota_str="${quota_str} [R${reset_day}]"; fi
         
         local limit_str=""
-        if [ "$is_punished" == "true" ]; then
+        if [ "$s_is_punished" == "true" ]; then
             local punish_val=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps')
             limit_str="${RED}${punish_val}Mbps(惩罚中)${PLAIN}"
         else
@@ -1070,10 +1337,15 @@ add_port_flow() {
         "group_id": "",
         "stats": {"acc_in": 0, "acc_out": 0, "last_kernel_in": 0, "last_kernel_out": 0},
         "dyn_limit": {"enable": false},
-        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true}
+        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true},
+        "ip_limit": {"enable": false, "max_ips": 3, "action": "alert", "cooldown_min": 30, "whitelist": [], "last_alert_ts": 0, "last_alert_ips": []}
     }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
         rm -f "$tmp"
         apply_port_rules "$target_port"
+        # 创建初始 state 文件
+        _init_port_state_defaults
+        s_last_reset_ts=$(date +%s)
+        _save_port_state "$target_port"
         echo -e "${GREEN}添加成功!${PLAIN}"; sleep 1; return
     else
         rm -f "$tmp"
@@ -1121,6 +1393,7 @@ config_port_menu() {
         echo -e " 6. 重置 统计数据 (清零)"
         echo -e " 7. 修改 自动重置日"
         echo -e " 8. 设置/修改 分组 ID (Group)"
+        echo -e " 9. 接入监控 (IP Sentinel)"
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " sub_choice
@@ -1177,12 +1450,11 @@ config_port_menu() {
                 if [[ "$confirm" == "y" ]]; then
                    local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
                    local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-                   if jq --argjson ki "$k_in" --argjson ko "$k_out" --arg p "$port" \
-                      '.ports[$p].stats.acc_in = 0 | .ports[$p].stats.acc_out = 0 | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko | .ports[$p].notify_state.quota_level = 0' \
-                      "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
-                       nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
-                       echo -e "${GREEN}已重置。${PLAIN}"; sleep 1
-                   fi
+                   _load_port_state "$port"
+                   s_acc_in=0; s_acc_out=0; s_last_k_in=$k_in; s_last_k_out=$k_out; s_quota_level=0
+                   _save_port_state "$port"
+                   nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
+                   echo -e "${GREEN}已重置。${PLAIN}"; sleep 1
                 fi 
                 ;;
             7) 
@@ -1210,8 +1482,9 @@ config_port_menu() {
             8)
                 # [优化] 自动列出已有分组供选择
                 echo -e "\n--- 设置分组 (Group) ---"
-                local existing_groups=$(jq -r '.ports[] | select(.group_id != null and .group_id != "") | "\(.group_id)|\(.quota_gb)"' "$CONFIG_FILE" | sort -u)
+                local existing_groups=$(jq -r '.ports | to_entries[] | select(.value.group_id != null and .value.group_id != "") | "\(.value.group_id)|\(.value.quota_gb)"' "$CONFIG_FILE" | sort -t'|' -k1,1 -u)
                 declare -A group_map
+                group_map=()
                 local g_idx=1
                 
                 if [ -n "$existing_groups" ]; then
@@ -1275,6 +1548,7 @@ config_port_menu() {
                     echo -e "${RED}写入失败。${PLAIN}"
                 fi
                 ;;
+            9) rm -f "$tmp"; configure_ip_sentinel "$port" ;;
             0) rm -f "$tmp"; break ;;
         esac
         
@@ -1283,31 +1557,179 @@ config_port_menu() {
     done
 }
 
-# (省略 configure_dyn_qos, configure_telegram, configure_push 等未变更函数，保持原样)
-# 为保持脚本完整性，以下是这些辅助函数的紧凑版 (实际应包含完整代码)
+# ==============================================================================
+# 4.5 辅助配置函数
+# ==============================================================================
 
 configure_dyn_qos() {
-    local port=$1; local tmp=$(mktemp)
-    echo -e "\n1.启用 2.禁用 0.取消"; read -p "> " s; s=$(strip_cr "$s")
+    local port=$1
+    local conf=$(jq ".ports[\"$port\"].dyn_limit // {}" "$CONFIG_FILE")
+    local d_en=$(echo "$conf" | jq -r '.enable // false')
+    local d_trigger=$(echo "$conf" | jq -r '.trigger_mbps // "-"')
+    local d_trig_t=$(echo "$conf" | jq -r '.trigger_time // "-"')
+    local d_pun_m=$(echo "$conf" | jq -r '.punish_mbps // "-"')
+    local d_pun_t=$(echo "$conf" | jq -r '.punish_time // "-"')
+    local d_punished=$(echo "$conf" | jq -r '.is_punished // false')
+
+    echo -e "\n========================================"
+    echo -e " 动态突发限制 (QoS) - 端口 $port"
+    echo -e "========================================"
+    echo -e " 状态:     $([ "$d_en" == "true" ] && echo "${GREEN}已启用${PLAIN}" || echo "${YELLOW}未启用${PLAIN}")"
+    if [ "$d_en" == "true" ]; then
+        echo -e " 触发阈值: ${d_trigger} Mbps"
+        echo -e " 触发时长: ${d_trig_t} 分钟"
+        echo -e " 惩罚限速: ${d_pun_m} Mbps"
+        echo -e " 惩罚时长: ${d_pun_t} 分钟"
+        echo -e " 惩罚中:   $([ "$d_punished" == "true" ] && echo "${RED}是${PLAIN}" || echo "否")"
+    fi
+    echo -e "========================================"
+    echo -e " 1. 启用 (配置参数)"
+    echo -e " 2. 禁用"
+    echo -e " 0. 取消"
+    echo -e "========================================"
+    read -p "> " s; s=$(strip_cr "$s")
+    local tmp=$(mktemp)
+
     if [ "$s" == "2" ]; then
-        if jq --arg p "$port" '.ports[$p].dyn_limit.enable=false|.ports[$p].dyn_limit.is_punished=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then apply_port_rules "$port"; fi
+        if jq --arg p "$port" '.ports[$p].dyn_limit.enable=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+            # 同步清除 state 中的惩罚状态
+            _load_port_state "$port"
+            s_is_punished=false; s_strike=0; s_punish_end_ts=0
+            _save_port_state "$port"
+            apply_port_rules "$port"
+            echo -e "${GREEN}已禁用动态限速。${PLAIN}"; sleep 0.5
+        fi
     elif [ "$s" == "1" ]; then
-        read -p "阈值(Mbps): " tm; read -p "触发时长(分): " tt; read -p "惩罚(Mbps): " pm; read -p "惩罚时长(分): " pt
-        jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
-        '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+        read -p "触发阈值 (Mbps, 超过此速率开始计数): " tm; tm=$(strip_cr "$tm")
+        read -p "触发时长 (分钟, 连续超标多久触发惩罚): " tt; tt=$(strip_cr "$tt")
+        read -p "惩罚限速 (Mbps, 触发后降速到): " pm; pm=$(strip_cr "$pm")
+        read -p "惩罚时长 (分钟, 降速持续多久): " pt; pt=$(strip_cr "$pt")
+        if [[ "$tm" =~ ^[0-9]+$ ]] && [[ "$tt" =~ ^[0-9]+$ ]] && [[ "$pm" =~ ^[0-9]+$ ]] && [[ "$pt" =~ ^[0-9]+$ ]]; then
+            if jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
+                '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' \
+                "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                echo -e "${GREEN}动态限速已启用。${PLAIN}"; sleep 0.5
+            fi
+        else
+            echo -e "${RED}错误: 所有参数必须为纯整数!${PLAIN}"; sleep 1
+        fi
     fi
     rm -f "$tmp"
 }
 
 configure_telegram() {
     while true; do
-        clear; echo "Telegram Config"; echo "1.Token 2.ChatID 3.Test 4.On/Off 0.Back"
-        read -p "> " c; c=$(strip_cr "$c"); local tmp=$(mktemp)
+        local tg=$(jq '.telegram' "$CONFIG_FILE")
+        local t_enable=$(echo "$tg" | jq -r '.enable // false')
+        local t_token=$(echo "$tg" | jq -r '.bot_token // ""')
+        local t_chatid=$(echo "$tg" | jq -r '.chat_id // ""')
+        local t_api=$(echo "$tg" | jq -r '.api_url // "https://api.telegram.org"')
+        local t_thr=$(echo "$tg" | jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")')
+        local t_rpt=$(echo "$tg" | jq -r '.report_interval_hours // 0')
+
+        local status_str="${YELLOW}⚪ 未启用${PLAIN}"
+        [ "$t_enable" == "true" ] && status_str="${GREEN}✅ 已启用${PLAIN}"
+        local token_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$t_token" ] && [ "$t_token" != "" ] && token_str="${GREEN}已配置${PLAIN} (${t_token:0:8}...)"
+        local chatid_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$t_chatid" ] && [ "$t_chatid" != "" ] && chatid_str="${GREEN}${t_chatid}${PLAIN}"
+        local rpt_str="${YELLOW}未开启${PLAIN}"
+        [ "$t_rpt" -gt 0 ] 2>/dev/null && rpt_str="${GREEN}每 ${t_rpt} 小时${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e "   Telegram 通知配置"
+        echo -e "========================================"
+        echo -e " 状态:   $status_str"
+        echo -e " Token:  $token_str"
+        echo -e " ChatID: $chatid_str"
+        echo -e " API:    $t_api"
+        echo -e " 阈值:   ${t_thr} (%)"
+        echo -e " 定时报告: $rpt_str"
+        echo -e "========================================"
+        echo -e " 1. 配置 Bot Token"
+        echo -e " 2. 配置 Chat ID"
+        echo -e " 3. 发送测试消息"
+        echo -e " 4. 开启/关闭 通知"
+        echo -e " 5. 修改 通知阈值"
+        echo -e " 6. 修改 API 地址 (国内反代)"
+        echo -e " 7. 配置 定时流量报告"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " c
+        c=$(strip_cr "$c")
+        local tmp=$(mktemp)
+
         case $c in
-            1) read -p "Token: " t; jq --arg v "$t" '.telegram.bot_token=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            2) read -p "ChatID: " i; jq --arg v "$i" '.telegram.chat_id=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            3) echo "Sending test..."; local t=$(jq -r '.telegram.bot_token' "$CONFIG_FILE"); local i=$(jq -r '.telegram.chat_id' "$CONFIG_FILE"); curl -s "https://api.telegram.org/bot$t/sendMessage" -d chat_id="$i" -d text="Test OK" ;;
-            4) local s=$(jq -r '.telegram.enable' "$CONFIG_FILE"); [ "$s" == "true" ] && ns="false" || ns="true"; jq --argjson v "$ns" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
+            1)
+                read -p "请输入 Bot Token: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.telegram.bot_token=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}Token 已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            2)
+                read -p "请输入 Chat ID: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.telegram.chat_id=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}Chat ID 已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            3)
+                echo -e "${YELLOW}正在发送测试消息...${PLAIN}"
+                local tk=$(jq -r '.telegram.bot_token' "$CONFIG_FILE")
+                local ci=$(jq -r '.telegram.chat_id' "$CONFIG_FILE")
+                local au=$(jq -r '.telegram.api_url // "https://api.telegram.org"' "$CONFIG_FILE")
+                if [ -z "$tk" ] || [ -z "$ci" ]; then
+                    echo -e "${RED}请先配置 Token 和 Chat ID!${PLAIN}"; sleep 1
+                else
+                    local nid=$(jq -r '.node_id // "unknown"' "$CONFIG_FILE")
+                    local result=$(curl -s --max-time 10 "${au}/bot${tk}/sendMessage" \
+                        -d chat_id="$ci" -d text="✅ PM 测试消息 (节点: ${nid})" -d parse_mode="Markdown")
+                    if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
+                        echo -e "${GREEN}发送成功!${PLAIN}"
+                    else
+                        local err=$(echo "$result" | jq -r '.description // "未知错误"' 2>/dev/null)
+                        echo -e "${RED}发送失败: ${err}${PLAIN}"
+                    fi
+                    sleep 2
+                fi ;;
+            4)
+                local nv="true"; [ "$t_enable" == "true" ] && nv="false"
+                jq --argjson v "$nv" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。${PLAIN}"; sleep 0.5 ;;
+            5)
+                echo -e "当前阈值: ${t_thr} (%)"
+                read -p "请输入新阈值 (用逗号分隔, 如 50,80,100): " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    # 解析逗号分隔为 JSON 数组
+                    local arr_json=$(echo "$val" | tr ',' '\n' | grep -E '^[0-9]+$' | jq -s '.')
+                    if [ -n "$arr_json" ] && [ "$arr_json" != "[]" ]; then
+                        jq --argjson v "$arr_json" '.telegram.thresholds=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                        echo -e "${GREEN}阈值已更新。${PLAIN}"; sleep 0.5
+                    else
+                        echo -e "${RED}格式错误! 请输入纯数字用逗号分隔。${PLAIN}"; sleep 1
+                    fi
+                fi ;;
+            6)
+                echo -e "当前 API: $t_api"
+                echo -e "留空恢复默认 (https://api.telegram.org)"
+                read -p "请输入新 API 地址: " val; val=$(strip_cr "$val")
+                [ -z "$val" ] && val="https://api.telegram.org"
+                jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}API 地址已更新。${PLAIN}"; sleep 0.5 ;;
+            7)
+                echo -e "当前设置: $([ "$t_rpt" -gt 0 ] 2>/dev/null && echo "每 ${t_rpt} 小时" || echo "未开启")"
+                read -p "报告间隔 (小时, 0为关闭): " val; val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    jq --argjson v "$val" '.telegram.report_interval_hours=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    if [ "$val" -eq 0 ]; then
+                        echo -e "${GREEN}定时报告已关闭。${PLAIN}"
+                    else
+                        echo -e "${GREEN}已设置为每 ${val} 小时报告一次。${PLAIN}"
+                    fi
+                    sleep 0.5
+                else
+                    echo -e "${RED}请输入纯整数!${PLAIN}"; sleep 1
+                fi ;;
             0) rm -f "$tmp"; break ;;
         esac
         rm -f "$tmp"
@@ -1316,13 +1738,63 @@ configure_telegram() {
 
 configure_push() {
     while true; do
-        clear; echo "Cloudflare Push"; echo "1.URL 2.Secret 3.NodeKey 4.On/Off 0.Back"
-        read -p "> " c; c=$(strip_cr "$c"); local tmp=$(mktemp)
+        local pc=$(jq '.push // {}' "$CONFIG_FILE")
+        local p_enable=$(echo "$pc" | jq -r '.enable // false')
+        local p_url=$(echo "$pc" | jq -r '.worker_url // ""')
+        local p_secret=$(echo "$pc" | jq -r '.secret // ""')
+        local p_nkey=$(echo "$pc" | jq -r '.node_key // ""')
+
+        local status_str="${YELLOW}⚪ 未启用${PLAIN}"
+        [ "$p_enable" == "true" ] && status_str="${GREEN}✅ 已启用${PLAIN}"
+        local url_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_url" ] && [ "$p_url" != "" ] && url_str="${GREEN}${p_url}${PLAIN}"
+        local secret_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_secret" ] && [ "$p_secret" != "" ] && secret_str="${GREEN}已配置${PLAIN} (${p_secret:0:6}...)"
+        local nkey_str="${YELLOW}未配置${PLAIN}"
+        [ -n "$p_nkey" ] && [ "$p_nkey" != "" ] && nkey_str="${GREEN}${p_nkey}${PLAIN}"
+
+        clear
+        echo -e "========================================"
+        echo -e "   Cloudflare Worker 云端推送"
+        echo -e "========================================"
+        echo -e " 状态:     $status_str"
+        echo -e " Worker:   $url_str"
+        echo -e " Secret:   $secret_str"
+        echo -e " Node Key: $nkey_str"
+        echo -e "========================================"
+        echo -e " 1. 配置 Worker URL"
+        echo -e " 2. 配置 Secret"
+        echo -e " 3. 配置 Node Key"
+        echo -e " 4. 开启/关闭 推送"
+        echo -e " 0. 返回主菜单"
+        echo -e "========================================"
+        read -p "请输入选项: " c
+        c=$(strip_cr "$c")
+        local tmp=$(mktemp)
+
         case $c in
-            1) read -p "URL: " u; jq --arg v "$u" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            2) read -p "Secret: " s; jq --arg v "$s" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            3) read -p "Key: " k; jq --arg v "$k" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
-            4) local s=$(jq -r '.push.enable' "$CONFIG_FILE"); [ "$s" == "true" ] && ns="false" || ns="true"; jq --argjson v "$ns" '.push.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" ;;
+            1)
+                read -p "请输入 Worker URL: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            2)
+                read -p "请输入 Secret: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            3)
+                read -p "请输入 Node Key: " val; val=$(strip_cr "$val")
+                if [ -n "$val" ]; then
+                    jq --arg v "$val" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                    echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                fi ;;
+            4)
+                local nv="true"; [ "$p_enable" == "true" ] && nv="false"
+                jq --argjson v "$nv" '.push.enable=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
+                echo -e "${GREEN}已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。${PLAIN}"; sleep 0.5 ;;
             0) rm -f "$tmp"; break ;;
         esac
         rm -f "$tmp"
@@ -1330,17 +1802,77 @@ configure_push() {
 }
 
 delete_port_flow() {
-    local arr=("$@"); read -p "ID to delete: " id; local port=${arr[$((id-1))]}
-    [ -n "$port" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null && \
-    local tmp=$(mktemp) && jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp" && rm -f "$tmp" && reload_all_rules && echo "Deleted." && sleep 1
+    local arr=("$@")
+    read -p "ID to delete: " id
+    id=$(strip_cr "$id")
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
+    local port=${arr[$((id-1))]}
+    if [ -z "$port" ]; then echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return; fi
+
+    read -p "确认删除端口 ${port}? [y/N]: " confirm
+    confirm=$(strip_cr "$confirm")
+    [ "$confirm" != "y" ] && return
+
+    # 1. 从封禁集合移除 (可能不在集合中, 忽略错误)
+    nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
+
+    # 2. 从配置中删除
+    local tmp=$(mktemp)
+    if jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+        rm -f "$tmp"
+        reload_all_rules
+        rm -f "$STATE_DIR/${port}.txt"
+        echo -e "${GREEN}端口 ${port} 已删除。${PLAIN}"; sleep 1
+    else
+        rm -f "$tmp"
+        echo -e "${RED}删除失败。${PLAIN}"; sleep 1
+    fi
 }
 
 update_script() {
-    local tmp=$(mktemp); curl -fsSL "$DOWNLOAD_URL" -o "$tmp" && mv "$tmp" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH" && exec "$INSTALL_PATH"
+    echo -e "${YELLOW}正在检查更新...${PLAIN}"
+    local tmp=$(mktemp /tmp/pm_update.XXXXXX.sh)
+    curl -fsSL --max-time 30 "$DOWNLOAD_URL" -o "$tmp" 2>/dev/null
+    if [ -s "$tmp" ] && head -1 "$tmp" | grep -q '^#!/bin/bash'; then
+        mv -f "$tmp" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+        echo -e "${GREEN}更新成功，正在重启...${PLAIN}"; sleep 1
+        exec "$INSTALL_PATH"
+    else
+        rm -f "$tmp"
+        echo -e "${RED}更新失败: 下载文件无效或网络不可用。${PLAIN}"; sleep 2
+    fi
 }
 
 uninstall_script() {
-    read -p "Uninstall? (yes): " c; [ "$c" == "yes" ] && rm -rf "$CONFIG_DIR" "$INSTALL_PATH" && crontab -l | grep -v "$SHORTCUT_NAME" | crontab - && echo "Done." && exit 0
+    echo -e "${RED}警告: 将删除所有配置和监控规则!${PLAIN}"
+    read -p "确认卸载? (输入 yes): " c
+    c=$(strip_cr "$c")
+    [ "$c" != "yes" ] && return
+
+    echo -e "${YELLOW}正在清理...${PLAIN}"
+
+    # 1. 清除 nftables 规则
+    nft delete table $NFT_TABLE 2>/dev/null
+    echo -e "  nftables 规则已清除"
+
+    # 2. 清除 TC 根队列
+    local iface=$(jq -r '.interface // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$iface" ] && iface=$(get_iface)
+    if [ -n "$iface" ]; then
+        tc qdisc del dev "$iface" root 2>/dev/null
+        echo -e "  TC 限速规则已清除"
+    fi
+
+    # 3. 移除 Cron
+    crontab -l 2>/dev/null | grep -v "$SHORTCUT_NAME" | crontab -
+    echo -e "  Cron 任务已清除"
+
+    # 4. 删除文件
+    rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$CRON_LOCK_FILE" "$USER_EDIT_LOCK" 2>/dev/null
+    echo -e "  文件已清除"
+
+    echo -e "${GREEN}卸载完成。${PLAIN}"
+    exit 0
 }
 
 # ==============================================================================
@@ -1349,10 +1881,30 @@ uninstall_script() {
 check_root
 install_shortcut "${1:-}"
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-install_deps
+
+if [ "${1:-}" == "--monitor" ] || [ "${1:-}" == "--ipl" ]; then
+    # [OPT-FAST] cron/CLI 模式: 跳过完整 install_deps (依赖已在首次运行时安装, 配置已迁移)
+    # 仅做最小化检查: 配置文件存在且 JSON 合法
+    if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        # 配置异常, 回退到完整初始化
+        install_deps
+    fi
+    mkdir -p "$STATE_DIR"
+else
+    install_deps
+fi
 
 if [ "${1:-}" == "--monitor" ]; then
     cron_task
+elif [ "${1:-}" == "--ipl" ]; then
+    echo -e "端口\t在线IP数\tIP列表"
+    echo -e "----\t--------\t------"
+    for p in $(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n); do
+        ips=$(_sentinel_scan_ips "$p")
+        cnt=0; [ -n "$ips" ] && cnt=$(echo "$ips" | wc -l)
+        list="-"; [ -n "$ips" ] && list=$(echo "$ips" | tr '\n' ' ')
+        echo -e "${p}\t${cnt}\t\t${list}"
+    done
 elif [ "${1:-}" == "update" ]; then
     update_script
 else
