@@ -853,53 +853,44 @@ cron_task() {
 
     # --- 阶段一：采集数据 + DynQoS (Port Level) ---
     for port in $ports; do
-        local p_conf=$(echo "$tmp_json" | jq ".ports[\"$port\"]")
-        
-        # 数据采集 (逻辑不变)
-        local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-        local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
-        local last_k_in=$(echo "$p_conf" | jq -r '(.stats.last_kernel_in // 0) | floor')
-        local last_k_out=$(echo "$p_conf" | jq -r '(.stats.last_kernel_out // 0) | floor')
+        # [OPT-1a] 批量读取 stats + dyn_enable (5次jq → 1次)
+        IFS=$'\t' read -r acc_in acc_out last_k_in last_k_out dyn_enable <<< \
+            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [(.stats.acc_in//0)|floor, (.stats.acc_out//0)|floor, (.stats.last_kernel_in//0)|floor, (.stats.last_kernel_out//0)|floor, (.dyn_limit.enable//false)] | @tsv")"
 
         local curr_k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         local curr_k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
         [ -z "$curr_k_in" ] && curr_k_in=0
         [ -z "$curr_k_out" ] && curr_k_out=0
 
+        # [OPT-1b] bash 原生算术替代 bc (纯整数运算)
         local delta_in=0
-        if [ $(echo "scale=0; $curr_k_in < $last_k_in" | bc) -eq 1 ]; then delta_in=$curr_k_in; else delta_in=$(echo "scale=0; $curr_k_in - $last_k_in" | bc); fi
+        if (( curr_k_in < last_k_in )); then delta_in=$curr_k_in; else delta_in=$((curr_k_in - last_k_in)); fi
         local delta_out=0
-        if [ $(echo "scale=0; $curr_k_out < $last_k_out" | bc) -eq 1 ]; then delta_out=$curr_k_out; else delta_out=$(echo "scale=0; $curr_k_out - $last_k_out" | bc); fi
+        if (( curr_k_out < last_k_out )); then delta_out=$curr_k_out; else delta_out=$((curr_k_out - last_k_out)); fi
         
-        acc_in=$(echo "scale=0; $acc_in + $delta_in" | bc)
-        acc_out=$(echo "scale=0; $acc_out + $delta_out" | bc)
+        acc_in=$((acc_in + delta_in))
+        acc_out=$((acc_out + delta_out))
 
         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].stats.acc_in = $acc_in | .ports[\"$port\"].stats.acc_out = $acc_out | .ports[\"$port\"].stats.last_kernel_in = $curr_k_in | .ports[\"$port\"].stats.last_kernel_out = $curr_k_out")
         modified=true
 
         # DynQoS 必须在这里做，因为它依赖 delta_in/delta_out (即实时速率)
-        local dyn_enable=$(echo "$p_conf" | jq -r '.dyn_limit.enable // false')
         if [ "$dyn_enable" == "true" ]; then
-            local dyn_trigger=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_mbps')
-            local dyn_trig_time=$(echo "$p_conf" | jq -r '.dyn_limit.trigger_time')
-            local dyn_punish_time=$(echo "$p_conf" | jq -r '.dyn_limit.punish_time')
-            local dyn_punish_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps')
-            local strike=$(echo "$p_conf" | jq -r '.dyn_limit.strike_count // 0')
-            local is_punished=$(echo "$p_conf" | jq -r '.dyn_limit.is_punished // false')
-            local end_ts=$(echo "$p_conf" | jq -r '.dyn_limit.punish_end_ts // 0')
-            local comment=$(echo "$p_conf" | jq -r '.comment // ""')
-            local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
+            # [OPT-1c] 批量读取 DynQoS 字段 (11次jq → 1次)
+            IFS=$'\t' read -r dyn_trigger dyn_trig_time dyn_punish_time dyn_punish_mbps strike is_punished end_ts punish_notified recover_notified <<< \
+                "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [.dyn_limit.trigger_mbps, .dyn_limit.trigger_time, .dyn_limit.punish_time, .dyn_limit.punish_mbps, (.dyn_limit.strike_count//0), (.dyn_limit.is_punished//false), (.dyn_limit.punish_end_ts//0), (.notify_state.punish_notified//false), (.notify_state.recover_notified//true)] | @tsv")"
 
             local current_mbps=$(echo "scale=2; ($delta_in + $delta_out) * 8 / 60 / 1000000" | bc)
             local rule_changed=false
-            local punish_notified=$(echo "$p_conf" | jq -r '.notify_state.punish_notified // false')
-            local recover_notified=$(echo "$p_conf" | jq -r '.notify_state.recover_notified // true')
 
             if [ "$is_punished" == "true" ]; then
                 if [ "$current_ts" -ge "$end_ts" ]; then
                     is_punished="false"; strike=0
                     tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = false | .ports[\"$port\"].dyn_limit.strike_count = 0")
                     if [ "$recover_notified" != "true" ]; then
+                        # 惰性读取 comment/gid (仅通知时才需要)
+                        local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
+                        local gid=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].group_id // empty")
                         tg_notify_recover "$port" "$comment" "$gid"
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.recover_notified = true | .ports[\"$port\"].notify_state.punish_notified = false")
                     fi
@@ -913,6 +904,8 @@ cron_task() {
                         end_ts=$((current_ts + dyn_punish_time * 60))
                         tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].dyn_limit.is_punished = true | .ports[\"$port\"].dyn_limit.punish_end_ts = $end_ts")
                         if [ "$punish_notified" != "true" ]; then
+                            local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
+                            local gid=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].group_id // empty")
                             tg_notify_punish "$port" "$comment" "$current_mbps" "$dyn_trigger" "$dyn_punish_mbps" "$dyn_punish_time" "$gid"
                             tmp_json=$(echo "$tmp_json" | jq ".ports[\"$port\"].notify_state.punish_notified = true | .ports[\"$port\"].notify_state.recover_notified = false")
                         fi
@@ -940,55 +933,51 @@ cron_task() {
 
     # --- 阶段二：计算组流量 (Aggregation) ---
     declare -A group_usage
-    # 重新遍历 JSON 数据 (因为 acc_in 等已更新)
-    # 使用临时文件传递数据，避开子Shell陷阱
+    # [OPT-2a] 单次 jq 完成过滤+计算，替代 per-entry 的 4次jq+1次bc
     local tmp_map_file=$(mktemp)
     
-    echo "$tmp_json" | jq -c '.ports | to_entries[]' | while IFS= read -r entry; do
-        local gid=$(echo "$entry" | jq -r '.value.group_id // empty')
-        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
-            local mode=$(echo "$entry" | jq -r '.value.quota_mode')
-            local p_in=$(echo "$entry" | jq -r '(.value.stats.acc_in // 0) | floor')
-            local p_out=$(echo "$entry" | jq -r '(.value.stats.acc_out // 0) | floor')
-            local p_total=0
-            if [ "$mode" == "out_only" ]; then p_total=$p_out; else p_total=$(echo "$p_in + $p_out" | bc); fi
-            echo "$gid $p_total" >> "$tmp_map_file"
-        fi
-    done
+    echo "$tmp_json" | jq -r '
+        .ports | to_entries[] |
+        select(.value.group_id != null and .value.group_id != "" and .value.group_id != "null") |
+        "\(.value.group_id)\t\(
+            if .value.quota_mode == "out_only"
+            then (.value.stats.acc_out // 0) | floor
+            else ((.value.stats.acc_in // 0) + (.value.stats.acc_out // 0)) | floor
+            end
+        )"
+    ' > "$tmp_map_file"
     
-    if [ -f "$tmp_map_file" ]; then
-        while read -r g_id g_bytes; do
-            local exist=${group_usage["$g_id"]}
-            [ -z "$exist" ] && exist=0
-            group_usage["$g_id"]=$(echo "$exist + $g_bytes" | bc)
+    if [ -s "$tmp_map_file" ]; then
+        # [OPT-2b] bash 算术替代 bc
+        while IFS=$'\t' read -r g_id g_bytes; do
+            [ -z "$g_id" ] && continue
+            group_usage["$g_id"]=$(( ${group_usage["$g_id"]:-0} + g_bytes ))
         done < "$tmp_map_file"
-        rm -f "$tmp_map_file"
     fi
+    rm -f "$tmp_map_file"
 
     # --- 阶段三：执行策略 (Quota Check / Reset) ---
+    # [OPT-3c] 循环外一次性缓存 blocked_ports 集合 (N次nft+jq → 1次)
+    local blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
+    # [OPT-3d] 循环外一次性读取阈值 (N次jq → 1次)
+    local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
+
     for port in $ports; do
-        local p_conf=$(echo "$tmp_json" | jq ".ports[\"$port\"]")
-        local quota_gb=$(echo "$p_conf" | jq -r '.quota_gb')
-        local mode=$(echo "$p_conf" | jq -r '.quota_mode')
-        local gid=$(echo "$p_conf" | jq -r '.group_id // empty')
-        local comment=$(echo "$p_conf" | jq -r '.comment // ""')
+        # [OPT-3a] 批量读取 8 个字段 (8次jq → 1次)
+        IFS=$'\t' read -r quota_gb mode gid reset_day last_reset_ts quota_level p3_acc_in p3_acc_out <<< \
+            "$(echo "$tmp_json" | jq -r ".ports[\"$port\"] | [.quota_gb, .quota_mode, (.group_id // \"\"), (.reset_day // 0), ((.last_reset_ts // 0)|floor), (.notify_state.quota_level // 0), ((.stats.acc_in // 0)|floor), ((.stats.acc_out // 0)|floor)] | @tsv")"
         
         # 确定用于判断的流量值
         local check_usage=0
         if [ -n "$gid" ] && [ "$gid" != "null" ]; then
-            check_usage=${group_usage["$gid"]}
-            [ -z "$check_usage" ] && check_usage=0
+            check_usage=${group_usage["$gid"]:-0}
         else
-            # 独立端口
-            local acc_in=$(echo "$p_conf" | jq -r '(.stats.acc_in // 0) | floor')
-            local acc_out=$(echo "$p_conf" | jq -r '(.stats.acc_out // 0) | floor')
-            if [ "$mode" == "out_only" ]; then check_usage=$acc_out; else check_usage=$(echo "$acc_in + $acc_out" | bc); fi
+            # [OPT-3b] bash 算术替代 bc
+            if [ "$mode" == "out_only" ]; then check_usage=$p3_acc_out; else check_usage=$((p3_acc_in + p3_acc_out)); fi
         fi
 
         # 自动重置判断 (同组端口分别判断，避免时区/设置差异导致不同步，通常应保持一致)
-        local reset_day=$(echo "$p_conf" | jq -r '.reset_day // 0')
         if [ "$reset_day" -gt 0 ] 2>/dev/null && [ "$reset_day" -le 31 ] 2>/dev/null; then
-            local last_reset_ts=$(echo "$p_conf" | jq -r '(.last_reset_ts // 0) | floor')
             local days_in_month=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%-d 2>/dev/null)
             [ -z "$days_in_month" ] && days_in_month=28
             local effective_day=$reset_day
@@ -1011,44 +1000,55 @@ cron_task() {
                 
                 nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null
                 apply_port_rules "$port"
+                # 惰性读取 comment (仅通知时)
+                local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
                 tg_notify_reset "$port" "$comment" "$quota_gb" "$gid"
                 modified=true
                 
                 # 重置后，check_usage 应视为0 (虽然 group_usage 缓存还没更，但下分钟自会修正)
-                check_usage=0 
+                check_usage=0
+                # 刷新 blocked 缓存 (刚删了元素)
+                blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
             fi
         fi
 
-        # 配额封禁检查
-        local quota_bytes=$(echo "scale=0; $quota_gb * 1024 * 1024 * 1024" | bc)
-        local is_blocked_nft=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)')
+        # [OPT-3b] 配额封禁检查 — bash 算术替代 bc
+        local quota_bytes=$((quota_gb * 1073741824))
+        local is_blocked_nft=false
+        [[ "$blocked_ports_str" == *" $port "* ]] && is_blocked_nft=true
 
-        if (( $(echo "$check_usage > $quota_bytes" | bc -l) )); then
-            [ "$is_blocked_nft" == "false" ] && nft add element $NFT_TABLE blocked_ports \{ $port \}
+        if (( check_usage > quota_bytes )); then
+            if [ "$is_blocked_nft" == "false" ]; then
+                nft add element $NFT_TABLE blocked_ports \{ $port \}
+                blocked_ports_str="${blocked_ports_str}${port} "
+            fi
         else
-            [ "$is_blocked_nft" == "true" ] && nft delete element $NFT_TABLE blocked_ports \{ $port \}
+            if [ "$is_blocked_nft" == "true" ]; then
+                nft delete element $NFT_TABLE blocked_ports \{ $port \}
+                blocked_ports_str="${blocked_ports_str/ $port / }"
+            fi
         fi
 
-        # 阈值通知
-        local quota_level=$(echo "$p_conf" | jq -r '.notify_state.quota_level // 0')
-        local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
-        
+        # [OPT-3e] 阈值通知 — 保留1次bc算百分比(需小数显示), 比较用bash整数
         if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
             local percent=$(echo "scale=1; $check_usage * 100 / $quota_bytes" | bc 2>/dev/null)
             [ -z "$percent" ] && percent=0
-            local used_fmt=$(fmt_bytes_plain "$check_usage")
+            local percent_int=${percent%.*}
+            [ -z "$percent_int" ] && percent_int=0
             
             local new_level=$quota_level
             for thr in $(echo "$thresholds" | sort -rn); do
                 [ -z "$thr" ] && continue
-                if (( $(echo "$percent >= $thr" | bc -l) )) && [ "$quota_level" -lt "$thr" ]; then
+                if (( percent_int >= thr )) && (( quota_level < thr )); then
                     new_level=$thr; break
                 fi
             done
 
-            if [ "$new_level" -gt "$quota_level" ]; then
+            if (( new_level > quota_level )); then
+                local used_fmt=$(fmt_bytes_plain "$check_usage")
+                local comment=$(echo "$tmp_json" | jq -r ".ports[\"$port\"].comment // \"\"")
                 tg_notify_quota "$port" "$comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
-                if [ "$new_level" -ge 100 ]; then
+                if (( new_level >= 100 )); then
                     tg_notify_blocked "$port" "$comment" "$quota_gb" "$reset_day" "$gid"
                 fi
                 tmp_json=$(echo "$tmp_json" | jq --argjson lv "$new_level" ".ports[\"$port\"].notify_state.quota_level = \$lv")
