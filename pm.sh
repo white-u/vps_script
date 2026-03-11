@@ -663,6 +663,22 @@ push_to_worker() {
     [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ] && return
     local payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
     [ -z "$payload" ] && return
+    # 从 state/*.txt 注入实时运行数据到 payload
+    local _push_ports=$(echo "$payload" | jq -r '.ports | keys[]')
+    for _pp in $_push_ports; do
+        _load_port_state "$_pp"
+        payload=$(echo "$payload" | jq \
+            --arg p "$_pp" --argjson ai "$s_acc_in" --argjson ao "$s_acc_out" \
+            --argjson ki "$s_last_k_in" --argjson ko "$s_last_k_out" \
+            --argjson ip "$( [ "$s_is_punished" = "true" ] && echo true || echo false )" \
+            --argjson sc "$s_strike" --argjson pet "$s_punish_end_ts" \
+            --argjson ql "$s_quota_level" \
+            '.ports[$p].stats.acc_in = $ai | .ports[$p].stats.acc_out = $ao
+             | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko
+             | .ports[$p].dyn_limit.is_punished = $ip | .ports[$p].dyn_limit.strike_count = $sc
+             | .ports[$p].dyn_limit.punish_end_ts = $pet
+             | .ports[$p].notify_state.quota_level = $ql')
+    done
     local timestamp=$(date +%s)
     local signature=$(printf '%s%s' "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
     [ -z "$signature" ] && return
@@ -1326,19 +1342,16 @@ add_port_flow() {
 
     local tmp=$(mktemp)
     if jq --argjson q "$quota" --arg m "$mode" --argjson l "$limit" --argjson rd "$reset_day" \
-          --argjson lrt "$(date +%s)" --arg c "$comment" --arg p "$target_port" \
+          --arg c "$comment" --arg p "$target_port" \
        '.ports[$p] = {
         "quota_gb": $q, 
         "quota_mode": $m, 
         "limit_mbps": $l, 
         "reset_day": $rd,
-        "last_reset_ts": $lrt,
         "comment": $c, 
         "group_id": "",
-        "stats": {"acc_in": 0, "acc_out": 0, "last_kernel_in": 0, "last_kernel_out": 0},
         "dyn_limit": {"enable": false},
-        "notify_state": {"quota_level": 0, "punish_notified": false, "recover_notified": true},
-        "ip_limit": {"enable": false, "max_ips": 3, "action": "alert", "cooldown_min": 30, "whitelist": [], "last_alert_ts": 0, "last_alert_ips": []}
+        "ip_limit": {"enable": false, "max_ips": 3, "action": "alert", "cooldown_min": 30, "whitelist": []}
     }' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
         rm -f "$tmp"
         apply_port_rules "$target_port"
@@ -1569,7 +1582,9 @@ configure_dyn_qos() {
     local d_trig_t=$(echo "$conf" | jq -r '.trigger_time // "-"')
     local d_pun_m=$(echo "$conf" | jq -r '.punish_mbps // "-"')
     local d_pun_t=$(echo "$conf" | jq -r '.punish_time // "-"')
-    local d_punished=$(echo "$conf" | jq -r '.is_punished // false')
+    # 惩罚状态从 state 文件读取 (实时)
+    _load_port_state "$port"
+    local d_punished=$s_is_punished
 
     echo -e "\n========================================"
     echo -e " 动态突发限制 (QoS) - 端口 $port"
@@ -1606,8 +1621,12 @@ configure_dyn_qos() {
         read -p "惩罚时长 (分钟, 降速持续多久): " pt; pt=$(strip_cr "$pt")
         if [[ "$tm" =~ ^[0-9]+$ ]] && [[ "$tt" =~ ^[0-9]+$ ]] && [[ "$pm" =~ ^[0-9]+$ ]] && [[ "$pt" =~ ^[0-9]+$ ]]; then
             if jq --argjson tm "$tm" --argjson tt "$tt" --argjson pm "$pm" --argjson pt "$pt" --arg p "$port" \
-                '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt,strike_count:0,is_punished:false,punish_end_ts:0}|.ports[$p].notify_state.punish_notified=false' \
+                '.ports[$p].dyn_limit={enable:true,trigger_mbps:$tm,trigger_time:$tt,punish_mbps:$pm,punish_time:$pt}' \
                 "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
+                # 同步重置 state 文件中的 DynQoS 运行状态
+                _load_port_state "$port"
+                s_strike=0; s_is_punished=false; s_punish_end_ts=0; s_punish_notified=false
+                _save_port_state "$port"
                 echo -e "${GREEN}动态限速已启用。${PLAIN}"; sleep 0.5
             fi
         else
