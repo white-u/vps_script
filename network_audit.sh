@@ -119,12 +119,12 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
         echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，4线程)...${PLAIN}"
         echo -e "${YELLOW}提示: 连接失败请检查落地机防火墙是否开放了 ${PORT} 端口${PLAIN}"
         # 修复: 正向压测补充 --connect-timeout，与反向压测保持一致
-        iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 4 --connect-timeout 10
+        iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 4 --connect-timeout 5000
 
         read -p "是否进行反向压测 (落地 -> 中转，测试下载方向带宽)? [y/n]: " RUN_REVERSE
         if [[ "$RUN_REVERSE" =~ ^[Yy]$ ]]; then
-            echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，4线程)...${PLAIN}"
-            iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 4 -R --connect-timeout 10
+            echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，单线程)...${PLAIN}"
+            iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000
         fi
     fi
 fi
