@@ -3,7 +3,7 @@
 # ====================================================
 # 脚本名称: network_audit.sh
 # 功能: 中转机与落地机之间的链路多维深度测试
-# 修复: v1.1 - 变量名错误、丢包解析兼容性、预检、参数修正
+# 版本: v1.2 - 单线程压测、末尾汇总报告
 # ====================================================
 
 # 颜色定义
@@ -11,7 +11,19 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 PLAIN='\033[0m'
+
+# 汇总数据变量
+SUMMARY_LATENCY_SMALL="N/A"
+SUMMARY_LATENCY_LARGE="N/A"
+SUMMARY_RATIO="N/A"
+SUMMARY_LOSS="N/A"
+SUMMARY_QOS_CONCLUSION="N/A"
+SUMMARY_FWD_BW="未测试"
+SUMMARY_FWD_RETR="N/A"
+SUMMARY_REV_BW="未测试"
+SUMMARY_REV_RETR="N/A"
 
 clear
 echo -e "${BLUE}====================================================${PLAIN}"
@@ -58,19 +70,22 @@ if [ -z "$S_AVG" ]; then
     exit 1
 fi
 echo -e "${GREEN}${S_AVG} ms${PLAIN}"
+SUMMARY_LATENCY_SMALL="${S_AVG} ms"
 
 # 丢包率解析 (兼容 Debian/Ubuntu/CentOS)
 S_LOSS=$(echo "$PING_S_OUT" | grep -oP '\d+(?=% packet loss)')
 [ -z "$S_LOSS" ] && S_LOSS="N/A"
+SUMMARY_LOSS="${S_LOSS}%"
 
-# 大包测试 (1400B)  — 修复: 原脚本变量名为 L_AVG 但 awk 引用了未定义的 L_RES
+# 大包测试 (1400B)
 echo -n "正在发送大包 (1400B)... "
 L_AVG=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
 [ -z "$L_AVG" ] && L_AVG="0"
 echo -e "${GREEN}${L_AVG} ms${PLAIN}"
+SUMMARY_LATENCY_LARGE="${L_AVG} ms"
 
-# QoS 分析
-awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
+# QoS 分析，输出结论供汇总捕获
+QOS_RESULT=$(awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
     s = s + 0; l = l + 0;
     if (l == 0) l = s;
     diff = l - s; ratio = (s > 0) ? l / s : 1;
@@ -84,13 +99,21 @@ awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
         print "\033[31m[结论] 链路存在大包 QoS 限制，高带宽应用可能波动。\033[0m";
     else
         print "\033[32m[结论] 链路透明度高，适合高带宽转发。\033[0m";
+    printf "RATIO:%.2f\n", ratio;
     printf "----------------------------------------------------\n";
-}'
+}')
+echo "$QOS_RESULT" | grep -v '^RATIO:'
+
+SUMMARY_RATIO=$(echo "$QOS_RESULT" | grep '^RATIO:' | cut -d: -f2)
+if awk "BEGIN {exit !($SUMMARY_RATIO > 1.2)}"; then
+    SUMMARY_QOS_CONCLUSION="❌ 存在大包 QoS 限制"
+else
+    SUMMARY_QOS_CONCLUSION="✅ 链路透明，无 QoS"
+fi
 
 # --- 2. 路由分析 ---
 echo -e "\n${YELLOW}[2/4] 正在分析去程路由路径...${PLAIN}"
 if command -v nexttrace &>/dev/null; then
-    # 修复: --dot-metric 不是有效参数，改用 --dot-server 指定 DoH 解析服务商
     nexttrace -g cn --dot-server aliyun "$TARGET"
 else
     echo -e "${YELLOW}未检测到 NextTrace，使用标准 traceroute (建议安装 NextTrace 以查看 AS 号和地理信息)${PLAIN}"
@@ -116,19 +139,46 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
         read -p "请输入 iperf3 端口 (默认 5201): " PORT
         PORT=${PORT:-5201}
 
-        echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，4线程)...${PLAIN}"
+        # 正向压测 (单线程)
+        echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，单线程)...${PLAIN}"
         echo -e "${YELLOW}提示: 连接失败请检查落地机防火墙是否开放了 ${PORT} 端口${PLAIN}"
-        # 修复: 正向压测补充 --connect-timeout，与反向压测保持一致
-        iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 4 --connect-timeout 5000
+        FWD_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 --connect-timeout 5000 2>&1)
+        echo "$FWD_OUT"
+        SUMMARY_FWD_BW=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
+        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-3)}')
+        [ -z "$SUMMARY_FWD_BW" ] && SUMMARY_FWD_BW="连接失败"
+        [ -z "$SUMMARY_FWD_RETR" ] && SUMMARY_FWD_RETR="N/A"
 
+        # 反向压测 (单线程)
         read -p "是否进行反向压测 (落地 -> 中转，测试下载方向带宽)? [y/n]: " RUN_REVERSE
         if [[ "$RUN_REVERSE" =~ ^[Yy]$ ]]; then
             echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，单线程)...${PLAIN}"
-            iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000
+            REV_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000 2>&1)
+            echo "$REV_OUT"
+            SUMMARY_REV_BW=$(echo "$REV_OUT" | grep 'receiver' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
+            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-3)}')
+            [ -z "$SUMMARY_REV_BW" ] && SUMMARY_REV_BW="连接失败"
+            [ -z "$SUMMARY_REV_RETR" ] && SUMMARY_REV_RETR="N/A"
         fi
     fi
 fi
 
+# --- 汇总报告 ---
 echo -e "\n${BLUE}====================================================${PLAIN}"
-echo -e "${BLUE}              测试流程结束，请对比数据              ${PLAIN}"
+echo -e "${BLUE}                   📊 测试汇总报告                   ${PLAIN}"
+echo -e "${BLUE}====================================================${PLAIN}"
+echo -e "${CYAN}  测试时间  :${PLAIN} $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "${CYAN}  中转机 IP :${PLAIN} ${LOCAL_IP}"
+echo -e "${CYAN}  落地机 IP :${PLAIN} ${TARGET}"
+echo -e "${BLUE}----------------------------------------------------${PLAIN}"
+echo -e "${CYAN}  【延迟 & QoS】${PLAIN}"
+echo -e "  小包延迟   : ${SUMMARY_LATENCY_SMALL}"
+echo -e "  大包延迟   : ${SUMMARY_LATENCY_LARGE}"
+echo -e "  延迟比例   : ${SUMMARY_RATIO} 倍"
+echo -e "  去程丢包   : ${SUMMARY_LOSS}"
+echo -e "  QoS 结论   : ${SUMMARY_QOS_CONCLUSION}"
+echo -e "${BLUE}----------------------------------------------------${PLAIN}"
+echo -e "${CYAN}  【吞吐量】${PLAIN}"
+echo -e "  正向带宽   : ${SUMMARY_FWD_BW}  (重传: ${SUMMARY_FWD_RETR})"
+echo -e "  反向带宽   : ${SUMMARY_REV_BW}  (重传: ${SUMMARY_REV_RETR})"
 echo -e "${BLUE}====================================================${PLAIN}"
