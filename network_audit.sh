@@ -91,7 +91,7 @@ awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
 echo -e "\n${YELLOW}[2/4] 正在分析去程路由路径...${PLAIN}"
 if command -v nexttrace &>/dev/null; then
     # 修复: --dot-metric 不是有效参数，改用 --dot-server 指定 DoH 解析服务商
-    nexttrace -g cn --dot-server alidns "$TARGET"
+    nexttrace -g cn --dot-server aliyun "$TARGET"
 else
     echo -e "${YELLOW}未检测到 NextTrace，使用标准 traceroute (建议安装 NextTrace 以查看 AS 号和地理信息)${PLAIN}"
     traceroute -n -m 30 "$TARGET"
