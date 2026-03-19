@@ -3,7 +3,7 @@
 # ====================================================
 # 脚本名称: network_audit.sh
 # 功能: 中转机与落地机之间的链路多维深度测试
-# 版本: v1.3 - 修复 iperf3 列解析错位
+# 版本: v1.4 - 修复 iperf3 列解析（锚点倒数法）
 # ====================================================
 
 # 颜色定义
@@ -60,11 +60,9 @@ echo -e "${GREEN}目标可达，开始测试${PLAIN}"
 # --- 1. 去程 QoS 与丢包探测 ---
 echo -e "\n${YELLOW}[1/4] 正在探测去程质量 (QoS 识别)...${PLAIN}"
 
-# 小包测试 (64B)
 echo -n "正在发送小包 (64B)... "
 PING_S_OUT=$(ping -s 64 -c 10 -q "$TARGET" 2>/dev/null)
 S_AVG=$(echo "$PING_S_OUT" | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
-
 if [ -z "$S_AVG" ]; then
     echo -e "${RED}失败：目标不可达或不响应 ICMP${PLAIN}"
     exit 1
@@ -72,19 +70,16 @@ fi
 echo -e "${GREEN}${S_AVG} ms${PLAIN}"
 SUMMARY_LATENCY_SMALL="${S_AVG} ms"
 
-# 丢包率解析 (兼容 Debian/Ubuntu/CentOS)
 S_LOSS=$(echo "$PING_S_OUT" | grep -oP '\d+(?=% packet loss)')
 [ -z "$S_LOSS" ] && S_LOSS="N/A"
 SUMMARY_LOSS="${S_LOSS}%"
 
-# 大包测试 (1400B)
 echo -n "正在发送大包 (1400B)... "
 L_AVG=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
 [ -z "$L_AVG" ] && L_AVG="0"
 echo -e "${GREEN}${L_AVG} ms${PLAIN}"
 SUMMARY_LATENCY_LARGE="${L_AVG} ms"
 
-# QoS 分析
 QOS_RESULT=$(awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
     s = s + 0; l = l + 0;
     if (l == 0) l = s;
@@ -116,7 +111,7 @@ echo -e "\n${YELLOW}[2/4] 正在分析去程路由路径...${PLAIN}"
 if command -v nexttrace &>/dev/null; then
     nexttrace -g cn --dot-server aliyun "$TARGET"
 else
-    echo -e "${YELLOW}未检测到 NextTrace，使用标准 traceroute (建议安装 NextTrace 以查看 AS 号和地理信息)${PLAIN}"
+    echo -e "${YELLOW}未检测到 NextTrace，使用标准 traceroute${PLAIN}"
     traceroute -n -m 30 "$TARGET"
 fi
 
@@ -139,28 +134,29 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
         read -p "请输入 iperf3 端口 (默认 5201): " PORT
         PORT=${PORT:-5201}
 
-        # 正向压测 (单线程)
-        # sender 行格式: [ID] interval sec transfer unit bitrate unit retr sender
-        #                  $1    $2    $3    $4      $5    $6     $7   $8   $9
+        # iperf3 汇总行格式（以 sender/receiver 为最后一列作为锚点）:
+        # [  5]  0.00-10.00  sec  397 MBytes  333 Mbits/sec  21422  sender
+        # 从末尾倒数: $NF=sender, $(NF-1)=重传, $(NF-2)=单位, $(NF-3)=带宽数值
+
+        # 正向压测
         echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，单线程)...${PLAIN}"
         echo -e "${YELLOW}提示: 连接失败请检查落地机防火墙是否开放了 ${PORT} 端口${PLAIN}"
         FWD_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 --connect-timeout 5000 2>&1)
         echo "$FWD_OUT"
-        SUMMARY_FWD_BW=$(echo "$FWD_OUT"   | grep 'sender' | tail -1 | awk '{print $6, $7}')
-        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $8}')
+        SUMMARY_FWD_BW=$(echo "$FWD_OUT"   | grep 'sender' | tail -1 | awk '{print $(NF-3), $(NF-2)}')
+        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-1)}')
         [ -z "$SUMMARY_FWD_BW" ]   && SUMMARY_FWD_BW="连接失败"
         [ -z "$SUMMARY_FWD_RETR" ] && SUMMARY_FWD_RETR="N/A"
 
-        # 反向压测 (单线程)
-        # 反向 receiver 行同样是第 $6 $7 列为带宽
-        # 重传在 sender 行 $8 列
+        # 反向压测
         read -p "是否进行反向压测 (落地 -> 中转，测试下载方向带宽)? [y/n]: " RUN_REVERSE
         if [[ "$RUN_REVERSE" =~ ^[Yy]$ ]]; then
             echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，单线程)...${PLAIN}"
             REV_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000 2>&1)
             echo "$REV_OUT"
-            SUMMARY_REV_BW=$(echo "$REV_OUT"   | grep 'receiver' | tail -1 | awk '{print $6, $7}')
-            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender'   | tail -1 | awk '{print $8}')
+            # 反向带宽取 receiver 行，重传取 sender 行
+            SUMMARY_REV_BW=$(echo "$REV_OUT"   | grep 'receiver' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
+            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender'   | tail -1 | awk '{print $(NF-1)}')
             [ -z "$SUMMARY_REV_BW" ]   && SUMMARY_REV_BW="连接失败"
             [ -z "$SUMMARY_REV_RETR" ] && SUMMARY_REV_RETR="N/A"
         fi
