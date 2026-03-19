@@ -3,7 +3,7 @@
 # ====================================================
 # 脚本名称: network_audit.sh
 # 功能: 中转机与落地机之间的链路多维深度测试
-# 版本: v1.2 - 单线程压测、末尾汇总报告
+# 版本: v1.3 - 修复 iperf3 列解析错位
 # ====================================================
 
 # 颜色定义
@@ -84,7 +84,7 @@ L_AVG=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null | tail -1 | awk -F '/' '{pri
 echo -e "${GREEN}${L_AVG} ms${PLAIN}"
 SUMMARY_LATENCY_LARGE="${L_AVG} ms"
 
-# QoS 分析，输出结论供汇总捕获
+# QoS 分析
 QOS_RESULT=$(awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
     s = s + 0; l = l + 0;
     if (l == 0) l = s;
@@ -140,24 +140,28 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
         PORT=${PORT:-5201}
 
         # 正向压测 (单线程)
+        # sender 行格式: [ID] interval sec transfer unit bitrate unit retr sender
+        #                  $1    $2    $3    $4      $5    $6     $7   $8   $9
         echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，单线程)...${PLAIN}"
         echo -e "${YELLOW}提示: 连接失败请检查落地机防火墙是否开放了 ${PORT} 端口${PLAIN}"
         FWD_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 --connect-timeout 5000 2>&1)
         echo "$FWD_OUT"
-        SUMMARY_FWD_BW=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
-        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-3)}')
-        [ -z "$SUMMARY_FWD_BW" ] && SUMMARY_FWD_BW="连接失败"
+        SUMMARY_FWD_BW=$(echo "$FWD_OUT"   | grep 'sender' | tail -1 | awk '{print $6, $7}')
+        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $8}')
+        [ -z "$SUMMARY_FWD_BW" ]   && SUMMARY_FWD_BW="连接失败"
         [ -z "$SUMMARY_FWD_RETR" ] && SUMMARY_FWD_RETR="N/A"
 
         # 反向压测 (单线程)
+        # 反向 receiver 行同样是第 $6 $7 列为带宽
+        # 重传在 sender 行 $8 列
         read -p "是否进行反向压测 (落地 -> 中转，测试下载方向带宽)? [y/n]: " RUN_REVERSE
         if [[ "$RUN_REVERSE" =~ ^[Yy]$ ]]; then
             echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，单线程)...${PLAIN}"
             REV_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000 2>&1)
             echo "$REV_OUT"
-            SUMMARY_REV_BW=$(echo "$REV_OUT" | grep 'receiver' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
-            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-3)}')
-            [ -z "$SUMMARY_REV_BW" ] && SUMMARY_REV_BW="连接失败"
+            SUMMARY_REV_BW=$(echo "$REV_OUT"   | grep 'receiver' | tail -1 | awk '{print $6, $7}')
+            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender'   | tail -1 | awk '{print $8}')
+            [ -z "$SUMMARY_REV_BW" ]   && SUMMARY_REV_BW="连接失败"
             [ -z "$SUMMARY_REV_RETR" ] && SUMMARY_REV_RETR="N/A"
         fi
     fi
