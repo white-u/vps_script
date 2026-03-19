@@ -62,8 +62,16 @@ fi
 # ==============================
 # 3. 安装必备工具 (无 ufw/net-tools)
 # ==============================
-echo -e "${YELLOW}[3/6] 正在安装必备工具 (curl, wget, vim, unzip, nano)...${NC}"
-apt install -y curl wget unzip nano vim
+echo -e "${YELLOW}[3/6] 正在安装必备工具 (curl, wget, vim, unzip, nano, iperf3)...${NC}"
+apt install -y curl wget unzip nano vim iperf3
+
+echo -e "${YELLOW}正在安装 nexttrace...${NC}"
+if curl -sL nxtrace.org/nt | bash; then
+    echo -e "${GREEN}nexttrace 安装完成。${NC}"
+else
+    echo -e "${RED}nexttrace 安装失败，可稍后手动安装：curl -sL nxtrace.org/nt | bash${NC}"
+fi
+
 echo -e "${GREEN}工具安装完成。${NC}"
 
 # ==============================
