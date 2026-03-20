@@ -3,7 +3,7 @@
 # ====================================================
 # 脚本名称: network_audit.sh
 # 功能: 中转机与落地机之间的链路多维深度测试
-# 版本: v1.4 - 修复 iperf3 列解析（锚点倒数法）
+# 版本: v1.6 - 修复 grep -oP / ping -W / NF阈值 / N/A% 显示
 # ====================================================
 
 # 颜色定义
@@ -24,6 +24,50 @@ SUMMARY_FWD_BW="未测试"
 SUMMARY_FWD_RETR="N/A"
 SUMMARY_REV_BW="未测试"
 SUMMARY_REV_RETR="N/A"
+
+# iperf3 结果解析函数
+# Linux sender 行: ... 333 Mbits/sec  21422  sender  (NF=10)
+# macOS sender 行: ... 333 Mbits/sec  sender         (NF=9)
+parse_iperf_bw() {
+    local output="$1"
+    local role="$2"   # sender 或 receiver
+    local line
+    line=$(echo "$output" | grep "$role" | tail -1)
+    local nf
+    nf=$(echo "$line" | awk '{print NF}')
+    if [ "$role" = "sender" ]; then
+        if [ "$nf" -ge 10 ]; then
+            # Linux: 有 Retr 列
+            echo "$line" | awk '{print $(NF-3), $(NF-2)}'
+        else
+            # macOS: 无 Retr 列
+            echo "$line" | awk '{print $(NF-2), $(NF-1)}'
+        fi
+    else
+        # receiver 行两平台格式相同，均无 Retr
+        echo "$line" | awk '{print $(NF-2), $(NF-1)}'
+    fi
+}
+
+parse_iperf_retr() {
+    local output="$1"
+    local line
+    line=$(echo "$output" | grep 'sender' | tail -1)
+    local nf
+    nf=$(echo "$line" | awk '{print NF}')
+    if [ "$nf" -ge 10 ]; then
+        echo "$line" | awk '{print $(NF-1)}'
+    else
+        echo "N/A"
+    fi
+}
+
+# 兼容 Linux/macOS 的单包预检函数
+# Linux: -W 单位毫秒；macOS: -W 单位也是毫秒，但 -t 才是秒级超时
+# 统一用 -W 3000 (3秒) 兼容两平台
+ping_check() {
+    ping -c 1 -W 3000 "$1" &>/dev/null
+}
 
 clear
 echo -e "${BLUE}====================================================${PLAIN}"
@@ -51,7 +95,7 @@ fi
 
 # --- 目标可达性预检 ---
 echo -e "\n${YELLOW}正在预检目标可达性...${PLAIN}"
-if ! ping -c 1 -W 3 "$TARGET" &>/dev/null; then
+if ! ping_check "$TARGET"; then
     echo -e "${RED}错误: 目标 ${TARGET} 不可达，请检查 IP 或网络连接${PLAIN}"
     exit 1
 fi
@@ -70,9 +114,11 @@ fi
 echo -e "${GREEN}${S_AVG} ms${PLAIN}"
 SUMMARY_LATENCY_SMALL="${S_AVG} ms"
 
-S_LOSS=$(echo "$PING_S_OUT" | grep -oP '\d+(?=% packet loss)')
+# 修复: 用 -E 替代 -P，兼容 macOS BSD grep
+S_LOSS=$(echo "$PING_S_OUT" | grep -Eo '[0-9]+% packet loss' | grep -Eo '^[0-9]+')
 [ -z "$S_LOSS" ] && S_LOSS="N/A"
-SUMMARY_LOSS="${S_LOSS}%"
+# 修复: N/A 时不拼接 %
+[ "$S_LOSS" = "N/A" ] && SUMMARY_LOSS="N/A" || SUMMARY_LOSS="${S_LOSS}%"
 
 echo -n "正在发送大包 (1400B)... "
 L_AVG=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
@@ -134,19 +180,14 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
         read -p "请输入 iperf3 端口 (默认 5201): " PORT
         PORT=${PORT:-5201}
 
-        # iperf3 汇总行格式（以 sender/receiver 为最后一列作为锚点）:
-        # [  5]  0.00-10.00  sec  397 MBytes  333 Mbits/sec  21422  sender
-        # 从末尾倒数: $NF=sender, $(NF-1)=重传, $(NF-2)=单位, $(NF-3)=带宽数值
-
         # 正向压测
         echo -e "\n${GREEN}正在进行正向压测 (中转 -> 落地，10秒，单线程)...${PLAIN}"
         echo -e "${YELLOW}提示: 连接失败请检查落地机防火墙是否开放了 ${PORT} 端口${PLAIN}"
         FWD_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 --connect-timeout 5000 2>&1)
         echo "$FWD_OUT"
-        SUMMARY_FWD_BW=$(echo "$FWD_OUT"   | grep 'sender' | tail -1 | awk '{print $(NF-3), $(NF-2)}')
-        SUMMARY_FWD_RETR=$(echo "$FWD_OUT" | grep 'sender' | tail -1 | awk '{print $(NF-1)}')
-        [ -z "$SUMMARY_FWD_BW" ]   && SUMMARY_FWD_BW="连接失败"
-        [ -z "$SUMMARY_FWD_RETR" ] && SUMMARY_FWD_RETR="N/A"
+        SUMMARY_FWD_BW=$(parse_iperf_bw "$FWD_OUT" "sender")
+        SUMMARY_FWD_RETR=$(parse_iperf_retr "$FWD_OUT")
+        [ -z "$SUMMARY_FWD_BW" ] && SUMMARY_FWD_BW="连接失败"
 
         # 反向压测
         read -p "是否进行反向压测 (落地 -> 中转，测试下载方向带宽)? [y/n]: " RUN_REVERSE
@@ -154,11 +195,9 @@ if [[ "$RUN_IPERF" =~ ^[Yy]$ ]]; then
             echo -e "\n${GREEN}正在进行反向压测 (落地 -> 中转，10秒，单线程)...${PLAIN}"
             REV_OUT=$(iperf3 -c "$TARGET" -p "$PORT" -t 10 -P 1 -R --connect-timeout 5000 2>&1)
             echo "$REV_OUT"
-            # 反向带宽取 receiver 行，重传取 sender 行
-            SUMMARY_REV_BW=$(echo "$REV_OUT"   | grep 'receiver' | tail -1 | awk '{print $(NF-2), $(NF-1)}')
-            SUMMARY_REV_RETR=$(echo "$REV_OUT" | grep 'sender'   | tail -1 | awk '{print $(NF-1)}')
-            [ -z "$SUMMARY_REV_BW" ]   && SUMMARY_REV_BW="连接失败"
-            [ -z "$SUMMARY_REV_RETR" ] && SUMMARY_REV_RETR="N/A"
+            SUMMARY_REV_BW=$(parse_iperf_bw "$REV_OUT" "receiver")
+            SUMMARY_REV_RETR=$(parse_iperf_retr "$REV_OUT")
+            [ -z "$SUMMARY_REV_BW" ] && SUMMARY_REV_BW="连接失败"
         fi
     fi
 fi
