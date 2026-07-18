@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 v5.2
+# Snell 多实例管理脚本 v5.2.1
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
 #
 # Usage: bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh)
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # 临时资源清理 (Ctrl+C / 异常退出时自动清理)
 _CLEANUP_FILES=()
@@ -18,6 +18,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+CURRENT_ACTION="初始化"
+unexpected_error() {
+    local rc=${1:-1} line=${2:-?}
+    printf '\n%b❌ 未预期错误: %s（第 %s 行，退出码 %s）%b\n' \
+        "${RED:-}" "${CURRENT_ACTION:-脚本执行}" "$line" "$rc" "${PLAIN:-}" >&2
+    echo "请保留以上信息，并执行: journalctl -xe --no-pager | tail -50" >&2
+}
+trap 'unexpected_error "$?" "$LINENO"' ERR
+
 # ==================== 变量定义 ====================
 RED="\033[31m"
 GREEN="\033[32m"
@@ -26,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="5.2"
+SCRIPT_VERSION="5.2.1"
 
 SNELL_BIN="/usr/local/bin/snell-server"
 SNELL_CONF_DIR="/etc/snell"
@@ -84,20 +93,64 @@ check_root() {
     fi
 }
 
+fresh_script_url() {
+    printf '%s?t=%s-%s' "$SCRIPT_URL" "$(date +%s)" "$$"
+}
+
+validate_script_candidate() {
+    local file=$1
+    local version
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q '^SCRIPT_VERSION="' "$file" || return 1
+    version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
+
 # 同步快捷命令 (入口处调用, 确保 /usr/local/bin/snell 与运行版本一致)
 sync_script() {
-    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
-        # 文件模式: 直接复制 (跳过从快捷命令自身运行的情况)
-        if [[ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]]; then
-            cp "$0" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-        fi
-    else
-        # 管道/进程替换模式: 从远程下载覆盖
-        if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" 2>/dev/null; then
-            chmod +x "$SCRIPT_PATH"
-        fi
+    local current_real target_real
+    current_real=$(realpath "$0" 2>/dev/null || true)
+    target_real=$(realpath "$SCRIPT_PATH" 2>/dev/null || true)
+    if [[ "$0" == "$SCRIPT_PATH" ]] || \
+       [[ -n "$current_real" && -n "$target_real" && "$current_real" == "$target_real" ]]; then
+        return 0
     fi
+
+    local tmp_script
+    tmp_script=$(mktemp "${SCRIPT_PATH}.sync.XXXXXX") || {
+        warn "无法创建快捷命令同步临时文件，继续运行当前脚本。"
+        return 0
+    }
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
+        cp "$0" "$tmp_script" 2>/dev/null || true
+    else
+        curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
+    fi
+
+    if validate_script_candidate "$tmp_script" && chmod 755 "$tmp_script" \
+        && mv -f "$tmp_script" "$SCRIPT_PATH"; then
+        return 0
+    fi
+    warn "快捷命令同步失败，继续运行当前脚本；现有快捷命令未被覆盖。"
+    return 0
 }
 
 # 架构检测
@@ -152,6 +205,7 @@ get_latest_version() {
 
 # 1. 安装/更新 Snell 核心二进制
 install_core() {
+    CURRENT_ACTION="安装或更新 Snell 核心"
     check_root
     check_deps
     
@@ -250,6 +304,7 @@ EOF
 
 # 2. 添加新实例 (多实例逻辑)
 add_instance() {
+    CURRENT_ACTION="添加 Snell 实例"
     if [[ ! -f "$SNELL_BIN" ]]; then
         err "未检测到 Snell 核心，请先执行安装核心。"
     fi
@@ -315,6 +370,7 @@ EOF
 
 # 3. 删除实例
 del_instance() {
+    CURRENT_ACTION="删除 Snell 实例"
     # 扫描现有配置
     local configs=(${SNELL_CONF_DIR}/*.conf)
     if [[ ! -e "${configs[0]}" ]]; then
@@ -448,6 +504,7 @@ close_port() {
 
 # 更新管理脚本
 update_script() {
+    CURRENT_ACTION="更新 Snell 管理脚本"
     echo
     echo -e " ${BLUE}>>> 更新管理脚本${PLAIN}"
     echo -e " 当前版本: v${SCRIPT_VERSION}"
@@ -455,29 +512,39 @@ update_script() {
     echo
 
     local tmp_script
-    tmp_script=$(mktemp /tmp/snell_update.XXXXXX.sh)
+    tmp_script=$(mktemp "${SCRIPT_PATH}.update.XXXXXX") || err "无法创建更新临时文件"
     _CLEANUP_FILES+=("$tmp_script")
 
-    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
-        err "下载失败，请检查网络。"
+    if ! curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
+        err "下载失败，请检查网络；现有脚本未被覆盖。"
+    fi
+    if ! validate_script_candidate "$tmp_script"; then
+        err "远程脚本格式或 Bash 语法校验失败，现有脚本未被覆盖。"
     fi
 
     # 提取远程版本号
     local remote_ver
     remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2 || true)
 
+    if version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
+        rm -f "$tmp_script"
+        err "拒绝降级：远端 v${remote_ver} 低于当前 v${SCRIPT_VERSION}"
+    fi
+
     if [[ -z "$remote_ver" ]]; then
         warn "无法解析远程版本号，继续更新..."
-    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]] && cmp -s "$tmp_script" "$SCRIPT_PATH"; then
         info "已是最新版本 (v${SCRIPT_VERSION})，无需更新。"
         rm -f "$tmp_script"
         return
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+        warn "检测到同版本内容修订，将继续更新。"
     else
         echo -e " 发现新版本: ${GREEN}v${remote_ver}${PLAIN}"
     fi
 
+    chmod 755 "$tmp_script"
     mv -f "$tmp_script" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
     info "脚本已更新完成! 正在重新加载..."
     echo
     exec "$SCRIPT_PATH"
@@ -485,6 +552,7 @@ update_script() {
 
 # 彻底卸载
 uninstall_all() {
+    CURRENT_ACTION="卸载 Snell"
     echo
     echo -e " ${RED}════════════════════════════════════════${PLAIN}"
     echo -e " ${RED}  警告: 即将卸载 Snell 核心及所有实例!${PLAIN}"
@@ -520,6 +588,7 @@ uninstall_all() {
 
 # ==================== 菜单 ====================
 menu() {
+    CURRENT_ACTION="读取 Snell 管理菜单"
     clear
     echo -e "========================================================================================="
     echo -e "   Snell 多实例管理脚本 (v${SCRIPT_VERSION})"

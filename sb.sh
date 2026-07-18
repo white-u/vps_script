@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.6"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -44,6 +44,46 @@ cleanup() { for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do rm -rf "$
 trap cleanup EXIT INT TERM
 
 strip_cr() { echo "${1//$'\r'/}"; }
+
+fresh_script_url() {
+  printf '%s?t=%s-%s' "$SCRIPT_URL" "$(date +%s)" "$$"
+}
+
+validate_script_candidate() {
+  local file=$1
+  local version
+  [[ -s "$file" ]] || return 1
+  head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+  grep -q '^SCRIPT_VERSION="' "$file" || return 1
+  version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+  [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+  bash -n "$file"
+}
+
+version_is_older() {
+  local candidate=$1 current=$2 i candidate_part current_part
+  local IFS=.
+  local -a candidate_parts current_parts
+  read -ra candidate_parts <<< "$candidate"
+  read -ra current_parts <<< "$current"
+  for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+    candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+    ((10#$candidate_part < 10#$current_part)) && return 0
+    ((10#$candidate_part > 10#$current_part)) && return 1
+  done
+  return 1
+}
+
+run_menu_action() {
+  local label=$1
+  shift
+  local rc=0
+  "$@" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}❌ ${label}失败（退出码 ${rc}）。服务日志: journalctl -u sing-box -n 30 --no-pager${PLAIN}" >&2
+  fi
+  return 0
+}
 
 check_root() {
   [[ $EUID -ne 0 ]] && { echo -e "${RED}错误: 必须使用 root 权限运行。${PLAIN}"; exit 1; }
@@ -301,8 +341,30 @@ safe_save_config() {
 
 install_shortcut_cmd() {
   if [[ "$(realpath "$0" 2>/dev/null)" == "$INSTALL_PATH" ]]; then return; fi
-  cp "$0" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH" && \
+  local tmp_script
+  tmp_script=$(mktemp "${INSTALL_PATH}.install.XXXXXX") || {
+    echo -e "${RED}无法创建快捷命令安装临时文件。${PLAIN}" >&2
+    return 1
+  }
+  _CLEANUP_FILES+=("$tmp_script")
+  if curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" \
+      && validate_script_candidate "$tmp_script"; then
+    if ! chmod 755 "$tmp_script" || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
+      echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+      return 1
+    fi
     echo -e "${GREEN}快捷命令 '${SHORTCUT_NAME}' 已安装到 ${INSTALL_PATH}${PLAIN}"
+  elif [[ -f "$0" ]] && validate_script_candidate "$0"; then
+    if ! cp "$0" "$tmp_script" || ! chmod 755 "$tmp_script" \
+        || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
+      echo -e "${RED}快捷命令本地安装失败，现有文件未被覆盖。${PLAIN}" >&2
+      return 1
+    fi
+    echo -e "${YELLOW}远程下载失败，快捷命令已从本地脚本安装。${PLAIN}"
+  else
+    echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+    return 1
+  fi
 }
 
 install_singbox() {
@@ -516,6 +578,22 @@ get_public_ip() {
   echo "$ip"
 }
 
+urlencode() {
+  local LC_ALL=C input="$1" output="" char encoded byte i
+  for ((i=0; i<${#input}; i++)); do
+    char=${input:i:1}
+    case "$char" in
+      [a-zA-Z0-9.~_-]) output+="$char" ;;
+      *)
+        printf -v byte '%d' "'$char"
+        printf -v encoded '%%%02X' "$((byte & 255))"
+        output+="$encoded"
+        ;;
+    esac
+  done
+  printf '%s' "$output"
+}
+
 show_node_info() {
   local tag=$1
   local ip; ip=$(get_public_ip)
@@ -560,11 +638,11 @@ show_node_info() {
     fi
 
   elif [[ "$proto" == "shadowsocks" ]]; then
-    local method pass raw link
+    local method pass link
     method=$(echo "$node" | jq -r '.method')
     pass=$(echo "$node" | jq -r '.password')
-    raw="${method}:${pass}"
-    link="ss://$(echo -n "$raw" | base64 | tr -d '\n')@${display_ip}:${port}#${tag}"
+    # SIP022: Shadowsocks 2022 userinfo 使用明文方法名和百分号编码密码。
+    link="ss://$(urlencode "$method"):$(urlencode "$pass")@${display_ip}:${port}#$(urlencode "$tag")"
     echo -e "Method: ${method}"
     echo -e "Pass  : ${pass}"
     echo -e "\n${GREEN}>>> 分享链接:${PLAIN}\n${link}"
@@ -837,32 +915,42 @@ configure_advanced() {
 
 update_script() {
   echo -e "${BLUE}>>> 更新脚本...${PLAIN}"
-  local tmp; tmp=$(mktemp /tmp/xsb_upd.XXXXXX.sh)
+  local tmp
+  tmp=$(mktemp "${INSTALL_PATH}.update.XXXXXX") || {
+    echo -e "${RED}无法创建更新临时文件，现有脚本未被覆盖。${PLAIN}" >&2
+    return 1
+  }
   _CLEANUP_FILES+=("$tmp")
 
-  if ! curl -fsSL --max-time 20 "${SCRIPT_URL}?t=$(date +%s)" -o "$tmp"; then
-    echo -e "${RED}下载失败：${SCRIPT_URL}${PLAIN}"
+  if ! curl -fsSLo "$tmp" --connect-timeout 8 --max-time 20 "$(fresh_script_url)"; then
+    echo -e "${RED}下载失败：${SCRIPT_URL}，现有脚本未被覆盖。${PLAIN}"
     return 1
   fi
-  if [[ ! -s "$tmp" ]]; then
-    echo -e "${RED}下载文件为空。${PLAIN}"
+  if ! validate_script_candidate "$tmp"; then
+    echo -e "${RED}远程脚本格式或 Bash 语法校验失败，现有脚本未被覆盖。${PLAIN}"
     return 1
   fi
 
   local new_ver
   new_ver=$(grep -E '^SCRIPT_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
-  [[ -z "$new_ver" ]] && new_ver="unknown"
-
-  local target="$INSTALL_PATH"
-  if [[ ! -f "$target" ]]; then
-    target="$(realpath "$0" 2>/dev/null)"
-    [[ -z "$target" ]] && target="$0"
+  if version_is_older "$new_ver" "$SCRIPT_VERSION"; then
+    echo -e "${RED}拒绝降级：远端 v${new_ver} 低于当前 v${SCRIPT_VERSION}。${PLAIN}" >&2
+    return 1
+  fi
+  if [[ "$new_ver" == "$SCRIPT_VERSION" ]] && cmp -s "$tmp" "$INSTALL_PATH"; then
+    echo -e "${GREEN}已是最新版本 (v${SCRIPT_VERSION})。${PLAIN}"
+    return 0
+  fi
+  if [[ "$new_ver" == "$SCRIPT_VERSION" ]]; then
+    echo -e "${YELLOW}检测到同版本内容修订，将继续更新。${PLAIN}"
   fi
 
-  mv -f "$tmp" "$target"
-  chmod +x "$target"
+  if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$INSTALL_PATH"; then
+    echo -e "${RED}替换脚本失败，现有脚本保持不变。${PLAIN}" >&2
+    return 1
+  fi
   echo -e "${GREEN}更新完成：v${SCRIPT_VERSION} -> v${new_ver}${PLAIN}"
-  exec "$target"
+  exec "$INSTALL_PATH"
 }
 
 uninstall_all() {
@@ -922,9 +1010,9 @@ main_menu() {
     choice=$(strip_cr "$choice")
 
     case "$choice" in
-      1) install_singbox; read -p "按回车继续..." ;;
-      2) add_reality; read -p "按回车继续..." ;;
-      3) add_ss2022; read -p "按回车继续..." ;;
+      1) run_menu_action "安装或更新 sing-box" install_singbox; read -p "按回车继续..." ;;
+      2) run_menu_action "添加 Reality 节点" add_reality; read -p "按回车继续..." ;;
+      3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read -p "按回车继续..." ;;
       4)
         list_nodes
         read -p "输入节点 ID 查看详情(0返回): " id
@@ -934,10 +1022,10 @@ main_menu() {
           [[ -n "$t" ]] && show_node_info "$t"
         fi
         read -p "按回车继续..." ;;
-      5) delete_node; read -p "按回车继续..." ;;
+      5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
       6) configure_advanced ;;
-      7) update_script ;;
-      8) uninstall_all ;;
+      7) run_menu_action "更新 sb 管理脚本" update_script ;;
+      8) run_menu_action "卸载 sing-box" uninstall_all ;;
       0) exit 0 ;;
     esac
   done

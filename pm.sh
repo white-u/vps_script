@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.4.0 (IP Sentinel)
+# 版本: v5.4.2 (IP Sentinel)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -14,8 +14,10 @@ DOWNLOAD_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 CONFIG_DIR="/etc/port_monitor"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 STATE_DIR="$CONFIG_DIR/state"
+TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
-SCRIPT_VERSION="5.4.0"
+LOG_FILE="/var/log/port_monitor.log"
+SCRIPT_VERSION="5.4.2"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=3
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -32,6 +34,28 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PLAIN='\033[0m'
+
+pm_error() {
+    local message="$*"
+    local line="$(date '+%Y-%m-%d %H:%M:%S') [ERROR] ${message}"
+    if ! printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null; then
+        command -v logger >/dev/null 2>&1 && logger -t port-monitor -- "$message" 2>/dev/null || true
+        printf '%s\n' "$line" >&2
+    fi
+    if [ -t 2 ]; then
+        echo -e "${RED}❌ ${message}${PLAIN}" >&2
+    fi
+}
+
+rotate_pm_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    local size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt 1048576 ] 2>/dev/null; then
+        local rotated="${LOG_FILE}.tmp.$$"
+        tail -n 1000 "$LOG_FILE" > "$rotated" 2>/dev/null && mv -f "$rotated" "$LOG_FILE"
+        rm -f "$rotated" 2>/dev/null
+    fi
+}
 
 # --- 临时资源清理 ---
 _CLEANUP_FILES=()
@@ -50,6 +74,35 @@ trap _global_cleanup EXIT INT TERM
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
 strip_cr() { echo "${1//$'\r'/}"; }
+
+fresh_script_url() {
+    printf '%s?t=%s-%s' "$DOWNLOAD_URL" "$(date +%s)" "$$"
+}
+
+validate_script_candidate() {
+    local file=$1
+    local version
+    [ -s "$file" ] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q '^SCRIPT_VERSION="' "$file" || return 1
+    version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
 
 # --- 端口运行状态 读/写 (零 fork, bash 内置) ---
 # 所有运行时变量使用 s_ 前缀, 避免与其他变量冲突
@@ -106,26 +159,37 @@ install_shortcut() {
     echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
     
     # 下载到临时文件, 校验成功后再覆盖, 防止中途断网损坏已有脚本
-    local tmp_dl=$(mktemp /tmp/pm_install.XXXXXX.sh)
-    curl -fsSL --max-time 15 "$DOWNLOAD_URL" -o "$tmp_dl" 2>/dev/null
+    local tmp_dl
+    tmp_dl=$(mktemp "${INSTALL_PATH}.install.XXXXXX") || {
+        echo -e "${RED}无法创建快捷命令安装临时文件。${PLAIN}" >&2
+        return 1
+    }
     
     # 验证下载完整性
-    if [ -s "$tmp_dl" ]; then
-        mv -f "$tmp_dl" "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
+    if curl -fsSLo "$tmp_dl" --connect-timeout 8 --max-time 15 "$(fresh_script_url)" \
+        && validate_script_candidate "$tmp_dl"; then
+        if ! chmod 755 "$tmp_dl" || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
+            echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+            return 1
+        fi
         echo -e "${GREEN}安装成功! 快捷指令: $SHORTCUT_NAME${PLAIN}"
         echo -e "${GREEN}正在启动管理面板...${PLAIN}"
         sleep 1
         # 移交控制权给安装好的脚本
         exec "$INSTALL_PATH" "$@"
     else
-        rm -f "$tmp_dl"
         # 降级策略：本地复制 (仅当本地文件存在且非管道运行时)
-        if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+        if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ] \
+            && validate_script_candidate "$SCRIPT_PATH"; then
             echo -e "${YELLOW}网络下载失败，尝试本地安装...${PLAIN}"
-            cp "$SCRIPT_PATH" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+            if ! cp "$SCRIPT_PATH" "$tmp_dl" || ! chmod 755 "$tmp_dl" \
+                || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
+                echo -e "${RED}快捷命令本地安装失败，现有文件未被覆盖。${PLAIN}" >&2
+                return 1
+            fi
             exec "$INSTALL_PATH" "$@"
         else
+            rm -f "$tmp_dl"
             # 如果是 curl | bash 且下载失败，我们依然允许内存中的脚本继续运行
             # 但不会生成快捷指令
             echo -e "${YELLOW}警告: 无法安装快捷指令 (网络问题或管道运行)，将仅在本次会话运行。${PLAIN}"
@@ -139,7 +203,7 @@ get_iface() {
 
 install_deps() {
     # 核心依赖清单 (Alpine 需特判)
-    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock" "stat")
+    local deps=("nft" "tc" "jq" "bc" "curl" "ss" "numfmt" "flock" "stat" "openssl" "crontab")
     local missing=false
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then missing=true; break; fi
@@ -151,19 +215,19 @@ install_deps() {
             . /etc/os-release
             case $ID in
                 debian|ubuntu)
-                    apt-get update -q && apt-get install -y -q nftables iproute2 jq bc curl coreutils util-linux ;;
+                    apt-get update -q && apt-get install -y -q nftables iproute2 jq bc curl coreutils util-linux openssl cron ;;
                 centos|rhel|almalinux|rocky)
-                    yum install -y -q nftables iproute tc jq bc curl coreutils util-linux ;;
+                    yum install -y -q nftables iproute tc jq bc curl coreutils util-linux openssl cronie ;;
                 alpine)
                     # Alpine 特别需要 coreutils(stat, numfmt) 和 util-linux(flock)
-                    apk add --no-cache nftables iproute2 jq bc curl coreutils util-linux ;;
+                    apk add --no-cache nftables iproute2 jq bc curl coreutils util-linux openssl dcron ;;
                 *)
                     echo -e "${RED}系统不受支持，请手动安装: ${deps[*]}${PLAIN}" && exit 1 ;;
             esac
         fi
         # 验证关键依赖是否真正可用
         local failed=()
-        for dep in "nft" "tc" "jq" "bc"; do
+        for dep in "nft" "tc" "jq" "bc" "openssl" "crontab"; do
             command -v "$dep" &>/dev/null || failed+=("$dep")
         done
         if [[ ${#failed[@]} -gt 0 ]]; then
@@ -177,9 +241,14 @@ install_deps() {
         mkdir -p "$CONFIG_DIR"
     fi
     mkdir -p "$STATE_DIR"
-    # 强制完整性检查：如果文件损坏或为空，重置它
-    if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo '{"node_id": "'"$(hostname 2>/dev/null || echo unknown)"'", "interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' > "$CONFIG_FILE"
+    # 仅首次运行时创建配置；已有配置损坏时保留现场并停止，禁止静默清空。
+    if [ ! -e "$CONFIG_FILE" ]; then
+        safe_write_config '{"node_id": "'"$(hostname 2>/dev/null || echo unknown)"'", "interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' || exit 1
+    elif [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        local corrupt_backup="${CONFIG_FILE}.corrupt.$(date +%Y%m%d%H%M%S)"
+        cp -p "$CONFIG_FILE" "$corrupt_backup" 2>/dev/null || true
+        echo -e "${RED}错误: 配置文件损坏，已保留为 ${corrupt_backup}，请修复后重试。${PLAIN}" >&2
+        exit 1
     fi
     # 确保存在 telegram 字段 (旧版本升级兼容)
     if ! jq -e '.telegram' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -313,19 +382,25 @@ init_nft_table() {
     nft list table $NFT_TABLE &>/dev/null
     if [ $? -ne 0 ]; then
         nft add table $NFT_TABLE || { echo -e "${RED}[错误] 无法创建 nft 表，请检查 nftables 是否正常。${PLAIN}" >&2; return 1; }
-        nft add set $NFT_TABLE blocked_ports { type inet_service\; }
+        nft add set $NFT_TABLE blocked_ports { type inet_service\; } || {
+            pm_error "无法创建 Nftables blocked_ports 集合"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
+        }
         # 优先级 -5，确保先计数再通过系统防火墙(UFW等通常是0)
-        nft add chain $NFT_TABLE input { type filter hook input priority -5\; }
-        nft add chain $NFT_TABLE output { type filter hook output priority -5\; }
+        nft add chain $NFT_TABLE input { type filter hook input priority -5\; } || {
+            pm_error "无法创建 Nftables input 链"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
+        }
+        nft add chain $NFT_TABLE output { type filter hook output priority -5\; } || {
+            pm_error "无法创建 Nftables output 链"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
+        }
         
         # 显式拆分 TCP/UDP，修复部分内核兼容性
-        nft add rule $NFT_TABLE input tcp dport @blocked_ports drop
-        nft add rule $NFT_TABLE input udp dport @blocked_ports drop
-        nft add rule $NFT_TABLE output tcp sport @blocked_ports drop
-        nft add rule $NFT_TABLE output udp sport @blocked_ports drop
+        nft add rule $NFT_TABLE input tcp dport @blocked_ports drop || { pm_error "无法创建 TCP 入站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
+        nft add rule $NFT_TABLE input udp dport @blocked_ports drop || { pm_error "无法创建 UDP 入站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
+        nft add rule $NFT_TABLE output tcp sport @blocked_ports drop || { pm_error "无法创建 TCP 出站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
+        nft add rule $NFT_TABLE output udp sport @blocked_ports drop || { pm_error "无法创建 UDP 出站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
         return 0
     fi
-    return 1
+    return 0
 }
 
 init_tc_root() {
@@ -344,7 +419,12 @@ init_tc_root() {
             return 1
         fi
         # 默认分类 (不限速通道, ID 使用高位值避免与端口 hex 冲突)
-        tc class add dev "$iface" parent 1: classid 1:$TC_DEFAULT_CID htb rate 1000mbit
+        if ! tc class add dev "$iface" parent 1: classid 1:$TC_DEFAULT_CID htb rate 1000mbit; then
+            tc qdisc del dev "$iface" root 2>/dev/null
+            echo -e "${RED}[错误] 无法在 $iface 上创建 TC 默认分类。${PLAIN}" >&2
+            return 1
+        fi
+        printf '%s\n' "$iface" > "$TC_OWNER_FILE"
     fi
 }
 
@@ -361,8 +441,8 @@ apply_port_rules() {
         limit_mbps=$(echo "$conf" | jq -r '.dyn_limit.punish_mbps // 50')
     fi
 
-    init_nft_table
-    init_tc_root
+    init_nft_table || { pm_error "Nftables 初始化失败（端口 ${port}）"; return 1; }
+    init_tc_root || { pm_error "TC 初始化失败（端口 ${port}）"; return 1; }
 
     # [双轨制] TC 使用 Hex 格式 ID，防止 >9999 报错
     local port_hex=$(printf '%x' $port)
@@ -406,10 +486,10 @@ apply_port_rules() {
 reload_all_rules() {
     # 彻底销毁旧表再重建，防止已删除端口的规则残留
     nft delete table $NFT_TABLE 2>/dev/null
-    init_nft_table
+    init_nft_table || { pm_error "Nftables 规则表重建失败"; return 1; }
     local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE")
     for port in $ports; do
-        apply_port_rules "$port"
+        apply_port_rules "$port" || return 1
     done
 }
 
@@ -419,19 +499,35 @@ reload_all_rules() {
 
 safe_write_config() {
     local content="$1"
-    # 使用 flock 确保原子写入, printf 防止 echo 对 -e/-n 开头内容的误处理
     (
         flock -x 200
-        printf '%s\n' "$content" > "$CONFIG_FILE"
+        local tmp
+        tmp=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX") || exit 1
+        printf '%s\n' "$content" > "$tmp"
+        if ! jq empty "$tmp" >/dev/null 2>&1; then
+            rm -f "$tmp"
+            echo -e "${RED}拒绝写入无效 JSON 配置。${PLAIN}" >&2
+            exit 1
+        fi
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$CONFIG_FILE"
     ) 200>"$LOCK_FILE"
 }
 
 # 从文件原子写入配置 (避免 ARG_MAX 限制)
 safe_write_config_from_file() {
     local src_file="$1"
+    [ -s "$src_file" ] && jq empty "$src_file" >/dev/null 2>&1 || {
+        echo -e "${RED}拒绝写入无效 JSON 配置。${PLAIN}" >&2
+        return 1
+    }
     (
         flock -x 200
-        cat "$src_file" > "$CONFIG_FILE"
+        local tmp
+        tmp=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX") || exit 1
+        cp "$src_file" "$tmp" || { rm -f "$tmp"; exit 1; }
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$CONFIG_FILE"
     ) 200>"$LOCK_FILE"
 }
 
@@ -490,7 +586,12 @@ tg_send() {
     local chat_id=$(echo "$tg_conf" | jq -r '.chat_id // empty')
     [ -z "$token" ] || [ -z "$chat_id" ] && return
     local api_url=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
-    curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" -d chat_id="$chat_id" -d text="$msg" -d parse_mode="Markdown" >/dev/null 2>&1 &
+    (
+        if ! curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
+            -d chat_id="$chat_id" -d text="$msg" -d parse_mode="Markdown" >/dev/null 2>&1; then
+            pm_error "Telegram 通知发送失败，请检查 Bot Token、Chat ID 和网络"
+        fi
+    ) &
 }
 
 # --- 通知模板 ---
@@ -680,9 +781,29 @@ push_to_worker() {
              | .ports[$p].notify_state.quota_level = $ql')
     done
     local timestamp=$(date +%s)
-    local signature=$(printf '%s%s' "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
-    [ -z "$signature" ] && return
-    curl -sf --max-time 10 -X PUT "${worker_url}" -H "Content-Type: application/json" -H "X-Node: ${node_key}" -H "X-Timestamp: ${timestamp}" -H "X-Signature: ${signature}" -d "$payload" >/dev/null 2>&1 &
+    local signature=$(printf '%s\n%s\n%s' "$node_key" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
+    if [ -z "$signature" ]; then
+        pm_error "Worker 推送签名生成失败，请检查 openssl"
+        return 1
+    fi
+    local http_code
+    local response_file
+    response_file=$(mktemp) || { pm_error "无法创建 Worker 响应临时文件"; return 1; }
+    _CLEANUP_FILES+=("$response_file")
+    if ! http_code=$(curl -sS --max-time 10 -o "$response_file" -w '%{http_code}' -X PUT "${worker_url}" \
+        -H "Content-Type: application/json" -H "X-Node: ${node_key}" \
+        -H "X-Timestamp: ${timestamp}" -H "X-Signature: ${signature}" -d "$payload" 2>>"$LOG_FILE"); then
+        pm_error "Worker 推送请求失败，请检查 URL、DNS 和网络"
+        return 1
+    fi
+    case "$http_code" in
+        2??) return 0 ;;
+        *)
+            local response_hint=$(head -c 200 "$response_file" 2>/dev/null | tr '\r\n' ' ')
+            pm_error "Worker 推送被拒绝（HTTP ${http_code}）${response_hint:+: ${response_hint}}"
+            return 1
+            ;;
+    esac
 }
 
 # ==============================================================================
@@ -894,6 +1015,7 @@ CRON_LOCK_FILE="/var/run/pm_cron.lock"
 cron_task() {
     exec 9>"$CRON_LOCK_FILE"
     flock -n 9 || exit 0
+    rotate_pm_log
 
     if [ -f "$USER_EDIT_LOCK" ]; then
         local lock_age=$(($(date +%s) - $(stat -c %Y "$USER_EDIT_LOCK" 2>/dev/null || echo 0)))
@@ -906,7 +1028,9 @@ cron_task() {
 
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-    if ! nft list table $NFT_TABLE &>/dev/null; then reload_all_rules; fi
+    if ! nft list table $NFT_TABLE &>/dev/null; then
+        reload_all_rules || { pm_error "后台任务无法重建 Nftables/TC 规则"; return 1; }
+    fi
 
     local tmp_json=$(cat "$CONFIG_FILE")
     local ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
@@ -1122,9 +1246,21 @@ cron_task() {
 }
 
 setup_cron() {
-    if ! crontab -l 2>/dev/null | grep -q "$INSTALL_PATH --monitor"; then
-        (crontab -l 2>/dev/null; echo "* * * * * $INSTALL_PATH --monitor") | crontab -
+    local old_line="* * * * * $INSTALL_PATH --monitor"
+    local cron_line="${old_line} >> $LOG_FILE 2>&1"
+    crontab -l 2>/dev/null | grep -Fqx -- "$cron_line" && return 0
+
+    local tmp_cron
+    tmp_cron=$(mktemp) || { pm_error "无法创建 Cron 临时文件"; return 1; }
+    _CLEANUP_FILES+=("$tmp_cron")
+    crontab -l 2>/dev/null | awk -v old="$old_line" -v current="$cron_line" \
+        '$0 != old && $0 != current' > "$tmp_cron"
+    echo "$cron_line" >> "$tmp_cron"
+    if ! crontab "$tmp_cron"; then
+        pm_error "Cron 任务安装失败，请检查 crontab 服务"
+        return 1
     fi
+    echo -e "${GREEN}后台错误日志: $LOG_FILE${PLAIN}"
 }
 
 # ==============================================================================
@@ -1165,6 +1301,23 @@ show_main_menu() {
     local port_list=()
     local i=1
     local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n)
+    local -A menu_group_usage=()
+
+    # 与配额执行逻辑保持一致：分组端口显示组内合计用量。
+    local group_port group_conf group_mode group_gid group_used
+    for group_port in $ports; do
+        group_conf=$(jq ".ports[\"$group_port\"]" "$CONFIG_FILE")
+        group_gid=$(echo "$group_conf" | jq -r '.group_id // empty')
+        [ -z "$group_gid" ] && continue
+        group_mode=$(echo "$group_conf" | jq -r '.quota_mode // "in_out"')
+        _load_port_state "$group_port"
+        if [ "$group_mode" == "out_only" ]; then
+            group_used=$s_acc_out
+        else
+            group_used=$((s_acc_in + s_acc_out))
+        fi
+        menu_group_usage["$group_gid"]=$(( ${menu_group_usage["$group_gid"]:-0} + group_used ))
+    done
 
     for port in $ports; do
         local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
@@ -1184,6 +1337,9 @@ show_main_menu() {
             total_used=$s_acc_out
         else
             total_used=$((s_acc_in + s_acc_out))
+        fi
+        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
+            total_used=${menu_group_usage["$gid"]:-0}
         fi
         
         local status_clean=""
@@ -1806,9 +1962,12 @@ configure_push() {
                 fi ;;
             3)
                 read -p "请输入 Node Key: " val; val=$(strip_cr "$val")
-                if [ -n "$val" ]; then
+                val=${val,,}
+                if [[ "$val" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
                     jq --arg v "$val" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"
                     echo -e "${GREEN}已更新。${PLAIN}"; sleep 0.5
+                else
+                    echo -e "${RED}Node Key 必须为 1-64 位小写字母、数字、下划线或连字符，且以字母或数字开头。${PLAIN}"; sleep 1
                 fi ;;
             4)
                 local nv="true"; [ "$p_enable" == "true" ] && nv="false"
@@ -1850,15 +2009,39 @@ delete_port_flow() {
 
 update_script() {
     echo -e "${YELLOW}正在检查更新...${PLAIN}"
-    local tmp=$(mktemp /tmp/pm_update.XXXXXX.sh)
-    curl -fsSL --max-time 30 "$DOWNLOAD_URL" -o "$tmp" 2>/dev/null
-    if [ -s "$tmp" ] && head -1 "$tmp" | grep -q '^#!/bin/bash'; then
-        mv -f "$tmp" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
-        echo -e "${GREEN}更新成功，正在重启...${PLAIN}"; sleep 1
+    local tmp
+    tmp=$(mktemp "${INSTALL_PATH}.update.XXXXXX") || {
+        echo -e "${RED}无法创建更新临时文件，现有脚本未被覆盖。${PLAIN}" >&2
+        return 1
+    }
+    if curl -fsSLo "$tmp" --connect-timeout 8 --max-time 30 "$(fresh_script_url)" \
+        && validate_script_candidate "$tmp"; then
+        local remote_ver
+        remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
+        if version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
+            rm -f "$tmp"
+            echo -e "${RED}拒绝降级：远端 v${remote_ver} 低于当前 v${SCRIPT_VERSION}。${PLAIN}" >&2
+            return 1
+        fi
+        if [ "$remote_ver" == "$SCRIPT_VERSION" ] && cmp -s "$tmp" "$INSTALL_PATH"; then
+            rm -f "$tmp"
+            echo -e "${GREEN}已是最新版本 (v${SCRIPT_VERSION})。${PLAIN}"
+            return 0
+        fi
+        if [ "$remote_ver" == "$SCRIPT_VERSION" ]; then
+            echo -e "${YELLOW}检测到同版本内容修订，将继续更新。${PLAIN}"
+        fi
+        if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$INSTALL_PATH"; then
+            echo -e "${RED}替换脚本失败，现有脚本保持不变。${PLAIN}" >&2
+            return 1
+        fi
+        echo -e "${GREEN}更新成功 (v${remote_ver})，正在重启...${PLAIN}"; sleep 1
         exec "$INSTALL_PATH"
     else
         rm -f "$tmp"
-        echo -e "${RED}更新失败: 下载文件无效或网络不可用。${PLAIN}"; sleep 2
+        echo -e "${RED}更新失败: 下载、格式或 Bash 语法校验未通过；现有脚本未被覆盖。${PLAIN}"
+        sleep 2
+        return 1
     fi
 }
 
@@ -1874,20 +2057,26 @@ uninstall_script() {
     nft delete table $NFT_TABLE 2>/dev/null
     echo -e "  nftables 规则已清除"
 
-    # 2. 清除 TC 根队列
+    # 2. 仅清除由本脚本创建并登记的 TC 根队列
     local iface=$(jq -r '.interface // empty' "$CONFIG_FILE" 2>/dev/null)
     [ -z "$iface" ] && iface=$(get_iface)
-    if [ -n "$iface" ]; then
+    if [ -n "$iface" ] && [ -f "$TC_OWNER_FILE" ] && [ "$(cat "$TC_OWNER_FILE" 2>/dev/null)" = "$iface" ] && \
+       tc qdisc show dev "$iface" 2>/dev/null | grep -Eq 'qdisc htb 1:.* root'; then
         tc qdisc del dev "$iface" root 2>/dev/null
         echo -e "  TC 限速规则已清除"
+    else
+        echo -e "  TC 根队列非本脚本所有，已保留"
     fi
 
     # 3. 移除 Cron
-    crontab -l 2>/dev/null | grep -v "$SHORTCUT_NAME" | crontab -
+    local old_line="* * * * * $INSTALL_PATH --monitor"
+    local cron_line="${old_line} >> $LOG_FILE 2>&1"
+    crontab -l 2>/dev/null | awk -v old="$old_line" -v current="$cron_line" \
+        '$0 != old && $0 != current' | crontab -
     echo -e "  Cron 任务已清除"
 
     # 4. 删除文件
-    rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$CRON_LOCK_FILE" "$USER_EDIT_LOCK" 2>/dev/null
+    rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$CRON_LOCK_FILE" "$USER_EDIT_LOCK" "$LOG_FILE" 2>/dev/null
     echo -e "  文件已清除"
 
     echo -e "${GREEN}卸载完成。${PLAIN}"
@@ -1905,8 +2094,9 @@ if [ "${1:-}" == "--monitor" ] || [ "${1:-}" == "--ipl" ]; then
     # [OPT-FAST] cron/CLI 模式: 跳过完整 install_deps (依赖已在首次运行时安装, 配置已迁移)
     # 仅做最小化检查: 配置文件存在且 JSON 合法
     if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        # 配置异常, 回退到完整初始化
-        install_deps
+        pm_error "配置文件不存在或损坏，监控任务已停止；请运行 pm 进行检查"
+        echo -e "${RED}错误: 配置文件不存在或损坏，监控任务已停止；请运行 pm 进行检查。${PLAIN}" >&2
+        exit 1
     fi
     mkdir -p "$STATE_DIR"
 else
@@ -1914,7 +2104,10 @@ else
 fi
 
 if [ "${1:-}" == "--monitor" ]; then
-    cron_task
+    if ! cron_task; then
+        pm_error "本轮后台监控任务未完成"
+        exit 1
+    fi
 elif [ "${1:-}" == "--ipl" ]; then
     echo -e "端口\t在线IP数\tIP列表"
     echo -e "----\t--------\t------"
@@ -1926,6 +2119,8 @@ elif [ "${1:-}" == "--ipl" ]; then
     done
 elif [ "${1:-}" == "update" ]; then
     update_script
+elif [ "${1:-}" == "uninstall" ]; then
+    uninstall_script
 else
     setup_cron
     _IS_MENU_MODE=true

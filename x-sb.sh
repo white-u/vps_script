@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.3"
 SHORTCUT_NAME="x-sb"
 INSTALL_PATH="/usr/local/bin/$SHORTCUT_NAME"
 # 脚本自身的下载地址
@@ -45,6 +45,46 @@ trap cleanup EXIT INT TERM
 
 # Windows 换行符清洗
 strip_cr() { echo "${1//$'\r'/}"; }
+
+fresh_script_url() {
+    printf '%s?t=%s-%s' "$SCRIPT_URL" "$(date +%s)" "$$"
+}
+
+validate_script_candidate() {
+    local file=$1
+    local version
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q '^SCRIPT_VERSION="' "$file" || return 1
+    version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
+
+run_menu_action() {
+    local label=$1
+    shift
+    local rc=0
+    "$@" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo -e "${RED}❌ ${label}失败（退出码 ${rc}）。服务日志: journalctl -u xray -n 30 --no-pager${PLAIN}" >&2
+    fi
+    return 0
+}
 
 # ==================== 基础检查 ====================
 check_root() {
@@ -148,6 +188,11 @@ install_xray() {
     local curr_ver="none"
     [[ -f "$XRAY_BIN" ]] && curr_ver=$($XRAY_BIN version | head -1 | awk '{print $2}')
     
+    local was_active=false
+    systemctl is-active --quiet xray 2>/dev/null && was_active=true
+    local binary_backup=""
+    local binary_updated=false
+
     if [[ "$curr_ver" == "$latest_ver" ]]; then
         echo -e "${GREEN}当前已是最新版 ($curr_ver)，跳过安装。${PLAIN}"
     else
@@ -158,17 +203,32 @@ install_xray() {
         _CLEANUP_FILES+=("$tmp_file" "$tmp_dir")
         
         if ! curl -L --max-time 120 -o "$tmp_file" --progress-bar "$zip_url"; then
-            echo -e "${RED}下载失败。${PLAIN}"; exit 1
+            echo -e "${RED}下载失败。${PLAIN}"; return 1
         fi
         
-        unzip -q "$tmp_file" -d "$tmp_dir"
-        
+        if ! unzip -q "$tmp_file" -d "$tmp_dir" || [[ ! -x "$tmp_dir/xray" ]]; then
+            echo -e "${RED}安装包无效或缺少 Xray 二进制。${PLAIN}"
+            return 1
+        fi
+
+        if [[ -f "$XRAY_BIN" ]]; then
+            binary_backup=$(mktemp /tmp/xray_binary_backup.XXXXXX)
+            _CLEANUP_FILES+=("$binary_backup")
+            cp -p "$XRAY_BIN" "$binary_backup" || return 1
+        fi
+
         systemctl stop xray 2>/dev/null || true
-        mv "$tmp_dir/xray" "$XRAY_BIN"
+        local staged_bin="${XRAY_BIN}.new.$$"
+        if ! install -m 755 "$tmp_dir/xray" "$staged_bin" || ! mv -f "$staged_bin" "$XRAY_BIN"; then
+            rm -f "$staged_bin"
+            if [[ -n "$binary_backup" ]]; then cp -p "$binary_backup" "$XRAY_BIN"; else rm -f "$XRAY_BIN"; fi
+            [[ "$was_active" == "true" ]] && systemctl start xray 2>/dev/null || true
+            echo -e "${RED}Xray 核心安装失败，已恢复旧版本。${PLAIN}"
+            return 1
+        fi
+        binary_updated=true
         mv "$tmp_dir/geoip.dat" "$DAT_DIR/" 2>/dev/null || true
         mv "$tmp_dir/geosite.dat" "$DAT_DIR/" 2>/dev/null || true
-        chmod +x "$XRAY_BIN"
-        echo -e "${GREEN}Xray 核心更新成功。${PLAIN}"
     fi
     
     cat > "$SYSTEMD_FILE" <<EOF
@@ -194,6 +254,26 @@ EOF
     systemctl enable xray 2>/dev/null
     
     init_config_if_missing
+
+    if [[ "$binary_updated" == "true" ]]; then
+        local update_error=""
+        update_error=$("$XRAY_BIN" run -test -c "$XRAY_CONF_FILE" 2>&1) || {
+            echo -e "${RED}新 Xray 无法加载现有配置，正在回滚:${PLAIN}"
+            echo "$update_error" | tail -5
+            if [[ -n "$binary_backup" ]]; then cp -p "$binary_backup" "$XRAY_BIN"; else rm -f "$XRAY_BIN"; fi
+            [[ "$was_active" == "true" ]] && systemctl start xray 2>/dev/null || true
+            return 1
+        }
+        if [[ "$was_active" == "true" ]]; then
+            if ! systemctl restart xray || ! systemctl is-active --quiet xray; then
+                if [[ -n "$binary_backup" ]]; then cp -p "$binary_backup" "$XRAY_BIN"; else rm -f "$XRAY_BIN"; fi
+                systemctl restart xray 2>/dev/null || true
+                echo -e "${RED}新 Xray 启动失败，已回滚旧版本。${PLAIN}"
+                return 1
+            fi
+        fi
+        echo -e "${GREEN}Xray 核心更新成功。${PLAIN}"
+    fi
     install_shortcut_cmd
 }
 
@@ -201,16 +281,30 @@ install_shortcut_cmd() {
     if [[ "$(realpath "$0" 2>/dev/null)" == "$INSTALL_PATH" ]]; then return; fi
     
     # 优先从远程下载(防止管道运行时 $0 指向 /dev/fd/XX)
-    local tmp_dl=$(mktemp /tmp/x-sb_install.XXXXXX.sh)
+    local tmp_dl
+    tmp_dl=$(mktemp "${INSTALL_PATH}.install.XXXXXX") || {
+        echo -e "${RED}无法创建快捷命令安装临时文件。${PLAIN}" >&2
+        return 1
+    }
     _CLEANUP_FILES+=("$tmp_dl")
-    if curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_dl" 2>/dev/null && [ -s "$tmp_dl" ]; then
-        mv -f "$tmp_dl" "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
+    if curl -fsSLo "$tmp_dl" --connect-timeout 8 --max-time 15 "$(fresh_script_url)" \
+        && validate_script_candidate "$tmp_dl"; then
+        if ! chmod 755 "$tmp_dl" || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
+            echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+            return 1
+        fi
         echo -e "${GREEN}快捷命令 '$SHORTCUT_NAME' 已安装。${PLAIN}"
     elif [[ -f "$0" ]]; then
         # 降级: 本地复制
-        cp "$0" "$INSTALL_PATH" && chmod +x "$INSTALL_PATH"
+        if ! cp "$0" "$tmp_dl" || ! validate_script_candidate "$tmp_dl" \
+            || ! chmod 755 "$tmp_dl" || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
+            echo -e "${RED}快捷命令本地安装失败，现有文件未被覆盖。${PLAIN}" >&2
+            return 1
+        fi
         echo -e "${GREEN}快捷命令 '$SHORTCUT_NAME' 已安装 (本地)。${PLAIN}"
+    else
+        echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+        return 1
     fi
 }
 
@@ -662,6 +756,22 @@ get_x25519_pubkey() {
     echo "$pubk"
 }
 
+urlencode() {
+    local LC_ALL=C input="$1" output="" char encoded byte i
+    for ((i=0; i<${#input}; i++)); do
+        char=${input:i:1}
+        case "$char" in
+            [a-zA-Z0-9.~_-]) output+="$char" ;;
+            *)
+                printf -v byte '%d' "'$char"
+                printf -v encoded '%%%02X' "$((byte & 255))"
+                output+="$encoded"
+                ;;
+        esac
+    done
+    printf '%s' "$output"
+}
+
 show_node_info() {
     local tag=$1
     local ip=""
@@ -713,8 +823,8 @@ show_node_info() {
     elif [[ "$proto" == "shadowsocks" ]]; then
         local method=$(echo "$node" | jq -r '.settings.method')
         local pass=$(echo "$node" | jq -r '.settings.password')
-        local raw="${method}:${pass}"
-        local link="ss://$(echo -n "$raw" | base64 | tr -d '\n')@${display_ip}:${port}#${tag}"
+        # SIP022: Shadowsocks 2022 userinfo 使用明文方法名和百分号编码密码。
+        local link="ss://$(urlencode "$method"):$(urlencode "$pass")@${display_ip}:${port}#$(urlencode "$tag")"
         
         echo -e "地址: $ip"
         echo -e "端口: $port"
@@ -760,25 +870,38 @@ delete_node() {
 
 update_script() {
     echo -e "\n ${BLUE}>>> 更新管理脚本${PLAIN}"
-    local tmp_script=$(mktemp)
+    local tmp_script
+    tmp_script=$(mktemp "${INSTALL_PATH}.update.XXXXXX") || {
+        echo -e "${RED}无法创建更新临时文件，现有脚本未被覆盖。${PLAIN}" >&2
+        return 1
+    }
     _CLEANUP_FILES+=("$tmp_script")
 
-    if ! curl -fsSL --max-time 15 "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
-        echo -e "${RED}下载失败。${PLAIN}"; return
+    if ! curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)"; then
+        echo -e "${RED}下载失败，现有脚本未被覆盖。${PLAIN}"; return 1
     fi
-    
-    if [ ! -s "$tmp_script" ]; then
-        echo -e "${RED}下载文件为空。${PLAIN}"; return
+    if ! validate_script_candidate "$tmp_script"; then
+        echo -e "${RED}远程脚本格式或 Bash 语法校验失败，现有脚本未被覆盖。${PLAIN}"; return 1
     fi
 
     # 简单版本校验
     local remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2)
-    if [ "$remote_ver" == "$SCRIPT_VERSION" ]; then
+    if version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
+        echo -e "${RED}拒绝降级：远端 v${remote_ver} 低于当前 v${SCRIPT_VERSION}。${PLAIN}" >&2
+        return 1
+    fi
+    if [ "$remote_ver" == "$SCRIPT_VERSION" ] && cmp -s "$tmp_script" "$INSTALL_PATH"; then
         echo -e "${GREEN}已是最新 (v${SCRIPT_VERSION})。${PLAIN}"; return
     fi
 
-    mv -f "$tmp_script" "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
+    if [ "$remote_ver" == "$SCRIPT_VERSION" ]; then
+        echo -e "${YELLOW}检测到同版本内容修订，将继续更新。${PLAIN}"
+    fi
+
+    if ! chmod 755 "$tmp_script" || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
+        echo -e "${RED}替换脚本失败，现有脚本保持不变。${PLAIN}" >&2
+        return 1
+    fi
     echo -e "${GREEN}更新完成 (v${remote_ver})! 正在重新加载...${PLAIN}"
     exec "$INSTALL_PATH"
 }
@@ -837,9 +960,9 @@ main_menu() {
         choice=$(strip_cr "$choice")
         
         case $choice in
-            1) install_xray; read -p "按回车继续..." ;;
-            2) add_reality; read -p "按回车继续..." ;;
-            3) add_ss2022; read -p "按回车继续..." ;;
+            1) run_menu_action "安装或更新 Xray" install_xray; read -p "按回车继续..." ;;
+            2) run_menu_action "添加 Reality 节点" add_reality; read -p "按回车继续..." ;;
+            3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read -p "按回车继续..." ;;
             4) 
                 list_nodes
                 read -p "输入节点 ID 查看详情 (0 返回): " nid
@@ -851,10 +974,10 @@ main_menu() {
                 fi
                 read -p "按回车继续..."
                 ;;
-            5) delete_node; read -p "按回车继续..." ;;
+            5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
             6) configure_advanced ;;
-            7) update_script ;;
-            8) uninstall_script ;;
+            7) run_menu_action "更新 x-sb 管理脚本" update_script ;;
+            8) run_menu_action "卸载 Xray" uninstall_script ;;
             0) exit 0 ;;
             *) ;;
         esac

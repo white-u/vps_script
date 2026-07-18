@@ -29,7 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 | **[snell.sh](SNELL_DOC.md)** | **Snell 管理** | `snell` | 专为 Snell 协议设计，支持 **Systemd 模板化多实例**。 |
 | **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 支持 VLESS-Vision-REALITY 和 Shadowsocks-2022，配置回滚保护。 |
 | **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | Sing-Box 内核专用，支持 Reality 和链式代理，元数据分离设计。 |
-| **[fw.sh](vps_script/fw.sh)** | **端口转发** | `fw` | 基于 **realm** 的轻量级端口转发，支持 TCP/UDP。 |
+| **[fw.sh](fw.sh)** | **端口转发** | `fw` | 基于 **realm** 的轻量级端口转发，支持 TCP/UDP。 |
 
 ---
 

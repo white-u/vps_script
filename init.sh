@@ -7,6 +7,15 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+fail() {
+    echo -e "${RED}❌ 错误: $1${NC}" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}⚠️ 警告: $1${NC}" >&2
+}
+
 # ==============================
 # 0. 环境预检
 # ==============================
@@ -34,9 +43,9 @@ echo -e "${BLUE}=================================================${NC}"
 # 1. 系统更新与清理
 # ==============================
 echo -e "${YELLOW}[1/6] 正在更新系统并清理旧依赖...${NC}"
-apt update -y && apt upgrade -y
-apt autoremove -y
-apt clean
+apt update -y && apt upgrade -y || fail "系统软件包更新失败，请检查 APT 源和网络"
+apt autoremove -y || warn "apt autoremove 执行失败，可稍后手动运行"
+apt clean || warn "apt clean 执行失败"
 echo -e "${GREEN}系统更新完成。${NC}"
 
 # ==============================
@@ -48,10 +57,10 @@ echo -e "当前主机名: ${BLUE}${CURRENT_HOSTNAME}${NC}"
 read -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
 NEW_HOSTNAME=$(strip_cr "$NEW_HOSTNAME")
 if [ ! -z "$NEW_HOSTNAME" ]; then
-    hostnamectl set-hostname "$NEW_HOSTNAME"
-    sed -i "s/127.0.1.1.*/127.0.1.1\t$NEW_HOSTNAME/" /etc/hosts
+    hostnamectl set-hostname "$NEW_HOSTNAME" || fail "主机名修改失败"
+    sed -i "s/127.0.1.1.*/127.0.1.1\t$NEW_HOSTNAME/" /etc/hosts || fail "/etc/hosts 更新失败"
     if ! grep -q "127.0.1.1" /etc/hosts; then
-        echo -e "127.0.1.1\t$NEW_HOSTNAME" >> /etc/hosts
+        echo -e "127.0.1.1\t$NEW_HOSTNAME" >> /etc/hosts || fail "/etc/hosts 写入失败"
     fi
     echo -e "${GREEN}主机名已修改为: ${NEW_HOSTNAME}${NC}"
 else
@@ -63,7 +72,7 @@ fi
 # 3. 安装必备工具 (无 ufw/net-tools)
 # ==============================
 echo -e "${YELLOW}[3/6] 正在安装必备工具 (curl, wget, vim, unzip, nano, iperf3)...${NC}"
-apt install -y curl wget unzip nano vim iperf3
+apt install -y curl wget unzip nano vim iperf3 || fail "基础工具安装失败"
 
 echo -e "${YELLOW}正在安装 nexttrace...${NC}"
 if curl -sL nxtrace.org/nt | bash; then
@@ -83,7 +92,7 @@ if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
     fi
     echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    sysctl -p
+    sysctl -p || fail "内核参数加载失败，请检查 /etc/sysctl.conf"
     echo -e "${GREEN}BBR 已开启。${NC}"
 else
     echo -e "${GREEN}BBR 已经开启，无需重复操作。${NC}"
@@ -96,7 +105,7 @@ echo -e "${YELLOW}[5/6] SSH 安全配置${NC}"
 
 # 备份配置
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%F_%T)"
-cp /etc/ssh/sshd_config "$SSHD_BACKUP"
+cp /etc/ssh/sshd_config "$SSHD_BACKUP" || fail "SSH 配置备份失败，已停止修改"
 echo -e "已备份 SSH 配置文件至 ${SSHD_BACKUP}。"
 
 # 辅助函数：替换或追加 sshd_config 配置项
@@ -105,9 +114,9 @@ sshd_set() {
     local key="$1"
     local value="$2"
     if grep -qE "^#?\s*${key}\b" /etc/ssh/sshd_config; then
-        sed -i "s/^#\?\s*${key}\b.*/${key} ${value}/" /etc/ssh/sshd_config
+        sed -i "s/^#\?\s*${key}\b.*/${key} ${value}/" /etc/ssh/sshd_config || fail "SSH 配置项 ${key} 更新失败"
     else
-        echo "${key} ${value}" >> /etc/ssh/sshd_config
+        echo "${key} ${value}" >> /etc/ssh/sshd_config || fail "SSH 配置项 ${key} 写入失败"
     fi
 }
 
@@ -126,6 +135,23 @@ while true; do
         echo -e "${RED}无效端口，请输入 1-65535 之间的数字。${NC}"
     fi
 done
+
+echo -e "${YELLOW}切换 SSH 端口前，请先在云服务商安全组中放行 TCP ${SSH_PORT}。${NC}"
+read -p "确认安全组已放行该端口？请输入 yes 继续: " PORT_READY
+PORT_READY=$(strip_cr "$PORT_READY")
+if [ "$PORT_READY" != "yes" ]; then
+    echo -e "${YELLOW}已取消 SSH 配置，当前 SSH 服务未改动。${NC}"
+    exit 0
+fi
+
+# 先放行主机本地防火墙，再修改 sshd，避免正确配置也被本机规则拦截。
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${SSH_PORT}/tcp" >/dev/null || { echo -e "${RED}UFW 放行失败，已停止。${NC}"; exit 1; }
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" >/dev/null && firewall-cmd --reload >/dev/null || {
+        echo -e "${RED}firewalld 放行失败，已停止。${NC}"; exit 1;
+    }
+fi
 
 # --- 配置密钥登录 ---
 echo -e "${YELLOW}--- 密钥登录设置 ---${NC}"
@@ -188,14 +214,20 @@ if ! sshd -t; then
     exit 1
 fi
 
-systemctl restart sshd
-
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}SSH 服务重启成功。${NC}"
-else
-    echo -e "${RED}SSH 服务重启失败！配置可能出错，正在恢复备份...${NC}"
+if ! sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | grep -qx "$SSH_PORT"; then
+    echo -e "${RED}错误：sshd 生效配置中未发现新端口，正在回滚...${NC}"
     cp "$SSHD_BACKUP" /etc/ssh/sshd_config
-    systemctl restart sshd
+    exit 1
+fi
+
+SSH_SERVICE="sshd"
+systemctl cat sshd.service >/dev/null 2>&1 || SSH_SERVICE="ssh"
+if systemctl reload "$SSH_SERVICE" && sleep 1 && ss -lntH | awk '{print $4}' | grep -Eq "(^|\]):${SSH_PORT}$|(^|[^0-9])${SSH_PORT}$"; then
+    echo -e "${GREEN}SSH 服务已安全重载，并确认监听新端口。${NC}"
+else
+    echo -e "${RED}SSH 新端口未成功监听，正在恢复备份...${NC}"
+    cp "$SSHD_BACKUP" /etc/ssh/sshd_config
+    systemctl reload "$SSH_SERVICE" 2>/dev/null || systemctl restart "$SSH_SERVICE" 2>/dev/null
     exit 1
 fi
 
@@ -214,13 +246,13 @@ else
 fi
 
 echo -e "${RED}!!! 特别注意 !!!${NC}"
-echo -e "请务必在【云服务商安全组】中放行端口 ${RED}$SSH_PORT${NC} 之后再关闭当前会话。"
+echo -e "请先从一个新的终端测试端口 ${RED}$SSH_PORT${NC} 登录成功，再关闭当前会话。"
 
 read -p "是否立即重启服务器? [y/n]: " REBOOT_NOW
 REBOOT_NOW=$(strip_cr "$REBOOT_NOW")
 if [[ "$REBOOT_NOW" =~ ^[Yy]$ ]]; then
     echo -e "正在重启..."
-    reboot
+    reboot || fail "系统重启命令执行失败"
 else
     echo -e "请记得稍后手动重启以生效内核设置。"
 fi

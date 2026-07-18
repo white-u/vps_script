@@ -1,6 +1,6 @@
 # Sing-Box 多协议管理脚本 (sb.sh)
 
-**版本**: v1.0.4 | **快捷命令**: `sb` | **安装路径**: `/usr/local/bin/sb`
+**版本**: v1.0.6 | **快捷命令**: `sb` | **安装路径**: `/usr/local/bin/sb`
 
 ---
 
@@ -51,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/sb.s
 
 ```text
 ================================================================================
-  sb (sing-box)  v1.0.4
+  sb (sing-box)  v1.0.6
 ================================================================================
  核心状态: ✅ 运行中 (core 1.8.11)
  配置文件: /usr/local/etc/sing-box/config.json

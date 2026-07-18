@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.2
+# 端口转发管理脚本 (基于 realm) v2.2.2
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
 #
 # Usage: bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh)
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # 临时资源清理 (Ctrl+C / 异常退出时自动清理)
 _CLEANUP_FILES=()
@@ -18,6 +18,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+CURRENT_ACTION="初始化"
+unexpected_error() {
+    local rc=${1:-1} line=${2:-?}
+    printf '\n%b❌ 未预期错误: %s（第 %s 行，退出码 %s）%b\n' \
+        "${RED:-}" "${CURRENT_ACTION:-脚本执行}" "$line" "$rc" "${PLAIN:-}" >&2
+    echo "请保留以上信息，并执行: journalctl -xe --no-pager | tail -50" >&2
+}
+trap 'unexpected_error "$?" "$LINENO"' ERR
+
 # ==================== 变量定义 ====================
 RED="\033[31m"
 GREEN="\033[32m"
@@ -26,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.2.2"
 REALM_VERSION="2.7.0"
 
 REALM_BIN="/usr/local/bin/realm"
@@ -53,20 +62,64 @@ check_root() {
     fi
 }
 
+fresh_script_url() {
+    printf '%s?t=%s-%s' "$SCRIPT_URL" "$(date +%s)" "$$"
+}
+
+validate_script_candidate() {
+    local file=$1
+    local version
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q '^SCRIPT_VERSION="' "$file" || return 1
+    version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
+
 # 同步快捷命令 (入口处调用, 确保 /usr/local/bin/fw 与运行版本一致)
 sync_script() {
-    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
-        # 文件模式: 直接复制 (跳过从快捷命令自身运行的情况)
-        if [[ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]]; then
-            cp "$0" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-        fi
-    else
-        # 管道/进程替换模式: 从远程下载覆盖
-        if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH" 2>/dev/null; then
-            chmod +x "$SCRIPT_PATH"
-        fi
+    local current_real target_real
+    current_real=$(realpath "$0" 2>/dev/null || true)
+    target_real=$(realpath "$SCRIPT_PATH" 2>/dev/null || true)
+    if [[ "$0" == "$SCRIPT_PATH" ]] || \
+       [[ -n "$current_real" && -n "$target_real" && "$current_real" == "$target_real" ]]; then
+        return 0
     fi
+
+    local tmp_script
+    tmp_script=$(mktemp "${SCRIPT_PATH}.sync.XXXXXX") || {
+        warn "无法创建快捷命令同步临时文件，继续运行当前脚本。"
+        return 0
+    }
+    _CLEANUP_FILES+=("$tmp_script")
+
+    if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
+        cp "$0" "$tmp_script" 2>/dev/null || true
+    else
+        curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
+    fi
+
+    if validate_script_candidate "$tmp_script" && chmod 755 "$tmp_script" \
+        && mv -f "$tmp_script" "$SCRIPT_PATH"; then
+        return 0
+    fi
+    warn "快捷命令同步失败，继续运行当前脚本；现有快捷命令未被覆盖。"
+    return 0
 }
 
 # 依赖检查
@@ -122,11 +175,11 @@ init_meta() {
         echo '{"rules":[]}' > "$META_FILE"
         return
     fi
-    # JSON 完整性校验, 损坏则备份重建
+    # JSON 完整性校验：保留损坏现场，禁止静默清空规则。
     if ! jq empty "$META_FILE" 2>/dev/null; then
-        warn "fw.json 已损坏，正在重建 (旧文件备份为 fw.json.bak)"
-        cp "$META_FILE" "${META_FILE}.bak" 2>/dev/null || true
-        echo '{"rules":[]}' > "$META_FILE"
+        local backup="${META_FILE}.corrupt.$(date +%Y%m%d%H%M%S)"
+        cp -p "$META_FILE" "$backup" 2>/dev/null || true
+        err "fw.json 已损坏，已保留为 ${backup}，请修复后重试"
     fi
 }
 
@@ -215,6 +268,7 @@ detect_listen_addr() {
 
 # 1. 安装/更新 realm 核心二进制
 install_realm() {
+    CURRENT_ACTION="安装或更新 realm"
     if realm_installed; then
         local cur_ver
         cur_ver=$(get_realm_version)
@@ -281,7 +335,7 @@ EOF
     local count
     count=$(rule_count)
     if [[ "$count" -gt 0 ]]; then
-        reload_realm true
+        reload_realm true || err "realm 安装完成，但现有规则启动失败"
     fi
 
     info "realm v${REALM_VERSION} 已安装完成"
@@ -339,7 +393,7 @@ reload_realm() {
 
     if ! realm_installed; then
         warn "realm 未安装，配置已保存，请先运行: fw install"
-        return 0
+        return 1
     fi
 
     # 有规则, 确保开机自启
@@ -356,11 +410,15 @@ reload_realm() {
         [[ "$quiet" == "true" ]] || info "realm 已重载 (${count} 条规则)"
     else
         warn "realm 启动失败，请检查: journalctl -u ${SERVICE_NAME} -n 20"
+        return 1
     fi
+
+    return 0
 }
 
 # 4. 添加转发规则
 add_forward() {
+    CURRENT_ACTION="添加 realm 转发规则"
     local src_port=$1 dst_ip=$2 dst_port=$3 comment=${4:-""}
 
     validate_port "$src_port" "源端口" || return 1
@@ -393,12 +451,25 @@ add_forward() {
     # 净化备注
     comment=$(echo "$comment" | tr -d '"\\' | head -c 80)
 
-    local tmp
-    tmp=$(jq --argjson sp "$src_port" --arg di "$dst_ip" --argjson dp "$dst_port" --arg c "$comment" \
-        '.rules += [{"src_port":$sp, "dst_ip":$di, "dst_port":$dp, "comment":$c}]' "$META_FILE") \
-        && echo "$tmp" > "$META_FILE"
+    local backup_file tmp_file
+    backup_file=$(mktemp /tmp/fw_meta_backup.XXXXXX)
+    tmp_file=$(mktemp /tmp/fw_meta_new.XXXXXX)
+    _CLEANUP_FILES+=("$backup_file" "$tmp_file")
+    cp -p "$META_FILE" "$backup_file"
+    if ! jq --argjson sp "$src_port" --arg di "$dst_ip" --argjson dp "$dst_port" --arg c "$comment" \
+        '.rules += [{"src_port":$sp, "dst_ip":$di, "dst_port":$dp, "comment":$c}]' "$META_FILE" > "$tmp_file"; then
+        warn "规则写入失败"
+        return 1
+    fi
+    chmod 600 "$tmp_file"
+    mv -f "$tmp_file" "$META_FILE"
 
-    reload_realm true
+    if ! reload_realm true; then
+        cp -p "$backup_file" "$META_FILE"
+        reload_realm true >/dev/null 2>&1 || true
+        warn "转发启动失败，新增规则已回滚"
+        return 1
+    fi
     open_port "$src_port"
     echo ""
     info "转发已添加: :${src_port} → ${dst_ip}:${dst_port}"
@@ -407,6 +478,7 @@ add_forward() {
 
 # 5. 删除转发规则
 delete_forward() {
+    CURRENT_ACTION="删除 realm 转发规则"
     local src_port=$1
 
     validate_port "$src_port" "源端口" || return 1
@@ -417,11 +489,24 @@ delete_forward() {
         warn "源端口 ${src_port} 不存在"; return 1
     fi
 
-    local tmp
-    tmp=$(jq --argjson sp "$src_port" '.rules = [.rules[] | select(.src_port != $sp)]' "$META_FILE") \
-        && echo "$tmp" > "$META_FILE"
+    local backup_file tmp_file
+    backup_file=$(mktemp /tmp/fw_meta_backup.XXXXXX)
+    tmp_file=$(mktemp /tmp/fw_meta_new.XXXXXX)
+    _CLEANUP_FILES+=("$backup_file" "$tmp_file")
+    cp -p "$META_FILE" "$backup_file"
+    if ! jq --argjson sp "$src_port" '.rules = [.rules[] | select(.src_port != $sp)]' "$META_FILE" > "$tmp_file"; then
+        warn "规则写入失败"
+        return 1
+    fi
+    chmod 600 "$tmp_file"
+    mv -f "$tmp_file" "$META_FILE"
 
-    reload_realm true
+    if ! reload_realm true; then
+        cp -p "$backup_file" "$META_FILE"
+        reload_realm true >/dev/null 2>&1 || true
+        warn "realm 重载失败，删除操作已回滚"
+        return 1
+    fi
     close_port "$src_port"
     info "转发已删除: 源端口 ${src_port}"
     echo -e " ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
@@ -465,6 +550,7 @@ show_all_configs() {
 
 # 7. 更新管理脚本
 update_script() {
+    CURRENT_ACTION="更新 fw 管理脚本"
     echo
     echo -e " ${BLUE}>>> 更新管理脚本${PLAIN}"
     echo -e " 当前版本: v${SCRIPT_VERSION}"
@@ -472,29 +558,39 @@ update_script() {
     echo
 
     local tmp_script
-    tmp_script=$(mktemp /tmp/fw_update.XXXXXX.sh)
+    tmp_script=$(mktemp "${SCRIPT_PATH}.update.XXXXXX") || err "无法创建更新临时文件"
     _CLEANUP_FILES+=("$tmp_script")
 
-    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_script" 2>/dev/null; then
-        err "下载失败，请检查网络。"
+    if ! curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
+        err "下载失败，请检查网络；现有脚本未被覆盖。"
+    fi
+    if ! validate_script_candidate "$tmp_script"; then
+        err "远程脚本格式或 Bash 语法校验失败，现有脚本未被覆盖。"
     fi
 
     # 提取远程版本号
     local remote_ver
     remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2 || true)
 
+    if version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
+        rm -f "$tmp_script"
+        err "拒绝降级：远端 v${remote_ver} 低于当前 v${SCRIPT_VERSION}"
+    fi
+
     if [[ -z "$remote_ver" ]]; then
         warn "无法解析远程版本号，继续更新..."
-    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]] && cmp -s "$tmp_script" "$SCRIPT_PATH"; then
         info "已是最新版本 (v${SCRIPT_VERSION})，无需更新。"
         rm -f "$tmp_script"
         return
+    elif [[ "$remote_ver" == "$SCRIPT_VERSION" ]]; then
+        warn "检测到同版本内容修订，将继续更新。"
     else
         echo -e " 发现新版本: ${GREEN}v${remote_ver}${PLAIN}"
     fi
 
+    chmod 755 "$tmp_script"
     mv -f "$tmp_script" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
     info "脚本已更新完成! 正在重新加载..."
     echo
     exec "$SCRIPT_PATH"
@@ -502,6 +598,7 @@ update_script() {
 
 # 8. 完整卸载
 uninstall_all() {
+    CURRENT_ACTION="卸载 realm"
     echo
     echo -e " ${RED}════════════════════════════════════════${PLAIN}"
     echo -e " ${RED}  警告: 即将卸载 realm 并清除全部配置!${PLAIN}"
@@ -658,6 +755,7 @@ menu_status() {
 
 # ==================== 菜单 ====================
 menu() {
+    CURRENT_ACTION="读取 fw 管理菜单"
     clear
     echo -e "========================================================================================="
     echo -e "   端口转发管理脚本 (v${SCRIPT_VERSION})"
@@ -729,8 +827,8 @@ menu() {
                 [[ "$c" =~ ^[nN] ]] && return
                 install_realm
             fi
-            menu_add; read -rp " 按回车返回..." ;;
-        2) menu_delete; read -rp " 按回车返回..." ;;
+            menu_add || true; read -rp " 按回车返回..." ;;
+        2) menu_delete || true; read -rp " 按回车返回..." ;;
         3) show_all_configs; read -rp " 按回车返回..." ;;
         4) menu_status; read -rp " 按回车返回..." ;;
         5) install_realm; read -rp " 按回车返回..." ;;

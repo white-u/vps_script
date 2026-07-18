@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v2.1
+ * Cloudflare Worker - 端口流量查询中控 v2.3
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -9,26 +9,38 @@
  *   - SHARED_SECRET  : VPS 推送签名密钥
  *   - BOT_TOKEN      : Telegram Bot Token
  *   - ADMIN_ID       : 管理员 Telegram ID (字符串)
+ *   - TELEGRAM_WEBHOOK_SECRET : Telegram Webhook secret_token
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
- * v2.1 变更: 新增 /delnode 命令，支持删除云端节点数据
+ * v2.3 变更: 顶层异常捕获、请求追踪 ID 与 Telegram API 错误检查
  * ============================================================
  */
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    const requestId = request.headers.get("CF-Ray") ||
+      globalThis.crypto?.randomUUID?.() ||
+      `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      const url = new URL(request.url);
 
-    if (url.pathname === "/api/push" && request.method === "PUT") {
-      return handlePush(request, env);
+      if (url.pathname === "/api/push" && request.method === "PUT") {
+        return await handlePush(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/webhook") {
+        return await handleTelegram(request, env);
+      }
+
+      return new Response("OK");
+    } catch (error) {
+      console.error(`[${requestId}] Unhandled worker error`, error?.stack || error);
+      return new Response(`Internal Server Error\nRequest ID: ${requestId}`, {
+        status: 500,
+        headers: { "X-Request-ID": requestId }
+      });
     }
-
-    if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleTelegram(request, env);
-    }
-
-    return new Response("OK");
   }
 };
 
@@ -48,18 +60,34 @@ async function handlePush(request, env) {
     return new Response("Bad Request", { status: 400 });
   }
 
+  if (!/^\d+$/.test(ts)) {
+    return new Response("Invalid timestamp", { status: 400 });
+  }
+
+  const timestamp = Number(ts);
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - parseInt(ts)) > 120) {
+  if (!Number.isSafeInteger(timestamp) || Math.abs(now - timestamp) > 120) {
     return new Response("Timestamp expired", { status: 403 });
   }
 
-  const expected = await hmacSHA256(secret, ts + body);
-  if (sig !== expected) {
+  const expected = await hmacSHA256(secret, `${nodeKey}\n${ts}\n${body}`);
+  if (!secureEqual(sig, expected)) {
     return new Response("Forbidden", { status: 403 });
   }
 
-  let nodeId = nodeKey;
-  try { nodeId = JSON.parse(body).node_id || nodeKey; } catch {}
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(nodeKey)) {
+    return new Response("Invalid node key", { status: 400 });
+  }
+
+  let parsed;
+  try { parsed = JSON.parse(body); } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+      !parsed.ports || typeof parsed.ports !== "object" || Array.isArray(parsed.ports)) {
+    return new Response("Invalid payload", { status: 400 });
+  }
+  const nodeId = typeof parsed.node_id === "string" && parsed.node_id ? parsed.node_id : nodeKey;
 
   await env.DB.prepare(
     `INSERT INTO nodes (node_key, node_id, config_json, updated_at)
@@ -75,6 +103,15 @@ async function handlePush(request, env) {
 // 2. Telegram 指令处理
 // ==============================================================
 async function handleTelegram(request, env) {
+  const webhookSecret = env.TELEGRAM_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return new Response("Webhook secret not configured", { status: 500 });
+  }
+  const providedSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+  if (!secureEqual(providedSecret, webhookSecret)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
   let payload;
   try { payload = await request.json(); } catch { return new Response("OK"); }
   if (!payload.message?.text) return new Response("OK");
@@ -398,6 +435,17 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
   let report = `📊 *${escMd(nodeId)}* (${nodeKey}) ${freshIcon} ${freshStr}\n`;
   let hasData = false;
 
+  // PM 的分组配额按组内所有端口的合计流量执行，报告必须使用同一口径。
+  const groupUsage = {};
+  for (const p of Object.values(ports)) {
+    const groupId = p?.group_id || "";
+    if (!groupId) continue;
+    const accIn = Math.floor(p.stats?.acc_in || 0);
+    const accOut = Math.floor(p.stats?.acc_out || 0);
+    const used = (p.quota_mode || "in_out") === "out_only" ? accOut : accIn + accOut;
+    groupUsage[groupId] = (groupUsage[groupId] || 0) + used;
+  }
+
   for (const port of sortedPorts) {
     if (allowedPorts !== "all") {
       if (!allowedPorts.includes(parseInt(port))) continue;
@@ -411,10 +459,12 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
     const accIn     = Math.floor(p.stats?.acc_in || 0);
     const accOut    = Math.floor(p.stats?.acc_out || 0);
     const resetDay  = p.reset_day || 0;
+    const groupId   = p.group_id || "";
     const isPunished = p.dyn_limit?.is_punished === true;
     const punishMbps = p.dyn_limit?.punish_mbps || 0;
 
-    const totalUsed = mode === "out_only" ? accOut : (accIn + accOut);
+    const ownUsed = mode === "out_only" ? accOut : (accIn + accOut);
+    const totalUsed = groupId ? (groupUsage[groupId] || 0) : ownUsed;
     const quotaBytes = quotaGb * 1024 * 1024 * 1024;
     const pct = quotaBytes > 0 ? (totalUsed * 100 / quotaBytes) : 0;
     const isBlocked = quotaBytes > 0 && totalUsed > quotaBytes;
@@ -425,6 +475,7 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
     else if (pct >= 80)  statusIcon = "⚠️";
 
     const safeComment = comment ? ` ${escMd(comment)}` : "";
+    const groupStr = groupId ? ` G:${escMd(groupId)}` : "";
     const resetStr = resetDay > 0 ? ` R${resetDay}` : "";
 
     let speedInfo = "";
@@ -434,7 +485,7 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
       speedInfo = ` 🔒${limitMbps}M`;
     }
 
-    report += `\n${statusIcon} \`${port}\`${safeComment}${resetStr}`;
+    report += `\n${statusIcon} \`${port}\`${groupStr}${safeComment}${resetStr}`;
     report += `\n   ${fmtBytes(totalUsed)} / ${quotaGb}GB (${pct.toFixed(1)}%)${speedInfo}\n`;
     hasData = true;
   }
@@ -455,6 +506,13 @@ async function hmacSHA256(secret, message) {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function secureEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 function escMd(s) {
@@ -496,11 +554,15 @@ async function tgReply(env, chatId, text) {
   }
 
   for (const chunk of chunks) {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "Markdown" })
     });
+    if (!response.ok) {
+      const errorBody = (await response.text()).slice(0, 200);
+      throw new Error(`Telegram API failed with HTTP ${response.status}: ${errorBody}`);
+    }
   }
 
   return new Response("OK");

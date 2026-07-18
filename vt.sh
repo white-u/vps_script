@@ -5,7 +5,7 @@
 # 子脚本: snell (Snell代理), x-sb (Xray多协议), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="2.1"
+VT_VERSION="2.1.2"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
@@ -22,6 +22,19 @@ RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; DIM='\033[
 
 # Windows 终端兼容: 清洗 \r
 strip_cr() { echo "${1//$'\r'/}"; }
+
+report_child_exit() {
+    local name=$1 rc=$2
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${RED}❌ ${name} 异常退出（退出码 ${rc}）。请查看上方错误信息和对应 systemd 日志。${PLAIN}" >&2
+    fi
+}
+
+CLEANUP_FAILURES=0
+cleanup_warn() {
+    echo -e "${RED}❌ 清理未完成: $1${PLAIN}" >&2
+    CLEANUP_FAILURES=$((CLEANUP_FAILURES + 1))
+}
 
 # ─────────────────── 防火墙工具 ───────────────────
 
@@ -48,22 +61,61 @@ check_root() {
     [[ $(id -u) -ne 0 ]] && { echo -e "${RED}请使用 root 运行${PLAIN}"; exit 1; }
 }
 
+fresh_url() {
+    printf '%s?t=%s-%s' "$1" "$(date +%s)" "$$"
+}
+
+validate_script_file() {
+    local file=$1 version_key=$2
+    local version
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q "^${version_key}=\"" "$file" || return 1
+    version=$(grep "^${version_key}=" "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}
+        current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
+
 # 安装快捷命令 (首次运行时)
 install_self() {
     [[ "$(realpath "$0" 2>/dev/null)" == "$(realpath "$VT_INSTALL_PATH" 2>/dev/null)" ]] && return
-    local tmp=$(mktemp /tmp/vt_install.XXXXXX.sh)
-    if curl -fsSL --max-time 15 "$VT_URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-        mv -f "$tmp" "$VT_INSTALL_PATH"
-        chmod +x "$VT_INSTALL_PATH"
+    local tmp
+    tmp=$(mktemp "${VT_INSTALL_PATH}.install.XXXXXX") || {
+        echo -e "${RED}无法在 /usr/local/bin 创建更新临时文件。${PLAIN}" >&2
+        return 1
+    }
+    if curl -fsSLo "$tmp" --connect-timeout 8 --max-time 15 "$(fresh_url "$VT_URL")" \
+        && validate_script_file "$tmp" "VT_VERSION"; then
+        if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$VT_INSTALL_PATH"; then
+            echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+            return 1
+        fi
         echo -e "${GREEN}快捷命令 '$VT_SHORTCUT' 已安装。${PLAIN}"
         exec "$VT_INSTALL_PATH" "$@"
     else
-        rm -f "$tmp"
-        if [[ -f "$0" ]]; then
-            cp "$0" "$VT_INSTALL_PATH" && chmod +x "$VT_INSTALL_PATH"
+        if [[ -f "$0" ]] && cp "$0" "$tmp" \
+            && validate_script_file "$tmp" "VT_VERSION" \
+            && chmod 755 "$tmp" && mv -f "$tmp" "$VT_INSTALL_PATH"; then
             echo -e "${GREEN}快捷命令 '$VT_SHORTCUT' 已安装 (本地)。${PLAIN}"
             exec "$VT_INSTALL_PATH" "$@"
         fi
+        rm -f "$tmp"
+        echo -e "${YELLOW}快捷命令安装失败，继续运行当前脚本；现有文件未被覆盖。${PLAIN}" >&2
     fi
 }
 
@@ -101,25 +153,37 @@ dispatch() {
     # 如果快捷命令已存在且可执行, 直接运行
     if [[ -x "$target" ]] && [[ -s "$target" ]]; then
         "$target"
+        local rc=$?
+        report_child_exit "$name" "$rc"
         return
     fi
 
     # 否则下载到文件再执行 (避免 bash <(curl) 导致 $0 = /dev/fd/XX)
     echo -e "${YELLOW}正在下载 ${name} 管理脚本...${PLAIN}"
-    local tmp=$(mktemp /tmp/vt_dl.XXXXXX.sh)
-    if curl -fsSL --max-time 30 "$url" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
-        mv -f "$tmp" "$target"
-        chmod +x "$target"
+    local tmp
+    tmp=$(mktemp "${target}.download.XXXXXX") || {
+        echo -e "${RED}无法为 ${name} 创建下载临时文件。${PLAIN}" >&2
+        return 1
+    }
+    if curl -fsSLo "$tmp" --connect-timeout 8 --max-time 30 "$(fresh_url "$url")" \
+        && validate_script_file "$tmp" "SCRIPT_VERSION"; then
+        if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$target"; then
+            echo -e "${RED}${name} 脚本安装失败，现有文件未被覆盖。${PLAIN}" >&2
+            return 1
+        fi
         "$target"
+        local rc=$?
+        report_child_exit "$name" "$rc"
     else
         rm -f "$tmp"
-        echo -e "${RED}下载失败。${PLAIN}"
+        echo -e "${RED}下载失败或远程脚本校验未通过，未覆盖现有脚本。${PLAIN}"
     fi
 }
 
 # ─────────────────── 统一卸载 ───────────────────
 
 nuke_all() {
+    CLEANUP_FAILURES=0
     echo ""
     echo -e "${RED}════════════════════════════════════════${PLAIN}"
     echo -e "${RED}  警告: 即将卸载所有组件并清除全部数据!${PLAIN}"
@@ -148,7 +212,12 @@ nuke_all() {
         rm -rf /etc/snell
         rm -f /usr/local/bin/snell-server /usr/local/bin/snell
         userdel snell 2>/dev/null || true
-        echo -e " ${GREEN}  Snell 已清除${PLAIN}"
+        if snell_installed || [[ -d /etc/snell ]] || \
+           systemctl list-units 'snell@*.service' --state=active --no-legend 2>/dev/null | grep -q .; then
+            cleanup_warn "Snell 文件或运行实例仍然存在"
+        else
+            echo -e " ${GREEN}  Snell 已清除${PLAIN}"
+        fi
     fi
 
     # === Xray ===
@@ -166,7 +235,11 @@ nuke_all() {
         rm -f /etc/systemd/system/xray.service
         rm -rf /usr/local/etc/xray /usr/local/bin/xray /usr/local/share/xray /var/log/xray
         rm -f /usr/local/bin/x-sb
-        echo -e " ${GREEN}  Xray 已清除${PLAIN}"
+        if xray_installed || [[ -d /usr/local/etc/xray ]] || systemctl is-active --quiet xray 2>/dev/null; then
+            cleanup_warn "Xray 文件或服务仍然存在"
+        else
+            echo -e " ${GREEN}  Xray 已清除${PLAIN}"
+        fi
     fi
 
     # === sing-box ===
@@ -184,30 +257,44 @@ nuke_all() {
         rm -f /etc/systemd/system/sing-box.service
         rm -rf /usr/local/etc/sing-box /var/lib/sing-box
         rm -f /usr/local/bin/sing-box /usr/local/bin/sb
-        echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+        if sb_installed || [[ -d /usr/local/etc/sing-box ]] || systemctl is-active --quiet sing-box 2>/dev/null; then
+            cleanup_warn "sing-box 文件或服务仍然存在"
+        else
+            echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+        fi
     fi
 
     # === PM ===
     if pm_installed || [[ -f /usr/local/bin/pm ]]; then
         echo -e " ${YELLOW}清理 PM...${PLAIN}"
-        crontab -l 2>/dev/null | grep -v 'pm.*--monitor' | crontab - 2>/dev/null
+        local pm_cron="* * * * * /usr/local/bin/pm --monitor"
+        local pm_cron_logged="${pm_cron} >> /var/log/port_monitor.log 2>&1"
+        crontab -l 2>/dev/null | awk -v old="$pm_cron" -v current="$pm_cron_logged" \
+            '$0 != old && $0 != current' | crontab - 2>/dev/null
         local iface=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
-        if [[ -n "$iface" ]] && tc qdisc show dev "$iface" 2>/dev/null | grep -q "htb 1:"; then
-            tc qdisc del dev "$iface" root handle 1: htb 2>/dev/null || true
+        if [[ -n "$iface" ]] && [[ -f /etc/port_monitor/tc_root_owned ]] && \
+           [[ "$(cat /etc/port_monitor/tc_root_owned 2>/dev/null)" == "$iface" ]] && \
+           tc qdisc show dev "$iface" 2>/dev/null | grep -Eq 'qdisc htb 1:.* root'; then
+            tc qdisc del dev "$iface" root 2>/dev/null || true
         fi
         nft delete table inet port_monitor 2>/dev/null || true
         rm -rf /etc/port_monitor
-        rm -f /usr/local/bin/pm /var/run/pm.lock /tmp/pm_user_editing
-        echo -e " ${GREEN}  PM 已清除${PLAIN}"
+        rm -f /usr/local/bin/pm /var/run/pm.lock /tmp/pm_user_editing /var/log/port_monitor.log
+        if pm_installed || [[ -f /usr/local/bin/pm ]] || \
+           crontab -l 2>/dev/null | grep -Fqx -e "$pm_cron" -e "$pm_cron_logged"; then
+            cleanup_warn "PM 文件或 Cron 任务仍然存在"
+        else
+            echo -e " ${GREEN}  PM 已清除${PLAIN}"
+        fi
     fi
 
     # === FW (realm) ===
     if fw_installed || [[ -d /etc/realm ]]; then
         echo -e " ${YELLOW}清理 FW (realm)...${PLAIN}"
         # 关闭防火墙中已放行的端口
-        if [[ -f /etc/realm/meta.json ]]; then
+        if [[ -f /etc/realm/fw.json ]]; then
             local p
-            for p in $(jq -r '.rules[].src_port' /etc/realm/meta.json 2>/dev/null); do
+            for p in $(jq -r '.rules[].src_port' /etc/realm/fw.json 2>/dev/null); do
                 close_port "$p"
             done
         fi
@@ -216,13 +303,23 @@ nuke_all() {
         rm -f /etc/systemd/system/realm.service
         rm -rf /etc/realm
         rm -f /usr/local/bin/realm /usr/local/bin/fw
-        echo -e " ${GREEN}  FW 已清除${PLAIN}"
+        if fw_installed || [[ -d /etc/realm ]] || systemctl is-active --quiet realm 2>/dev/null; then
+            cleanup_warn "realm 文件或服务仍然存在"
+        else
+            echo -e " ${GREEN}  FW 已清除${PLAIN}"
+        fi
     fi
 
-    systemctl daemon-reload 2>/dev/null
+    systemctl daemon-reload 2>/dev/null || cleanup_warn "systemd daemon-reload 失败"
 
     echo ""
-    echo -e "${GREEN}全部清除完成。${PLAIN}"
+    if [[ $CLEANUP_FAILURES -gt 0 ]]; then
+        echo -e "${RED}清理结束，但有 ${CLEANUP_FAILURES} 项失败；请根据上方提示手动处理。${PLAIN}"
+        echo -e "${YELLOW}工具箱自身已保留，便于修复后重新执行清理。${PLAIN}"
+        return 1
+    else
+        echo -e "${GREEN}全部清除完成。${PLAIN}"
+    fi
     read -p " 是否同时卸载工具箱自身? [y/N]: " rm_self
     rm_self=$(strip_cr "$rm_self")
     if [[ "${rm_self,,}" == "y" ]]; then
@@ -238,21 +335,37 @@ update_self() {
     echo -e " 当前版本: v${VT_VERSION}"
     echo -e " 远程地址: ${DIM}${VT_URL}${PLAIN}"
     echo ""
-    local tmp=$(mktemp /tmp/vt_update.XXXXXX.sh)
-    if ! curl -fsSL --max-time 15 "$VT_URL" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    local tmp
+    tmp=$(mktemp "${VT_INSTALL_PATH}.update.XXXXXX") || {
+        echo -e "${RED}无法创建更新临时文件，当前版本保持不变。${PLAIN}" >&2
+        return 1
+    }
+    if ! curl -fsSLo "$tmp" --connect-timeout 8 --max-time 15 "$(fresh_url "$VT_URL")" \
+        || ! validate_script_file "$tmp" "VT_VERSION"; then
         rm -f "$tmp"
-        echo -e "${RED}下载失败。${PLAIN}"
+        echo -e "${RED}下载失败或远程脚本校验未通过，当前版本保持不变。${PLAIN}"
         return
     fi
     local remote_ver=$(grep '^VT_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
-    if [[ "$remote_ver" == "$VT_VERSION" ]]; then
+    if version_is_older "$remote_ver" "$VT_VERSION"; then
+        rm -f "$tmp"
+        echo -e "${RED}拒绝降级：远端 v${remote_ver} 低于当前 v${VT_VERSION}。${PLAIN}" >&2
+        return 1
+    fi
+    if [[ "$remote_ver" == "$VT_VERSION" ]] && cmp -s "$tmp" "$VT_INSTALL_PATH"; then
         rm -f "$tmp"
         echo -e "${GREEN}已是最新版本。${PLAIN}"
         return
     fi
-    echo -e " 发现新版本: v${remote_ver}"
-    mv -f "$tmp" "$VT_INSTALL_PATH"
-    chmod +x "$VT_INSTALL_PATH"
+    if [[ "$remote_ver" == "$VT_VERSION" ]]; then
+        echo -e " 发现同版本内容修订: v${remote_ver}"
+    else
+        echo -e " 发现新版本: v${remote_ver}"
+    fi
+    if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$VT_INSTALL_PATH"; then
+        echo -e "${RED}替换工具箱脚本失败，当前版本保持不变。${PLAIN}" >&2
+        return 1
+    fi
     echo -e "${GREEN}更新完成, 正在重启...${PLAIN}"
     exec "$VT_INSTALL_PATH"
 }
