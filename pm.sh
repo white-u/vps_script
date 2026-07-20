@@ -215,7 +215,10 @@ install_deps() {
             . /etc/os-release
             case $ID in
                 debian|ubuntu)
-                    apt-get update -q && apt-get install -y -q nftables iproute2 jq bc curl coreutils util-linux openssl cron ;;
+                    if ! apt-get update -q; then
+                        echo -e "${YELLOW}警告: 部分 APT 软件源刷新失败；将使用现有索引继续安装依赖。请检查上方报错的软件源。${PLAIN}" >&2
+                    fi
+                    apt-get install -y -q nftables iproute2 jq bc curl coreutils util-linux openssl cron || true ;;
                 centos|rhel|almalinux|rocky)
                     yum install -y -q nftables iproute tc jq bc curl coreutils util-linux openssl cronie ;;
                 alpine)

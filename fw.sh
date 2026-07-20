@@ -127,7 +127,10 @@ check_deps() {
     command -v jq &>/dev/null && return 0
     info "安装必要依赖..."
     if [ -f /etc/debian_version ]; then
-        apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1
+        if ! apt-get update -qq; then
+            warn "部分 APT 软件源刷新失败；将使用现有索引继续安装 jq。请检查上方报错的软件源。"
+        fi
+        apt-get install -y -qq jq || true
     elif [ -f /etc/redhat-release ]; then
         yum install -y jq >/dev/null 2>&1 || true
     elif [ -f /etc/alpine-release ]; then

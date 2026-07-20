@@ -173,7 +173,10 @@ check_deps() {
     if [[ $need_install -eq 1 ]]; then
         info "安装必要依赖..."
         if [ -f /etc/debian_version ]; then
-            apt-get update && apt-get install -y "${deps[@]}"
+            if ! apt-get update; then
+                warn "部分 APT 软件源刷新失败；将使用现有索引继续安装依赖。请检查上方报错的软件源。"
+            fi
+            apt-get install -y "${deps[@]}" || true
         elif [ -f /etc/redhat-release ]; then
             yum install -y "${deps[@]}" || true
         elif [ -f /etc/alpine-release ]; then

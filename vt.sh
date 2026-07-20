@@ -131,7 +131,11 @@ fw_installed()    { [[ -x /usr/local/bin/realm ]]; }
 snell_version() { cat /etc/snell/.version 2>/dev/null || echo "?"; }
 xray_version()  { /usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "?"; }
 sb_version()    { /usr/local/bin/sing-box version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
-pm_version()    { grep -oP 'SCRIPT_VERSION="\K[^"]+' /usr/local/bin/pm 2>/dev/null || echo "?"; }
+pm_version() {
+    local version
+    version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' /usr/local/bin/pm 2>/dev/null | head -n 1)
+    echo "${version:-?}"
+}
 fw_version()    { /usr/local/bin/realm --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
 
 # 格式化状态行

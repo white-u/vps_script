@@ -112,8 +112,10 @@ check_deps() {
 
   case "$pm" in
     apt)
-      apt-get update -y
-      apt-get install -y curl tar jq openssl qrencode iproute2
+      if ! apt-get update -y; then
+        echo -e "${YELLOW}警告: 部分 APT 软件源刷新失败；将使用现有索引继续安装依赖。请检查上方报错的软件源。${PLAIN}" >&2
+      fi
+      apt-get install -y curl tar jq openssl qrencode iproute2 || true
       ;;
     yum)
       yum install -y curl tar jq openssl qrencode iproute
