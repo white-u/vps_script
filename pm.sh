@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.4.3 (IP Sentinel)
+# 版本: v5.4.4 (Telegram UI)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -17,7 +17,7 @@ STATE_DIR="$CONFIG_DIR/state"
 TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.4.3"
+SCRIPT_VERSION="5.4.4"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=3
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -34,6 +34,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PLAIN='\033[0m'
+TG_DIVIDER="━━━━━━━━━━━━━━"
 
 pm_error() {
     local message="$*"
@@ -648,8 +649,38 @@ tg_send() {
     [ -z "$token" ] || [ -z "$chat_id" ] && return
     local api_url=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
     (
-        if ! curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
-            -d chat_id="$chat_id" -d text="$msg" -d parse_mode="Markdown" >/dev/null 2>&1; then
+        local send_failed=false
+        if [ "${#msg}" -le 3900 ]; then
+            curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
+                -d chat_id="$chat_id" -d text="$msg" -d parse_mode="Markdown" >/dev/null 2>&1 || send_failed=true
+        else
+            while IFS= read -r -d '' chunk; do
+                [ -z "$chunk" ] && continue
+                if ! curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
+                    -d chat_id="$chat_id" -d text="$chunk" -d parse_mode="Markdown" >/dev/null 2>&1; then
+                    send_failed=true
+                    break
+                fi
+            done < <(printf '%s' "$msg" | jq -Rrsj '
+                def chunks($limit):
+                    reduce (split("\n")[]) as $line
+                        ({parts: [], current: ""};
+                         (if .current == "" then $line else .current + "\n" + $line end) as $candidate
+                         | if ($candidate | length) <= $limit then
+                               .current = $candidate
+                           else
+                               .parts += [.current]
+                               | .current = $line
+                           end)
+                    | .parts + (if .current == "" then [] else [.current] end)
+                    | map(. as $part
+                          | [range(0; ($part | length); $limit) as $offset
+                             | $part[$offset:($offset + $limit)]])
+                    | add;
+                chunks(3900)[] + "\u0000"
+            ' 2>/dev/null)
+        fi
+        if [ "$send_failed" = "true" ]; then
             pm_error "Telegram 通知发送失败，请检查 Bot Token、Chat ID 和网络"
         fi
     ) &
@@ -667,15 +698,19 @@ tg_notify_quota() {
     
     local port_info="\`${port}\`"
     if [ -n "$group_id" ] && [ "$group_id" != "null" ]; then
-        port_info="\`${port}\` (Group: $group_id)"
+        local safe_group_id=$(echo "$group_id" | sed 's/[_*`\[]/\\&/g')
+        port_info="\`${port}\` (Group: $safe_group_id)"
     fi
 
     tg_send "${icon} *流量预警*
-🏷 标识: *${label}*
-🔌 端口: ${port_info}
-📊 已用: ${used_fmt} / ${quota_gb}GB (*${percent}%*)
-📋 模式: ${mode_str}
-⏰ 状态: 已超过 *${threshold}%* 阈值"
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  ${port_info}
+├ 📦 流量  ${used_fmt} / ${quota_gb}GB
+├ 📋 统计  ${mode_str}
+└ 📈 使用  *${percent}%*
+${TG_DIVIDER}
+⚠️ 已超过 ${threshold}% 提醒阈值"
 }
 
 tg_notify_blocked() {
@@ -690,40 +725,53 @@ tg_notify_blocked() {
     fi
 
     tg_send "🚫 *${title}*
-🏷 标识: *${label}*
-🔌 端口: \`${port}\`
-📊 流量配额已耗尽，服务已阻断
-🔄 重置策略: ${reset_str}"
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  \`${port}\`
+├ 📦 配额  ${quota_gb}GB
+└ 🔄 重置  ${reset_str}
+${TG_DIVIDER}
+⛔ 流量配额已耗尽，服务连接已阻断"
 }
 
 tg_notify_punish() {
     local port=$1 comment=$2 avg_mbps=$3 trigger_mbps=$4 punish_mbps=$5 punish_min=$6 group_id=$7
     local label=$(get_host_label "$comment" "$group_id")
     tg_send "⚡ *动态限速触发*
-🏷 标识: *${label}*
-🔌 端口: \`${port}\`
-📈 平均速率: ${avg_mbps} Mbps (阈值 ${trigger_mbps} Mbps)
-📉 已降速至: *${punish_mbps} Mbps*
-⏱ 持续时间: ${punish_min} 分钟"
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  \`${port}\`
+├ 📈 速率  ${avg_mbps} Mbps
+├ 🎯 阈值  ${trigger_mbps} Mbps
+├ 📉 限速  *${punish_mbps} Mbps*
+└ ⏱ 时长  ${punish_min} 分钟
+${TG_DIVIDER}
+ℹ️ 惩罚期结束后将自动恢复"
 }
 
 tg_notify_recover() {
     local port=$1 comment=$2 group_id=$3
     local label=$(get_host_label "$comment" "$group_id")
     tg_send "✅ *限速已恢复*
-🏷 标识: *${label}*
-🔌 端口: \`${port}\`
-📈 惩罚期结束，已恢复原始速率"
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  \`${port}\`
+└ 📈 状态  已恢复原始速率
+${TG_DIVIDER}
+ℹ️ 动态限速惩罚期已结束"
 }
 
 tg_notify_reset() {
     local port=$1 comment=$2 quota_gb=$3 group_id=$4
     local label=$(get_host_label "$comment" "$group_id")
     tg_send "🔄 *配额已自动重置*
-🏷 标识: *${label}*
-🔌 端口: \`${port}\`
-📊 新配额: ${quota_gb} GB
-⏰ 新周期已开始"
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  \`${port}\`
+├ 📦 配额  ${quota_gb}GB
+└ 🗓 周期  新周期已开始
+${TG_DIVIDER}
+✅ 流量计数已清零"
 }
 
 tg_notify_report() {
@@ -789,28 +837,34 @@ tg_notify_report() {
         elif [ $(echo "$percent >= 80" | bc 2>/dev/null) -eq 1 ] 2>/dev/null; then status_icon="⚠️"; fi
         
         local port_title="\`${port}\`"
-        if [ -n "$gid" ]; then port_title="${port_title} [G:$gid]"; fi
+        if [ -n "$gid" ]; then
+            local safe_gid=$(echo "$gid" | sed 's/[_*`\[]/\\&/g')
+            port_title="${port_title} [G:$safe_gid]"
+        fi
         if [ -n "$comment" ]; then
             local safe_comment=$(echo "$comment" | sed 's/[_*`\[]/\\&/g')
             port_title="${port_title} ${safe_comment}"
         fi
         
-        local speed_info=""
+        local speed_info="正常策略"
         if [ "$s_is_punished" == "true" ]; then
             local pun_mbps=$(echo "$p_conf" | jq -r '.dyn_limit.punish_mbps // 0')
-            speed_info=" ⚡${pun_mbps}M"
+            speed_info="⚡ 动态限速 ${pun_mbps} Mbps"
         elif [ "$limit" != "0" ] && [ -n "$limit" ]; then
-            speed_info=" 🔒${limit}M"
+            speed_info="🔒 出站限速 ${limit} Mbps"
         fi
         
         report_lines="${report_lines}
-${status_icon} ${port_title}
-   ${used_fmt} / ${quota_gb}GB (${percent}%)${speed_info}"
+${status_icon} *端口* ${port_title}
+├ 📦 ${used_fmt} / ${quota_gb}GB · ${percent}%
+└ ⚙️ ${speed_info}"
     done
     
     tg_send "📋 *定时流量报告*
-🖥 主机: \`${host_label}\`
-⏰ ${now_str}
+${TG_DIVIDER}
+🖥 *${host_label}*
+└ 🕒 ${now_str}
+${TG_DIVIDER}
 ${report_lines}"
 }
 
@@ -934,14 +988,17 @@ tg_notify_ip_alert() {
     local port=$1 comment=$2 ip_count=$3 max_ips=$4 ip_details=$5 group_id=$6
     local label=$(get_host_label "$comment" "$group_id")
     tg_send "🚨 *异常接入警报*
-🏷 标识: *${label}*
-🔌 端口: \`${port}\`
-📊 状态: 🔴 *${ip_count}* 人在线 (阈值: ${max_ips})
-
-📋 接入详情:
+${TG_DIVIDER}
+🖥 *${label}*
+├ 🔌 端口  \`${port}\`
+├ 👥 在线  *${ip_count} IP*
+└ 🎯 阈值  ${max_ips} IP
+${TG_DIVIDER}
+📋 *当前连接*
 ${ip_details}
+${TG_DIVIDER}
 ⚠️ 建议检查密码或重启服务
-⏱ $(date '+%Y-%m-%d %H:%M:%S')"
+🕒 $(date '+%Y-%m-%d %H:%M:%S')"
 }
 
 # 从 ss 输出中提取端口的独立对端 IP（去重、清洗 IPv4-mapped）
@@ -2006,8 +2063,15 @@ configure_telegram() {
                     echo -e "${RED}请先配置 Token 和 Chat ID!${PLAIN}"; sleep 1
                 else
                     local nid=$(jq -r '.node_id // "unknown"' "$CONFIG_FILE")
+                    local safe_nid=$(echo "$nid" | sed 's/[_*`\[]/\\&/g')
+                    local test_msg="✅ *Telegram 通知测试*
+${TG_DIVIDER}
+🖥 节点  *${safe_nid}*
+└ 📡 状态  Bot 通信正常
+${TG_DIVIDER}
+ℹ️ PM 通知配置已生效"
                     local result=$(curl -s --max-time 10 "${au}/bot${tk}/sendMessage" \
-                        -d chat_id="$ci" -d text="✅ PM 测试消息 (节点: ${nid})" -d parse_mode="Markdown")
+                        -d chat_id="$ci" -d text="$test_msg" -d parse_mode="Markdown")
                     if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
                         echo -e "${GREEN}发送成功!${PLAIN}"
                     else
