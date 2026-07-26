@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.4.2 (IP Sentinel)
+# 版本: v5.4.3 (IP Sentinel)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -17,7 +17,7 @@ STATE_DIR="$CONFIG_DIR/state"
 TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.4.2"
+SCRIPT_VERSION="5.4.3"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=3
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -767,21 +767,66 @@ push_to_worker() {
     [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ] && return
     local payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
     [ -z "$payload" ] && return
-    # 从 state/*.txt 注入实时运行数据到 payload
+    # 从 state/*.txt 注入实时运行数据，并附加当前连接 IP 列表到 payload。
+    # 性能约束: 每轮推送只执行一次 ss，再按本地端口聚合，避免端口多时重复扫描连接表。
     local _push_ports=$(echo "$payload" | jq -r '.ports | keys[]')
+    local scan_ts=$(date +%s)
+    declare -A _push_port_set _online_ip_cache _online_ip_seen
+    for _pp in $_push_ports; do
+        _push_port_set["$_pp"]=1
+    done
+    while IFS=$'\t' read -r local_ep peer_ep; do
+        if [ -z "$local_ep" ] || [ -z "$peer_ep" ]; then
+            continue
+        fi
+        local local_port="${local_ep##*:}"
+        [[ -n "${_push_port_set[$local_port]+x}" ]] || continue
+        local peer_ip="${peer_ep%:*}"
+        peer_ip="${peer_ip#[}"
+        peer_ip="${peer_ip%]}"
+        peer_ip="${peer_ip#::ffff:}"
+        [ -z "$peer_ip" ] && continue
+        local cache_key="${local_port}|${peer_ip}"
+        [[ -n "${_online_ip_seen[$cache_key]+x}" ]] && continue
+        _online_ip_seen["$cache_key"]=1
+        _online_ip_cache["$local_port"]+="${peer_ip}"$'\n'
+    done < <(ss -Hnt state established 2>/dev/null | awk '{print $3 "\t" $4}')
+
     for _pp in $_push_ports; do
         _load_port_state "$_pp"
+        local online_ips online_count online_limited online_list_json online_truncated
+        online_ips="${_online_ip_cache[$_pp]:-}"
+        online_count=0
+        if [ -n "$online_ips" ]; then
+            online_count=$(printf '%s\n' "$online_ips" | grep -cve '^[[:space:]]*$')
+        fi
+        online_truncated=false
+        online_limited="$online_ips"
+        if [ "$online_count" -gt 50 ] 2>/dev/null; then
+            online_limited=$(printf '%s\n' "$online_ips" | head -n 50)
+            online_truncated=true
+        fi
+        online_list_json=$(printf '%s\n' "$online_limited" | jq -R -s -c 'split("\n") | map(select(length > 0))')
         payload=$(echo "$payload" | jq \
             --arg p "$_pp" --argjson ai "$s_acc_in" --argjson ao "$s_acc_out" \
             --argjson ki "$s_last_k_in" --argjson ko "$s_last_k_out" \
             --argjson ip "$( [ "$s_is_punished" = "true" ] && echo true || echo false )" \
             --argjson sc "$s_strike" --argjson pet "$s_punish_end_ts" \
             --argjson ql "$s_quota_level" \
+            --argjson online_count "$online_count" --argjson online_ips "$online_list_json" \
+            --argjson online_ts "$scan_ts" \
+            --argjson online_truncated "$( [ "$online_truncated" = "true" ] && echo true || echo false )" \
             '.ports[$p].stats.acc_in = $ai | .ports[$p].stats.acc_out = $ao
              | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko
              | .ports[$p].dyn_limit.is_punished = $ip | .ports[$p].dyn_limit.strike_count = $sc
              | .ports[$p].dyn_limit.punish_end_ts = $pet
-             | .ports[$p].notify_state.quota_level = $ql')
+             | .ports[$p].notify_state.quota_level = $ql
+             | .ports[$p].online = {
+                 ip_count: $online_count,
+                 ips: $online_ips,
+                 updated_at: $online_ts,
+                 truncated: $online_truncated
+               }')
     done
     local timestamp=$(date +%s)
     local signature=$(printf '%s\n%s\n%s' "$node_key" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')

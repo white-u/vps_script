@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v2.3
+ * Cloudflare Worker - 端口流量查询中控 v2.5
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -13,7 +13,7 @@
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
- * v2.3 变更: 顶层异常捕获、请求追踪 ID 与 Telegram API 错误检查
+ * v2.5 变更: Telegram 报告为在线 IP 附加归属地/运营商信息
  * ============================================================
  */
 
@@ -173,14 +173,14 @@ async function handleQuery(env, chatId, userId, text, isAdmin) {
       if (!rows.results?.length) return tgReply(env, chatId, "暂无节点数据。");
       let fullMsg = "";
       for (const r of rows.results) {
-        fullMsg += generateReport(r.node_key, r.node_id, r.config_json, r.updated_at, "all") + "\n";
+        fullMsg += await generateReport(r.node_key, r.node_id, r.config_json, r.updated_at, "all") + "\n";
       }
       return tgReply(env, chatId, fullMsg.trim());
     }
 
     const row = await env.DB.prepare("SELECT * FROM nodes WHERE node_key = ?1").bind(target).first();
     if (!row) return tgReply(env, chatId, `❌ 节点 \`${target}\` 未找到`);
-    return tgReply(env, chatId, generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, "all"));
+    return tgReply(env, chatId, await generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, "all"));
 
   } else {
     // 普通用户: 从 D1 读取权限
@@ -193,7 +193,7 @@ async function handleQuery(env, chatId, userId, text, isAdmin) {
       try { ports = JSON.parse(perm.ports); } catch { ports = []; }
       const row = await env.DB.prepare("SELECT * FROM nodes WHERE node_key = ?1").bind(perm.node_key).first();
       if (row) {
-        fullMsg += generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, ports) + "\n";
+        fullMsg += await generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, ports) + "\n";
       }
     }
     if (!fullMsg) return tgReply(env, chatId, "暂无可查询的数据。");
@@ -419,9 +419,9 @@ async function handleHelp(env, chatId, isAdmin) {
 }
 
 // ==============================================================
-// 报告生成 (不变)
+// 报告生成
 // ==============================================================
-function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
+async function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
   let conf;
   try { conf = JSON.parse(configJson); } catch { return `❌ 节点 \`${nodeKey}\` 数据异常`; }
 
@@ -431,6 +431,7 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
   const freshness = now - updatedAt;
   const freshIcon = freshness < 180 ? "🟢" : "🔴";
   const freshStr = fmtAge(freshness);
+  const geoMap = await lookupIpGeos(collectVisibleOnlineIps(sortedPorts, ports, allowedPorts));
 
   let report = `📊 *${escMd(nodeId)}* (${nodeKey}) ${freshIcon} ${freshStr}\n`;
   let hasData = false;
@@ -462,6 +463,11 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
     const groupId   = p.group_id || "";
     const isPunished = p.dyn_limit?.is_punished === true;
     const punishMbps = p.dyn_limit?.punish_mbps || 0;
+    const online = p.online || {};
+    const onlineIps = Array.isArray(online.ips) ? online.ips : [];
+    const parsedOnlineCount = Number(online.ip_count);
+    const onlineCount = Number.isFinite(parsedOnlineCount) ? Math.max(0, Math.floor(parsedOnlineCount)) : onlineIps.length;
+    const onlineTruncated = online.truncated === true;
 
     const ownUsed = mode === "out_only" ? accOut : (accIn + accOut);
     const totalUsed = groupId ? (groupUsage[groupId] || 0) : ownUsed;
@@ -487,6 +493,13 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
 
     report += `\n${statusIcon} \`${port}\`${groupStr}${safeComment}${resetStr}`;
     report += `\n   ${fmtBytes(totalUsed)} / ${quotaGb}GB (${pct.toFixed(1)}%)${speedInfo}\n`;
+    if (onlineCount > 0) {
+      const shownIps = onlineIps.slice(0, 8);
+      const ipList = shownIps.map(ip => formatIpWithGeo(ip, geoMap)).join(" ");
+      const hasMore = onlineTruncated || onlineCount > shownIps.length;
+      const moreText = hasMore ? " ..." : "";
+      report += `   👥 ${onlineCount} IP${ipList ? `: ${ipList}${moreText}` : ""}\n`;
+    }
     hasData = true;
   }
 
@@ -500,6 +513,68 @@ function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
 // ==============================================================
 // 工具函数
 // ==============================================================
+
+function collectVisibleOnlineIps(sortedPorts, ports, allowedPorts) {
+  const seen = new Set();
+  const ips = [];
+  for (const port of sortedPorts) {
+    if (allowedPorts !== "all" && !allowedPorts.includes(parseInt(port))) continue;
+    const onlineIps = Array.isArray(ports[port]?.online?.ips) ? ports[port].online.ips : [];
+    for (const ip of onlineIps.slice(0, 8)) {
+      const normalized = String(ip || "").trim();
+      if (!normalized || seen.has(normalized) || !isLikelyPublicIp(normalized)) continue;
+      seen.add(normalized);
+      ips.push(normalized);
+      if (ips.length >= 20) return ips;
+    }
+  }
+  return ips;
+}
+
+async function lookupIpGeos(ips) {
+  if (!ips.length) return {};
+  try {
+    const timeoutSignal = typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(2500)
+      : undefined;
+    const response = await fetch("http://ip-api.com/batch?fields=status,country,regionName,city,isp,query&lang=zh-CN", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ips),
+      signal: timeoutSignal
+    });
+    if (!response.ok) return {};
+    const rows = await response.json();
+    if (!Array.isArray(rows)) return {};
+    const geoMap = {};
+    for (const row of rows) {
+      if (row?.status !== "success" || !row.query) continue;
+      const location = [row.country, row.regionName, row.city].filter(Boolean).join(" ");
+      const isp = row.isp || "";
+      const label = [location, isp].filter(Boolean).join(" / ");
+      if (label) geoMap[row.query] = label;
+    }
+    return geoMap;
+  } catch {
+    return {};
+  }
+}
+
+function formatIpWithGeo(ip, geoMap) {
+  const safeIp = escMd(ip);
+  const geo = geoMap[ip];
+  if (!geo) return `\`${safeIp}\``;
+  return `\`${safeIp}\`(${escMd(geo)})`;
+}
+
+function isLikelyPublicIp(ip) {
+  if (/^(10|127|169\.254)\./.test(ip)) return false;
+  if (/^192\.168\./.test(ip)) return false;
+  const v4 = ip.match(/^172\.(\d{1,3})\./);
+  if (v4 && Number(v4[1]) >= 16 && Number(v4[1]) <= 31) return false;
+  if (/^(::1|fc|fd|fe80:)/i.test(ip)) return false;
+  return true;
+}
 
 async function hmacSHA256(secret, message) {
   const enc = new TextEncoder();

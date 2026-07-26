@@ -25,7 +25,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 | 脚本 | 功能 | 快捷命令 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **[vt.sh](vt.sh)** | **总控工具箱** | `vt` | 统一管理入口，查看组件状态，一键清理环境。 |
-| **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**动态 QoS 限速**、Telegram 通知。 |
+| **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**动态 QoS 限速**、Telegram 通知、在线 IP 上报。 |
 | **[snell.sh](SNELL_DOC.md)** | **Snell 管理** | `snell` | 专为 Snell 协议设计，支持 **Systemd 模板化多实例**。 |
 | **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 支持 VLESS-Vision-REALITY 和 Shadowsocks-2022，配置回滚保护。 |
 | **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | Sing-Box 内核专用，支持 Reality 和链式代理，元数据分离设计。 |
