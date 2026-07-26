@@ -60,6 +60,10 @@ rotate_pm_log() {
 # --- 临时资源清理 ---
 _CLEANUP_FILES=()
 _IS_MENU_MODE=false
+_CONNECTION_SNAPSHOT_FILE=""
+_UNIQUE_CONNECTION_SNAPSHOT_FILE=""
+_CONNECTION_SNAPSHOT_TS=0
+_SENTINEL_GEO_REQUESTS=0
 _global_cleanup() {
     for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
         rm -rf "$f" 2>/dev/null
@@ -70,6 +74,60 @@ _global_cleanup() {
     fi
 }
 trap _global_cleanup EXIT INT TERM
+
+# 按需抓取一次当前 TCP 已建立连接，供同一轮任务中的 Sentinel 与云推送复用。
+# 快照格式: 本地端口<TAB>对端 IP（每条连接一行，保留重复项用于连接数排序）。
+_ensure_connection_snapshot() {
+    if [ -n "$_CONNECTION_SNAPSHOT_FILE" ] && [ -f "$_CONNECTION_SNAPSHOT_FILE" ]; then
+        return 0
+    fi
+
+    local snapshot_file
+    snapshot_file=$(mktemp) || return 1
+    _CLEANUP_FILES+=("$snapshot_file")
+    _CONNECTION_SNAPSHOT_FILE="$snapshot_file"
+
+    ss -Hnt state established 2>/dev/null | awk '
+        function endpoint_port(value) {
+            sub(/^.*:/, "", value)
+            return value
+        }
+        function endpoint_ip(value) {
+            sub(/:[^:]*$/, "", value)
+            sub(/^\[/, "", value)
+            sub(/\]$/, "", value)
+            sub(/^::ffff:/, "", value)
+            return value
+        }
+        {
+            local_port = endpoint_port($3)
+            peer_ip = endpoint_ip($4)
+            if (local_port ~ /^[0-9]+$/ && peer_ip != "") {
+                print local_port "\t" peer_ip
+            }
+        }
+    ' > "$snapshot_file"
+    local ss_status=${PIPESTATUS[0]}
+    if [ "$ss_status" -ne 0 ]; then
+        : > "$snapshot_file"
+        _CONNECTION_SNAPSHOT_TS=0
+        return 1
+    fi
+    _CONNECTION_SNAPSHOT_TS=$(date +%s)
+}
+
+_ensure_unique_connection_snapshot() {
+    if [ -n "$_UNIQUE_CONNECTION_SNAPSHOT_FILE" ] && [ -f "$_UNIQUE_CONNECTION_SNAPSHOT_FILE" ]; then
+        return 0
+    fi
+    _ensure_connection_snapshot || true
+
+    local unique_file
+    unique_file=$(mktemp) || return 1
+    _CLEANUP_FILES+=("$unique_file")
+    _UNIQUE_CONNECTION_SNAPSHOT_FILE="$unique_file"
+    sort -t $'\t' -k1,1n -k2,2 -u "$_CONNECTION_SNAPSHOT_FILE" > "$unique_file" 2>/dev/null || : > "$unique_file"
+}
 
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
@@ -757,79 +815,93 @@ ${report_lines}"
 }
 
 push_to_worker() {
-    local push_conf=$(jq -r '.push // empty' "$CONFIG_FILE" 2>/dev/null)
-    [ -z "$push_conf" ] && return
-    local enabled=$(echo "$push_conf" | jq -r '.enable // false')
+    local push_values enabled worker_url secret node_key
+    push_values=$(jq -r '[.push.enable // false, .push.worker_url // "", .push.secret // "", .push.node_key // ""] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$push_values" ] && return
+    IFS=$'\t' read -r enabled worker_url secret node_key <<< "$push_values"
     [ "$enabled" != "true" ] && return
-    local worker_url=$(echo "$push_conf" | jq -r '.worker_url // empty')
-    local secret=$(echo "$push_conf" | jq -r '.secret // empty')
-    local node_key=$(echo "$push_conf" | jq -r '.node_key // empty')
     [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ] && return
-    local payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
+    local payload
+    payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
     [ -z "$payload" ] && return
-    # 从 state/*.txt 注入实时运行数据，并附加当前连接 IP 列表到 payload。
-    # 性能约束: 每轮推送只执行一次 ss，再按本地端口聚合，避免端口多时重复扫描连接表。
-    local _push_ports=$(echo "$payload" | jq -r '.ports | keys[]')
-    local scan_ts=$(date +%s)
-    declare -A _push_port_set _online_ip_cache _online_ip_seen
-    for _pp in $_push_ports; do
-        _push_port_set["$_pp"]=1
-    done
-    while IFS=$'\t' read -r local_ep peer_ep; do
-        if [ -z "$local_ep" ] || [ -z "$peer_ep" ]; then
-            continue
-        fi
-        local local_port="${local_ep##*:}"
-        [[ -n "${_push_port_set[$local_port]+x}" ]] || continue
-        local peer_ip="${peer_ep%:*}"
-        peer_ip="${peer_ip#[}"
-        peer_ip="${peer_ip%]}"
-        peer_ip="${peer_ip#::ffff:}"
-        [ -z "$peer_ip" ] && continue
-        local cache_key="${local_port}|${peer_ip}"
-        [[ -n "${_online_ip_seen[$cache_key]+x}" ]] && continue
-        _online_ip_seen["$cache_key"]=1
-        _online_ip_cache["$local_port"]+="${peer_ip}"$'\n'
-    done < <(ss -Hnt state established 2>/dev/null | awk '{print $3 "\t" $4}')
 
-    for _pp in $_push_ports; do
-        _load_port_state "$_pp"
-        local online_ips online_count online_limited online_list_json online_truncated
-        online_ips="${_online_ip_cache[$_pp]:-}"
-        online_count=0
-        if [ -n "$online_ips" ]; then
-            online_count=$(printf '%s\n' "$online_ips" | grep -cve '^[[:space:]]*$')
+    local push_ports_json push_ports scan_ts online_json runtime_json
+    push_ports_json=$(jq -c '.ports | keys' <<< "$payload")
+    push_ports=$(jq -r '.[]' <<< "$push_ports_json")
+    scan_ts=$(date +%s)
+
+    # 一次 jq 完成按端口去重、计数和 50 条上传上限，避免 Bash 大字符串反复拼接。
+    online_json='{}'
+    if [ -n "$push_ports" ]; then
+        _ensure_unique_connection_snapshot || true
+        if [ "$_CONNECTION_SNAPSHOT_TS" -gt 0 ] 2>/dev/null; then
+            scan_ts=$_CONNECTION_SNAPSHOT_TS
         fi
-        online_truncated=false
-        online_limited="$online_ips"
-        if [ "$online_count" -gt 50 ] 2>/dev/null; then
-            online_limited=$(printf '%s\n' "$online_ips" | head -n 50)
-            online_truncated=true
-        fi
-        online_list_json=$(printf '%s\n' "$online_limited" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-        payload=$(echo "$payload" | jq \
-            --arg p "$_pp" --argjson ai "$s_acc_in" --argjson ao "$s_acc_out" \
-            --argjson ki "$s_last_k_in" --argjson ko "$s_last_k_out" \
-            --argjson ip "$( [ "$s_is_punished" = "true" ] && echo true || echo false )" \
-            --argjson sc "$s_strike" --argjson pet "$s_punish_end_ts" \
-            --argjson ql "$s_quota_level" \
-            --argjson online_count "$online_count" --argjson online_ips "$online_list_json" \
-            --argjson online_ts "$scan_ts" \
-            --argjson online_truncated "$( [ "$online_truncated" = "true" ] && echo true || echo false )" \
-            '.ports[$p].stats.acc_in = $ai | .ports[$p].stats.acc_out = $ao
-             | .ports[$p].stats.last_kernel_in = $ki | .ports[$p].stats.last_kernel_out = $ko
-             | .ports[$p].dyn_limit.is_punished = $ip | .ports[$p].dyn_limit.strike_count = $sc
-             | .ports[$p].dyn_limit.punish_end_ts = $pet
-             | .ports[$p].notify_state.quota_level = $ql
-             | .ports[$p].online = {
-                 ip_count: $online_count,
-                 ips: $online_ips,
-                 updated_at: $online_ts,
-                 truncated: $online_truncated
-               }')
-    done
-    local timestamp=$(date +%s)
-    local signature=$(printf '%s\n%s\n%s' "$node_key" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
+        online_json=$(jq -Rn -c --argjson monitored_ports "$push_ports_json" --argjson scan_ts "$scan_ts" '
+            ($monitored_ports | reduce .[] as $port ({}; .[$port] = true)) as $monitored |
+            [inputs
+             | split("\t")
+             | select(length == 2 and $monitored[.[0]] == true)
+             | {port: .[0], ip: .[1]}]
+            | group_by(.port)
+            | reduce .[] as $group ({};
+                ($group | map(.ip)) as $ips
+                | .[$group[0].port] = {
+                    ip_count: ($ips | length),
+                    ips: $ips[:50],
+                    updated_at: $scan_ts,
+                    truncated: (($ips | length) > 50)
+                  })
+        ' < "$_UNIQUE_CONNECTION_SNAPSHOT_FILE")
+    fi
+    [ -z "$online_json" ] && online_json='{}'
+
+    # 运行状态先汇总成对象，再一次性合并到 payload，端口数增加时不再线性启动 jq。
+    runtime_json=$(
+        for _pp in $push_ports; do
+            _load_port_state "$_pp"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$_pp" "$s_acc_in" "$s_acc_out" "$s_last_k_in" "$s_last_k_out" \
+                "$s_is_punished" "$s_strike" "$s_punish_end_ts" "$s_quota_level"
+        done | jq -Rn -c --argjson online "$online_json" --argjson scan_ts "$scan_ts" '
+            def number_or_zero: tonumber? // 0;
+            reduce inputs as $line ({};
+                ($line | split("\t")) as $f
+                | .[$f[0]] = {
+                    acc_in: ($f[1] | number_or_zero),
+                    acc_out: ($f[2] | number_or_zero),
+                    last_kernel_in: ($f[3] | number_or_zero),
+                    last_kernel_out: ($f[4] | number_or_zero),
+                    is_punished: ($f[5] == "true"),
+                    strike_count: ($f[6] | number_or_zero),
+                    punish_end_ts: ($f[7] | number_or_zero),
+                    quota_level: ($f[8] | number_or_zero),
+                    online: ($online[$f[0]] // {
+                        ip_count: 0,
+                        ips: [],
+                        updated_at: $scan_ts,
+                        truncated: false
+                    })
+                  })
+        '
+    )
+    [ -z "$runtime_json" ] && return
+    payload=$(jq -c --argjson runtime "$runtime_json" '
+        reduce ($runtime | to_entries[]) as $entry (.;
+            .ports[$entry.key].stats.acc_in = $entry.value.acc_in
+            | .ports[$entry.key].stats.acc_out = $entry.value.acc_out
+            | .ports[$entry.key].stats.last_kernel_in = $entry.value.last_kernel_in
+            | .ports[$entry.key].stats.last_kernel_out = $entry.value.last_kernel_out
+            | .ports[$entry.key].dyn_limit.is_punished = $entry.value.is_punished
+            | .ports[$entry.key].dyn_limit.strike_count = $entry.value.strike_count
+            | .ports[$entry.key].dyn_limit.punish_end_ts = $entry.value.punish_end_ts
+            | .ports[$entry.key].notify_state.quota_level = $entry.value.quota_level
+            | .ports[$entry.key].online = $entry.value.online)
+    ' <<< "$payload")
+    [ -z "$payload" ] && return
+    local timestamp signature
+    timestamp=$(date +%s)
+    signature=$(printf '%s\n%s\n%s' "$node_key" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
     if [ -z "$signature" ]; then
         pm_error "Worker 推送签名生成失败，请检查 openssl"
         return 1
@@ -875,28 +947,25 @@ ${ip_details}
 # 从 ss 输出中提取端口的独立对端 IP（去重、清洗 IPv4-mapped）
 _sentinel_scan_ips() {
     local port=$1
-    ss -nt state established "( sport = :$port )" 2>/dev/null | \
-        grep -v 'Address:Port' | awk '{print $4}' | \
-        rev | cut -d: -f2- | rev | \
-        sed 's/^\[//;s/\]$//;s/^::ffff://' | \
-        grep -v '^$' | sort -u
+    _ensure_unique_connection_snapshot || true
+    awk -F '\t' -v port="$port" '$1 == port {print $2}' "$_UNIQUE_CONNECTION_SNAPSHOT_FILE" 2>/dev/null
 }
 
 # 阶段四入口: 遍历启用了 ip_limit 的端口执行检测
 check_ip_sentinel() {
     local current_ts=$1
+    local snapshot_changed=false
     # [PERF] 一次性读取所有启用了 ip_limit 的端口配置
     local _sentinel_cfg=$(jq -r '
         .ports | to_entries[] | select(.value.ip_limit.enable == true) |
         [.key, (.value.ip_limit.max_ips // 3), (.value.ip_limit.action // "alert"),
          (.value.ip_limit.cooldown_min // 30), (.value.comment // ""),
-         (.value.group_id // "")] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+         (.value.group_id // ""), ((.value.ip_limit.whitelist // []) | join(","))]
+        | map(tostring) | join("\u001f")' "$CONFIG_FILE" 2>/dev/null)
     [ -z "$_sentinel_cfg" ] && return
+    _ensure_unique_connection_snapshot || true
 
-    # 白名单需要单独读 (数组字段无法 @tsv)
-    local _s_json=$(cat "$CONFIG_FILE")
-
-    while IFS=$'\t' read -r port max_ips action cooldown_min comment gid; do
+    while IFS=$'\x1f' read -r port max_ips action cooldown_min comment gid whitelist_csv; do
         [ -z "$port" ] && continue
 
         # --- 扫描 ---
@@ -904,76 +973,95 @@ check_ip_sentinel() {
         [ -z "$raw_ips" ] && continue
 
         # --- 过滤白名单 ---
-        local wl_json=$(echo "$_s_json" | jq -r ".ports[\"$port\"].ip_limit.whitelist // [] | .[]" 2>/dev/null)
-        local filtered=""
+        declare -A whitelist_set=()
+        local -a whitelist_items=()
+        IFS=',' read -ra whitelist_items <<< "$whitelist_csv"
+        for w in "${whitelist_items[@]}"; do
+            [ -n "$w" ] && whitelist_set["$w"]=1
+        done
+        local -a filtered_ips=()
         while IFS= read -r ip; do
             [ -z "$ip" ] && continue
-            local skip=false
-            if [ -n "$wl_json" ]; then
-                while IFS= read -r w; do
-                    [ "$ip" = "$w" ] && { skip=true; break; }
-                done <<< "$wl_json"
-            fi
-            [ "$skip" = "false" ] && filtered+="${ip}"$'\n'
+            [[ -z "${whitelist_set[$ip]+x}" ]] && filtered_ips+=("$ip")
         done <<< "$raw_ips"
-        filtered=$(echo "$filtered" | grep -v '^$')
-        local ip_count=$(echo "$filtered" | grep -cve '^\s*$')
+        local ip_count=${#filtered_ips[@]}
         [ "$ip_count" -le "$max_ips" ] && continue
 
         # --- 冷却: 从 state 文件读取, 有新 IP 则强制报警 ---
         _load_port_state "$port"
         local has_new=false
-        while IFS= read -r ip; do
-            [ -z "$ip" ] && continue
+        for ip in "${filtered_ips[@]}"; do
             if [ -z "$s_last_alert_ips" ] || [[ ",$s_last_alert_ips," != *",$ip,"* ]]; then
                 has_new=true; break
             fi
-        done <<< "$filtered"
+        done
         if [ "$has_new" = "false" ] && [ $((current_ts - s_last_alert_ts)) -lt $((cooldown_min * 60)) ]; then
             continue
         fi
 
-        # --- 归属地查询 (降级容错) ---
-        local details="" idx=1
+        # --- 归属地查询 (最多 15 个 IP 合并为一次 HTTP 请求) ---
+        local details="" idx=1 detail_ips ips_json geo_response
+        detail_ips=$(printf '%s\n' "${filtered_ips[@]:0:15}")
+        ips_json=$(printf '%s\n' "$detail_ips" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+        geo_response=""
+        if [ "$_SENTINEL_GEO_REQUESTS" -lt 15 ]; then
+            _SENTINEL_GEO_REQUESTS=$((_SENTINEL_GEO_REQUESTS + 1))
+            geo_response=$(curl -sf --max-time 3 \
+                -H 'Content-Type: application/json' \
+                -d "$ips_json" \
+                'http://ip-api.com/batch?fields=status,country,regionName,isp,query&lang=zh-CN' 2>/dev/null || true)
+        fi
+        declare -A geo_by_ip=()
+        while IFS=$'\t' read -r geo_ip geo_label; do
+            [ -n "$geo_ip" ] && geo_by_ip["$geo_ip"]="${geo_label:-(查询失败)}"
+        done < <(printf '%s' "$geo_response" | jq -r '
+            if type == "array" then .[] else empty end
+            | [.query, (if .status == "success"
+                then ([.country, .regionName, .isp] | map(select(. != null and . != "")) | join(", "))
+                else "(查询失败)" end)]
+            | @tsv' 2>/dev/null)
+
         while IFS= read -r ip; do
             [ -z "$ip" ] && continue
-            local geo=""
-            geo=$(curl -sf --max-time 3 "http://ip-api.com/line/${ip}?fields=country,regionName,isp&lang=zh-CN" 2>/dev/null | tr '\n' ', ' | sed 's/, *$//')
-            [ -z "$geo" ] && geo="(查询失败)"
+            local geo="${geo_by_ip[$ip]:-(查询失败)}"
             geo=$(echo "$geo" | sed 's/[_*`\[]/\\&/g')
             details+="${idx}. \`${ip}\` - ${geo}"$'\n'
             idx=$((idx + 1))
-            [ "$idx" -gt 15 ] && { details+="... 仅显示前 15 条"$'\n'; break; }
-        done <<< "$filtered"
+        done <<< "$detail_ips"
+        [ "$ip_count" -gt 15 ] && details+="... 仅显示前 15 条"$'\n'
 
         # --- 通知 ---
         tg_notify_ip_alert "$port" "$comment" "$ip_count" "$max_ips" "$details" "$gid"
 
         # --- 自动阻断 (可选, 保留连接数最多的前 N 个 IP) ---
         if [ "$action" = "block" ]; then
-            local ranked=$(ss -nt state established "( sport = :$port )" 2>/dev/null | \
-                grep -v 'Address:Port' | awk '{print $4}' | \
-                rev | cut -d: -f2- | rev | \
-                sed 's/^\[//;s/\]$//;s/^::ffff://' | \
-                grep -v '^$' | sort | uniq -c | sort -rn)
+            local ranked
+            ranked=$(awk -F '\t' -v port="$port" '$1 == port {print $2}' "$_CONNECTION_SNAPSHOT_FILE" 2>/dev/null | sort | uniq -c | sort -rn)
             local kept=0
             while read -r cnt kip; do
                 [ -z "$kip" ] && continue
-                local in_wl=false
-                if [ -n "$wl_json" ]; then
-                    while IFS= read -r w; do [ "$kip" = "$w" ] && { in_wl=true; break; }; done <<< "$wl_json"
-                fi
-                [ "$in_wl" = "true" ] && continue
+                [[ -n "${whitelist_set[$kip]+x}" ]] && continue
                 kept=$((kept + 1))
-                [ "$kept" -gt "$max_ips" ] && ss -K dst "$kip" sport = ":$port" 2>/dev/null
+                if [ "$kept" -gt "$max_ips" ]; then
+                    ss -K dst "$kip" sport = ":$port" 2>/dev/null
+                    snapshot_changed=true
+                fi
             done <<< "$ranked"
         fi
 
         # --- 更新状态至 .txt ---
         s_last_alert_ts=$current_ts
-        s_last_alert_ips=$(echo "$filtered" | tr '\n' ',' | sed 's/,$//')
+        printf -v s_last_alert_ips '%s,' "${filtered_ips[@]}"
+        s_last_alert_ips=${s_last_alert_ips%,}
         _save_port_state "$port"
     done <<< "$_sentinel_cfg"
+
+    # 阻断动作改变了连接表；让后续云推送重新采样，避免上报已被踢出的 IP。
+    if [ "$snapshot_changed" = "true" ]; then
+        _CONNECTION_SNAPSHOT_FILE=""
+        _UNIQUE_CONNECTION_SNAPSHOT_FILE=""
+        _CONNECTION_SNAPSHOT_TS=0
+    fi
 }
 
 configure_ip_sentinel() {
@@ -1097,11 +1185,12 @@ cron_task() {
         .ports | to_entries[] | select(.value.dyn_limit.enable == true) |
         [.key, .value.dyn_limit.trigger_mbps, .value.dyn_limit.trigger_time,
          .value.dyn_limit.punish_time, .value.dyn_limit.punish_mbps,
-         (.value.comment // ""), (.value.group_id // "")] | @tsv')
+         (.value.comment // ""), (.value.group_id // "")]
+        | map(tostring) | join("\u001f")')
 
     # 构建 DynQoS 配置查找表 (避免循环内 jq)
     declare -A _dyn_trigger _dyn_trig_time _dyn_punish_time _dyn_punish_mbps _dyn_comment _dyn_gid
-    while IFS=$'\t' read -r _dp _dt _dtt _dpt _dpm _dc _dg; do
+    while IFS=$'\x1f' read -r _dp _dt _dtt _dpt _dpm _dc _dg; do
         [ -z "$_dp" ] && continue
         _dyn_trigger["$_dp"]=$_dt; _dyn_trig_time["$_dp"]=$_dtt
         _dyn_punish_time["$_dp"]=$_dpt; _dyn_punish_mbps["$_dp"]=$_dpm
@@ -1183,14 +1272,18 @@ cron_task() {
     # --- 阶段三：执行策略 (Quota Check / Reset) ---
     # [PERF] 循环外缓存
     local blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
-    local thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' "$CONFIG_FILE" 2>/dev/null)
+    local thresholds
+    thresholds=$(jq -r '.telegram.thresholds // [50,80,100] | .[]' <<< "$tmp_json" | sort -rn)
+    local current_year_month="" days_in_month=""
+    declare -A reset_ts_cache
     # [PERF] 一次性读取所有端口的静态配置
     local _p3_cfg=$(echo "$tmp_json" | jq -r '
         .ports | to_entries[] |
         [.key, .value.quota_gb, .value.quota_mode, (.value.group_id // ""),
-         (.value.reset_day // 0), (.value.comment // "")] | @tsv')
+         (.value.reset_day // 0), (.value.comment // "")]
+        | map(tostring) | join("\u001f")')
 
-    while IFS=$'\t' read -r port quota_gb mode gid reset_day p3_comment; do
+    while IFS=$'\x1f' read -r port quota_gb mode gid reset_day p3_comment; do
         [ -z "$port" ] && continue
         _load_port_state "$port"
 
@@ -1204,12 +1297,20 @@ cron_task() {
 
         # 自动重置判断
         if [ "$reset_day" -gt 0 ] 2>/dev/null && [ "$reset_day" -le 31 ] 2>/dev/null; then
-            local days_in_month=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%-d 2>/dev/null)
-            [ -z "$days_in_month" ] && days_in_month=28
+            if [ -z "$current_year_month" ]; then
+                current_year_month=$(date +%Y-%m)
+                days_in_month=$(date -d "${current_year_month}-01 +1 month -1 day" +%-d 2>/dev/null)
+                [ -z "$days_in_month" ] && days_in_month=28
+            fi
             local effective_day=$reset_day
             [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
-            local reset_date=$(printf "%s-%02d 00:00:00" "$(date +%Y-%m)" "$effective_day")
-            local reset_ts=$(date -d "$reset_date" +%s 2>/dev/null || echo 0)
+            local reset_ts=${reset_ts_cache[$effective_day]:-}
+            if [ -z "$reset_ts" ]; then
+                local reset_date
+                reset_date=$(printf "%s-%02d 00:00:00" "$current_year_month" "$effective_day")
+                reset_ts=$(date -d "$reset_date" +%s 2>/dev/null || echo 0)
+                reset_ts_cache["$effective_day"]=$reset_ts
+            fi
 
             if [ "$current_ts" -ge "$reset_ts" ] && [ "$s_last_reset_ts" -lt "$reset_ts" ]; then
                 # 重置: 清零流量, 记录当前内核计数器作为新基准
@@ -1255,7 +1356,7 @@ cron_task() {
             [ -z "$percent_int" ] && percent_int=0
 
             local new_level=$s_quota_level
-            for thr in $(echo "$thresholds" | sort -rn); do
+            for thr in $thresholds; do
                 [ -z "$thr" ] && continue
                 if (( percent_int >= thr )) && (( s_quota_level < thr )); then
                     new_level=$thr; break
@@ -2159,6 +2260,7 @@ if [ "${1:-}" == "--monitor" ]; then
 elif [ "${1:-}" == "--ipl" ]; then
     echo -e "端口\t在线IP数\tIP列表"
     echo -e "----\t--------\t------"
+    _ensure_unique_connection_snapshot || true
     for p in $(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n); do
         ips=$(_sentinel_scan_ips "$p")
         cnt=0; [ -n "$ips" ] && cnt=$(echo "$ips" | wc -l)

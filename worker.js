@@ -17,6 +17,11 @@
  * ============================================================
  */
 
+const GEO_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const GEO_CACHE_MAX_ENTRIES = 500;
+const geoCache = new Map();
+let geoRateLimitedUntil = 0;
+
 export default {
   async fetch(request, env) {
     const requestId = request.headers.get("CF-Ray") ||
@@ -171,11 +176,14 @@ async function handleQuery(env, chatId, userId, text, isAdmin) {
     if (target === "all") {
       const rows = await env.DB.prepare("SELECT * FROM nodes ORDER BY node_key").all();
       if (!rows.results?.length) return tgReply(env, chatId, "暂无节点数据。");
-      let fullMsg = "";
-      for (const r of rows.results) {
-        fullMsg += await generateReport(r.node_key, r.node_id, r.config_json, r.updated_at, "all") + "\n";
-      }
-      return tgReply(env, chatId, fullMsg.trim());
+      const reports = await generateReports(rows.results.map(r => ({
+        nodeKey: r.node_key,
+        nodeId: r.node_id,
+        configJson: r.config_json,
+        updatedAt: r.updated_at,
+        allowedPorts: "all"
+      })));
+      return tgReply(env, chatId, reports.join("\n").trim());
     }
 
     const row = await env.DB.prepare("SELECT * FROM nodes WHERE node_key = ?1").bind(target).first();
@@ -183,21 +191,32 @@ async function handleQuery(env, chatId, userId, text, isAdmin) {
     return tgReply(env, chatId, await generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, "all"));
 
   } else {
-    // 普通用户: 从 D1 读取权限
-    const perms = await env.DB.prepare("SELECT node_key, ports FROM users WHERE user_id = ?1").bind(userId).all();
-    if (!perms.results?.length) return new Response("OK"); // 无权限，静默
+    // 权限与节点一次 JOIN 取回，避免普通用户授权多个节点时产生 N+1 查询。
+    const rows = await env.DB.prepare(
+      `SELECT u.ports AS allowed_ports, n.node_key, n.node_id, n.config_json, n.updated_at
+       FROM users u
+       LEFT JOIN nodes n ON n.node_key = u.node_key
+       WHERE u.user_id = ?1
+       ORDER BY u.node_key`
+    ).bind(userId).all();
+    if (!rows.results?.length) return new Response("OK"); // 无权限，静默
 
-    let fullMsg = "";
-    for (const perm of perms.results) {
-      let ports;
-      try { ports = JSON.parse(perm.ports); } catch { ports = []; }
-      const row = await env.DB.prepare("SELECT * FROM nodes WHERE node_key = ?1").bind(perm.node_key).first();
-      if (row) {
-        fullMsg += await generateReport(row.node_key, row.node_id, row.config_json, row.updated_at, ports) + "\n";
-      }
+    const reportInputs = [];
+    for (const row of rows.results) {
+      if (!row.node_key) continue;
+      let allowedPorts;
+      try { allowedPorts = JSON.parse(row.allowed_ports); } catch { allowedPorts = []; }
+      reportInputs.push({
+        nodeKey: row.node_key,
+        nodeId: row.node_id,
+        configJson: row.config_json,
+        updatedAt: row.updated_at,
+        allowedPorts
+      });
     }
-    if (!fullMsg) return tgReply(env, chatId, "暂无可查询的数据。");
-    return tgReply(env, chatId, fullMsg.trim());
+    if (!reportInputs.length) return tgReply(env, chatId, "暂无可查询的数据。");
+    const reports = await generateReports(reportInputs);
+    return tgReply(env, chatId, reports.join("\n").trim());
   }
 }
 
@@ -422,16 +441,47 @@ async function handleHelp(env, chatId, isAdmin) {
 // 报告生成
 // ==============================================================
 async function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPorts) {
-  let conf;
-  try { conf = JSON.parse(configJson); } catch { return `❌ 节点 \`${nodeKey}\` 数据异常`; }
+  const reports = await generateReports([{ nodeKey, nodeId, configJson, updatedAt, allowedPorts }]);
+  return reports[0];
+}
 
-  const ports = conf.ports || {};
-  const sortedPorts = Object.keys(ports).sort((a, b) => parseInt(a) - parseInt(b));
+async function generateReports(inputs) {
+  const prepared = inputs.map(input => {
+    try {
+      const parsed = JSON.parse(input.configJson);
+      const ports = parsed?.ports && typeof parsed.ports === "object" && !Array.isArray(parsed.ports)
+        ? parsed.ports
+        : {};
+      const sortedPorts = Object.keys(ports).sort((a, b) => parseInt(a) - parseInt(b));
+      const allowedPorts = normalizeAllowedPorts(input.allowedPorts);
+      return { ...input, ports, sortedPorts, allowedPorts };
+    } catch {
+      return { ...input, error: `❌ 节点 \`${input.nodeKey}\` 数据异常` };
+    }
+  });
+
+  const seenIps = new Set();
+  const visibleIps = [];
+  for (const item of prepared) {
+    if (item.error) continue;
+    for (const ip of collectVisibleOnlineIps(item.sortedPorts, item.ports, item.allowedPorts)) {
+      if (seenIps.has(ip)) continue;
+      seenIps.add(ip);
+      visibleIps.push(ip);
+    }
+  }
+  const geoMap = await lookupIpGeos(visibleIps);
+
+  return prepared.map(item => item.error || renderReport(item, geoMap));
+}
+
+function renderReport(input, geoMap) {
+  const { nodeKey, nodeId, updatedAt, ports, sortedPorts, allowedPorts } = input;
+
   const now = Math.floor(Date.now() / 1000);
   const freshness = now - updatedAt;
   const freshIcon = freshness < 180 ? "🟢" : "🔴";
   const freshStr = fmtAge(freshness);
-  const geoMap = await lookupIpGeos(collectVisibleOnlineIps(sortedPorts, ports, allowedPorts));
 
   let report = `📊 *${escMd(nodeId)}* (${nodeKey}) ${freshIcon} ${freshStr}\n`;
   let hasData = false;
@@ -448,9 +498,7 @@ async function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPor
   }
 
   for (const port of sortedPorts) {
-    if (allowedPorts !== "all") {
-      if (!allowedPorts.includes(parseInt(port))) continue;
-    }
+    if (!canAccessPort(allowedPorts, port)) continue;
 
     const p = ports[port];
     const comment   = p.comment || "";
@@ -494,7 +542,7 @@ async function generateReport(nodeKey, nodeId, configJson, updatedAt, allowedPor
     report += `\n${statusIcon} \`${port}\`${groupStr}${safeComment}${resetStr}`;
     report += `\n   ${fmtBytes(totalUsed)} / ${quotaGb}GB (${pct.toFixed(1)}%)${speedInfo}\n`;
     if (onlineCount > 0) {
-      const shownIps = onlineIps.slice(0, 8);
+      const shownIps = onlineIps.slice(0, 8).map(ip => String(ip || "").trim()).filter(Boolean);
       const ipList = shownIps.map(ip => formatIpWithGeo(ip, geoMap)).join(" ");
       const hasMore = onlineTruncated || onlineCount > shownIps.length;
       const moreText = hasMore ? " ..." : "";
@@ -518,7 +566,7 @@ function collectVisibleOnlineIps(sortedPorts, ports, allowedPorts) {
   const seen = new Set();
   const ips = [];
   for (const port of sortedPorts) {
-    if (allowedPorts !== "all" && !allowedPorts.includes(parseInt(port))) continue;
+    if (!canAccessPort(allowedPorts, port)) continue;
     const onlineIps = Array.isArray(ports[port]?.online?.ips) ? ports[port].online.ips : [];
     for (const ip of onlineIps.slice(0, 8)) {
       const normalized = String(ip || "").trim();
@@ -531,33 +579,90 @@ function collectVisibleOnlineIps(sortedPorts, ports, allowedPorts) {
   return ips;
 }
 
+function normalizeAllowedPorts(allowedPorts) {
+  if (allowedPorts === "all") return "all";
+  const normalized = new Set();
+  if (!Array.isArray(allowedPorts)) return normalized;
+  for (const port of allowedPorts) {
+    const parsed = Number.parseInt(port, 10);
+    if (parsed > 0 && parsed <= 65535) normalized.add(parsed);
+  }
+  return normalized;
+}
+
+function canAccessPort(allowedPorts, port) {
+  return allowedPorts === "all" || allowedPorts.has(Number.parseInt(port, 10));
+}
+
 async function lookupIpGeos(ips) {
   if (!ips.length) return {};
-  try {
-    const timeoutSignal = typeof AbortSignal !== "undefined" && AbortSignal.timeout
-      ? AbortSignal.timeout(2500)
-      : undefined;
-    const response = await fetch("http://ip-api.com/batch?fields=status,country,regionName,city,isp,query&lang=zh-CN", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ips),
-      signal: timeoutSignal
-    });
-    if (!response.ok) return {};
-    const rows = await response.json();
-    if (!Array.isArray(rows)) return {};
-    const geoMap = {};
-    for (const row of rows) {
-      if (row?.status !== "success" || !row.query) continue;
-      const location = [row.country, row.regionName, row.city].filter(Boolean).join(" ");
-      const isp = row.isp || "";
-      const label = [location, isp].filter(Boolean).join(" / ");
-      if (label) geoMap[row.query] = label;
+  const geoMap = {};
+  const uniqueIps = [...new Set(ips)];
+  const missingIps = [];
+  const now = Date.now();
+
+  for (const ip of uniqueIps) {
+    const cached = geoCache.get(ip);
+    if (cached && cached.expiresAt > now) {
+      geoMap[ip] = cached.label;
+    } else {
+      if (cached) geoCache.delete(ip);
+      missingIps.push(ip);
     }
-    return geoMap;
-  } catch {
-    return {};
   }
+
+  // ip-api batch 单次最多接受 100 项；顺序分批避免多节点查询产生瞬时并发峰值。
+  for (let offset = 0; offset < missingIps.length; offset += 100) {
+    if (Date.now() < geoRateLimitedUntil) break;
+    const batch = missingIps.slice(offset, offset + 100);
+    try {
+      const timeoutSignal = typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(2500)
+        : undefined;
+      const response = await fetch("http://ip-api.com/batch?fields=status,country,regionName,city,isp,query&lang=zh-CN", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(batch),
+        signal: timeoutSignal
+      });
+      const remaining = Number.parseInt(response.headers.get("X-Rl") || "", 10);
+      const ttlSeconds = Number.parseInt(response.headers.get("X-Ttl") || "", 10);
+      const isRateLimited = response.status === 429 || remaining === 0;
+      if (isRateLimited) {
+        const retryMs = Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds * 1000 : 60_000;
+        geoRateLimitedUntil = Date.now() + retryMs;
+      }
+      if (!response.ok) {
+        if (isRateLimited) break;
+        continue;
+      }
+      const rows = await response.json();
+      if (!Array.isArray(rows)) {
+        if (isRateLimited) break;
+        continue;
+      }
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        if (row?.status !== "success" || !row.query) continue;
+        const requestedIp = batch[index] || row.query;
+        const location = [row.country, row.regionName, row.city].filter(Boolean).join(" ");
+        const isp = row.isp || "";
+        const label = [location, isp].filter(Boolean).join(" / ");
+        if (label) {
+          geoMap[requestedIp] = label;
+          geoCache.delete(requestedIp);
+          geoCache.set(requestedIp, { label, expiresAt: now + GEO_CACHE_TTL_MS });
+        }
+      }
+      if (isRateLimited) break;
+    } catch {
+      // 单批失败仅降级该批 IP，不影响其他节点和 Telegram 主报告。
+    }
+  }
+  while (geoCache.size > GEO_CACHE_MAX_ENTRIES) {
+    geoCache.delete(geoCache.keys().next().value);
+  }
+  return geoMap;
 }
 
 function formatIpWithGeo(ip, geoMap) {
