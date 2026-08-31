@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v2.7
+ * Cloudflare Worker - 端口流量查询中控 v2.8
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -13,7 +13,7 @@
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
- * v2.7 变更: /ll 使用节点选择菜单，支持详情、返回与刷新
+ * v2.8 变更: 支持按端口的用户到期前 3 天向管理员提醒一次
  * ============================================================
  */
 
@@ -22,6 +22,7 @@ const GEO_CACHE_MAX_ENTRIES = 500;
 const TG_DIVIDER = "━━━━━━━━━━━━━━";
 const geoCache = new Map();
 let geoRateLimitedUntil = 0;
+let expirySchemaReady = false;
 
 export default {
   async fetch(request, env) {
@@ -102,7 +103,93 @@ async function handlePush(request, env) {
        node_id = ?2, config_json = ?3, updated_at = ?4`
   ).bind(nodeKey, nodeId, body, now).run();
 
+  await processUserExpiryNotifications(env, nodeKey, nodeId, parsed, now);
+
   return new Response("OK");
+}
+
+async function processUserExpiryNotifications(env, nodeKey, nodeId, payload, nowSeconds) {
+  const todayDay = Math.floor(nowSeconds / 86400);
+  const candidates = [];
+
+  for (const [port, config] of Object.entries(payload.ports)) {
+    const portNumber = Number(port);
+    if (!/^\d{1,5}$/.test(port) || !Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535 ||
+        !config || typeof config !== "object" || Array.isArray(config)) continue;
+    const expiryDay = parseIsoDateDay(config.expiry_date);
+    if (expiryDay === null) continue;
+    const daysRemaining = expiryDay - todayDay;
+    // 只提醒一次。若节点在第 3 天离线，到期前恢复上报时补发。
+    if (daysRemaining < 0 || daysRemaining > 3) continue;
+    candidates.push({
+      port,
+      expiryDate: config.expiry_date,
+      daysRemaining,
+      comment: typeof config.comment === "string" ? config.comment : ""
+    });
+  }
+
+  if (!candidates.length) return;
+  if (!env.BOT_TOKEN || !env.ADMIN_ID) {
+    throw new Error("用户到期提醒需要 BOT_TOKEN 和 ADMIN_ID");
+  }
+
+  await ensureExpirySchema(env);
+  const claimResults = await env.DB.batch(candidates.map(candidate => env.DB.prepare(
+    `INSERT OR IGNORE INTO user_expiry_notifications
+     (node_key, port, expiry_date, sent_at) VALUES (?1, ?2, ?3, ?4)`
+  ).bind(nodeKey, candidate.port, candidate.expiryDate, nowSeconds)));
+  const claimed = [];
+  for (let index = 0; index < candidates.length; index++) {
+    if ((claimResults[index]?.meta?.changes || 0) > 0) claimed.push(candidates[index]);
+  }
+  if (!claimed.length) return;
+
+  let message = `⏰ *用户到期提醒*\n${TG_DIVIDER}`;
+  message += `\n🖥 *${escMd(nodeId)}* · \`${nodeKey}\``;
+  for (const item of claimed) {
+    const label = item.comment ? ` · ${escMd(item.comment)}` : "";
+    const remaining = item.daysRemaining === 0 ? "今天到期" : `剩余 *${item.daysRemaining} 天*`;
+    message += `\n\n🔔 端口 \`${item.port}\`${label}`;
+    message += `\n├ 到期 ${item.expiryDate}`;
+    message += `\n└ ${remaining}`;
+  }
+
+  try {
+    await tgReply(env, String(env.ADMIN_ID), message);
+  } catch (error) {
+    // Telegram 失败时释放占位，使下一次 VPS 上报能够重试。
+    await env.DB.batch(claimed.map(item => env.DB.prepare(
+      `DELETE FROM user_expiry_notifications
+       WHERE node_key = ?1 AND port = ?2 AND expiry_date = ?3`
+    ).bind(nodeKey, item.port, item.expiryDate)));
+    throw error;
+  }
+}
+
+async function ensureExpirySchema(env) {
+  if (expirySchemaReady) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS user_expiry_notifications (
+       node_key TEXT NOT NULL,
+       port TEXT NOT NULL,
+       expiry_date TEXT NOT NULL,
+       sent_at INTEGER NOT NULL,
+       PRIMARY KEY (node_key, port, expiry_date)
+     )`
+  ).run();
+  expirySchemaReady = true;
+}
+
+function parseIsoDateDay(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  const timestamp = Date.UTC(year, month - 1, day);
+  const parsed = new Date(timestamp);
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+    return null;
+  }
+  return Math.floor(timestamp / 86400000);
 }
 
 // ==============================================================
@@ -413,8 +500,13 @@ async function handleDelNode(env, chatId, text) {
     return tgReply(env, chatId, formatNotice("⚠️", "节点不存在", [`未找到节点 \`${nodeKey}\`。`]));
   }
 
-  // 删除节点数据
+  await ensureExpirySchema(env);
+
+  // 删除节点数据与关联的到期提醒去重记录。
   await env.DB.prepare("DELETE FROM nodes WHERE node_key = ?1").bind(nodeKey).run();
+  await env.DB.prepare(
+    "DELETE FROM user_expiry_notifications WHERE node_key = ?1"
+  ).bind(nodeKey).run();
 
   const lines = [`🖥 节点  \`${nodeKey}\``, `🏷 名称  ${escMd(node.node_id)}`];
 
@@ -570,6 +662,7 @@ function renderReport(input, geoMap) {
     const accIn     = Math.floor(p.stats?.acc_in || 0);
     const accOut    = Math.floor(p.stats?.acc_out || 0);
     const resetDay  = p.reset_day || 0;
+    const expiryDate = typeof p.expiry_date === "string" ? p.expiry_date : "";
     const groupId   = p.group_id || "";
     const isPunished = p.dyn_limit?.is_punished === true;
     const punishMbps = p.dyn_limit?.punish_mbps || 0;
@@ -595,6 +688,8 @@ function renderReport(input, geoMap) {
     const policyParts = [modeText];
     if (groupId) policyParts.push(`分组 ${escMd(groupId)}`);
     if (resetDay > 0) policyParts.push(`每月 ${resetDay} 日重置`);
+    const expiryText = formatExpiryStatus(expiryDate, now);
+    if (expiryText) policyParts.push(expiryText);
 
     report += `\n\n${statusIcon} *端口* \`${port}\`${safeComment}`;
     report += `\n├ 📦 ${fmtBytes(totalUsed)} / ${quotaGb}GB`;
@@ -671,6 +766,15 @@ function formatProgressBar(percent) {
   const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
   const filled = normalized > 0 ? Math.ceil(normalized / 12.5) : 0;
   return `\`${"█".repeat(filled)}${"░".repeat(8 - filled)}\``;
+}
+
+function formatExpiryStatus(expiryDate, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const expiryDay = parseIsoDateDay(expiryDate);
+  if (expiryDay === null) return "";
+  const remaining = expiryDay - Math.floor(nowSeconds / 86400);
+  if (remaining > 0) return `到期 ${expiryDate} · 剩 ${remaining} 天`;
+  if (remaining === 0) return `到期 ${expiryDate} · 今天`;
+  return `到期 ${expiryDate} · 已过 ${Math.abs(remaining)} 天`;
 }
 
 async function lookupIpGeos(ips) {

@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.4.4 (Telegram UI)
+# 版本: v5.5.0 (用户到期提醒)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -17,9 +17,9 @@ STATE_DIR="$CONFIG_DIR/state"
 TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.4.4"
+SCRIPT_VERSION="5.5.0"
 # 配置结构版本号 (用于数据迁移)
-CURRENT_CONFIG_VERSION=3
+CURRENT_CONFIG_VERSION=4
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
@@ -133,6 +133,13 @@ _ensure_unique_connection_snapshot() {
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
 strip_cr() { echo "${1//$'\r'/}"; }
+
+validate_expiry_date() {
+    local value=$1 normalized
+    [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    normalized=$(date -d "$value" '+%Y-%m-%d' 2>/dev/null) || return 1
+    [ "$normalized" = "$value" ]
+}
 
 fresh_script_url() {
     printf '%s?t=%s-%s' "$DOWNLOAD_URL" "$(date +%s)" "$$"
@@ -424,6 +431,23 @@ s_last_alert_ips=${_laips:-}
 MEOF
         done
         tmp_json=$(echo "$tmp_json" | jq '.config_version = 3')
+        modified=true
+    fi
+
+    # v3 -> v4: 为每个端口增加用户到期日期；空字符串表示不提醒。
+    if [ "$file_ver" -lt 4 ]; then
+        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v4: 用户到期提醒)...${PLAIN}"
+        tmp_json=$(echo "$tmp_json" | jq '
+            .config_version = 4 |
+            .ports |= with_entries(
+                .value.expiry_date = (
+                    if ((.value.expiry_date // "") | type) == "string"
+                    then (.value.expiry_date // "")
+                    else ""
+                    end
+                )
+            )
+        ')
         modified=true
     fi
     if [ "$modified" == "true" ]; then
@@ -1702,15 +1726,24 @@ add_port_flow() {
     read -p "备注信息: " comment
     comment=$(strip_cr "$comment")
 
+    read -p "用户到期日期 (YYYY-MM-DD，留空为不提醒): " expiry_date
+    expiry_date=$(strip_cr "$expiry_date")
+    if [ -n "$expiry_date" ] && ! validate_expiry_date "$expiry_date"; then
+        echo -e "${RED}错误: 到期日期必须是有效的 YYYY-MM-DD。${PLAIN}"
+        sleep 2
+        return
+    fi
+
     local tmp=$(mktemp)
     if jq --argjson q "$quota" --arg m "$mode" --argjson l "$limit" --argjson rd "$reset_day" \
-          --arg c "$comment" --arg p "$target_port" \
+          --arg c "$comment" --arg expiry "$expiry_date" --arg p "$target_port" \
        '.ports[$p] = {
         "quota_gb": $q, 
         "quota_mode": $m, 
         "limit_mbps": $l, 
         "reset_day": $rd,
         "comment": $c, 
+        "expiry_date": $expiry,
         "group_id": "",
         "dyn_limit": {"enable": false},
         "ip_limit": {"enable": false, "max_ips": 3, "action": "alert", "cooldown_min": 30, "whitelist": []}
@@ -1749,6 +1782,7 @@ config_port_menu() {
         local dyn_conf=$(echo "$conf" | jq '.dyn_limit')
         local dyn_enable=$(echo "$dyn_conf" | jq -r '.enable // false')
         local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
+        local expiry_date=$(echo "$conf" | jq -r '.expiry_date // ""')
         
         clear
         echo -e "========================================"
@@ -1759,6 +1793,7 @@ config_port_menu() {
         echo -e " 计费模式: $([ "$mode" == "out_only" ] && echo "仅出站" || echo "双向")"
         echo -e " 基础限速: $([ "$limit" == "0" ] && echo "无限制" || echo "$limit Mbps")"
         if [ "$reset_day" -gt 0 ] 2>/dev/null; then echo -e " 自动重置: 每月 ${GREEN}${reset_day}${PLAIN} 日"; else echo -e " 自动重置: ${YELLOW}未设置${PLAIN}"; fi
+        if [ -n "$expiry_date" ]; then echo -e " 用户到期: ${GREEN}${expiry_date}${PLAIN} (提前 3 天提醒)"; else echo -e " 用户到期: ${YELLOW}未设置${PLAIN}"; fi
         echo -e "========================================"
         echo -e " 1. 修改 流量配额"
         echo -e " 2. 修改 计费模式"
@@ -1769,6 +1804,7 @@ config_port_menu() {
         echo -e " 7. 修改 自动重置日"
         echo -e " 8. 设置/修改 分组 ID (Group)"
         echo -e " 9. 接入监控 (IP Sentinel)"
+        echo -e " 10. 设置 用户到期提醒"
         echo -e " 0. 返回主菜单"
         echo -e "========================================"
         read -p "请输入选项: " sub_choice
@@ -1924,6 +1960,7 @@ config_port_menu() {
                 fi
                 ;;
             9) rm -f "$tmp"; configure_ip_sentinel "$port" ;;
+            10) rm -f "$tmp"; configure_user_expiry "$port" ;;
             0) rm -f "$tmp"; break ;;
         esac
         
@@ -1935,6 +1972,37 @@ config_port_menu() {
 # ==============================================================================
 # 4.5 辅助配置函数
 # ==============================================================================
+
+configure_user_expiry() {
+    local port=$1 value tmp
+    echo -e "\n用户到期前 3 天将通过 Cloudflare Bot 向管理员提醒一次。"
+    read -p "到期日期 (YYYY-MM-DD，0 为关闭，留空取消): " value
+    value=$(strip_cr "$value")
+    [ -z "$value" ] && return 0
+    [ "$value" = "0" ] && value=""
+    if [ -n "$value" ] && ! validate_expiry_date "$value"; then
+        echo -e "${RED}错误: 到期日期必须是有效的 YYYY-MM-DD。${PLAIN}"
+        sleep 2
+        return 1
+    fi
+
+    tmp=$(mktemp) || { pm_error "无法创建到期配置临时文件"; return 1; }
+    if jq --arg p "$port" --arg value "$value" '.ports[$p].expiry_date = $value' "$CONFIG_FILE" > "$tmp" \
+        && safe_write_config_from_file "$tmp"; then
+        if [ -n "$value" ]; then
+            echo -e "${GREEN}已设置为 ${value}，将提前 3 天提醒。${PLAIN}"
+        else
+            echo -e "${GREEN}已关闭该用户的到期提醒。${PLAIN}"
+        fi
+        rm -f "$tmp"
+        sleep 1
+        return 0
+    fi
+    rm -f "$tmp"
+    pm_error "端口 ${port} 的到期日期写入失败"
+    sleep 2
+    return 1
+}
 
 configure_dyn_qos() {
     local port=$1

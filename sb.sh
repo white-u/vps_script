@@ -2,7 +2,7 @@
 # sb (sing-box edition) - multi-protocol manager
 # - VLESS Vision REALITY (TCP)
 # - Shadowsocks 2022
-# - Optional chain SOCKS5 outbound + per-inbound routing
+# - Optional encrypted Shadowsocks 2022 relay / legacy SOCKS5 chain
 # - Safe config check + rollback
 # - Script self-update (GitHub raw)
 
@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.2.1"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -30,6 +30,8 @@ META_FILE="${SB_CONF_DIR}/nodes_meta.json"
 
 # If not empty, force install this sing-box version (without v prefix), e.g. "1.12.22"
 PINNED_SB_VERSION=""
+SS2022_METHOD="2022-blake3-aes-128-gcm"
+SS2022_KEY_BYTES=16
 
 SNI_LIST=(
   "addons.mozilla.org"
@@ -131,7 +133,7 @@ check_deps() {
       ;;
   esac
 
-  local hard=("curl" "tar" "jq" "openssl")
+  local hard=("curl" "tar" "jq" "openssl" "ss")
   local failed=()
   for d in "${hard[@]}"; do command -v "$d" >/dev/null 2>&1 || failed+=("$d"); done
   if [[ ${#failed[@]} -gt 0 ]]; then
@@ -150,48 +152,80 @@ map_arch_sb() {
 
 open_port() {
   local port=$1
+  local mode=${2:-both}
+  local protocols=(tcp udp)
+  [[ "$mode" == "tcp" ]] && protocols=(tcp)
+  local proto rc=0
+
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "$port" >/dev/null 2>&1
+    for proto in "${protocols[@]}"; do
+      ufw allow "${port}/${proto}" >/dev/null 2>&1 || rc=1
+    done
   elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
-    firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1
+    for proto in "${protocols[@]}"; do
+      firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || rc=1
+    done
+    firewall-cmd --reload >/dev/null 2>&1 || rc=1
   elif command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    for proto in "${protocols[@]}"; do
+      iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || rc=1
+    done
     if command -v iptables-save >/dev/null 2>&1; then
       mkdir -p /etc/iptables 2>/dev/null || true
-      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || rc=1
     fi
   fi
+  return "$rc"
 }
 
 close_port() {
   local port=$1
+  local mode=${2:-both}
+  local protocols=(tcp udp)
+  [[ "$mode" == "tcp" ]] && protocols=(tcp)
+  local proto
+
   if command -v ufw >/dev/null 2>&1; then
-    ufw delete allow "$port" >/dev/null 2>&1 || true
+    for proto in "${protocols[@]}"; do
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    done
   elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+    for proto in "${protocols[@]}"; do
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+    done
     firewall-cmd --reload >/dev/null 2>&1 || true
   elif command -v iptables >/dev/null 2>&1; then
-    iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-    iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    for proto in "${protocols[@]}"; do
+      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    done
     if command -v iptables-save >/dev/null 2>&1; then
       iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
   fi
 }
 
+network_mode_for_type() {
+  [[ "$1" == "vless" ]] && echo "tcp" || echo "both"
+}
+
+get_sb_ver_from_bin() {
+  local bin=$1
+  local ver
+  [[ -x "$bin" ]] || return 1
+  ver=$("$bin" version 2>/dev/null | sed -nE 's/^sing-box version v?([^[:space:]]+).*/\1/p' | head -1)
+  [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+  echo "$ver"
+}
+
 get_current_sb_ver() {
   [[ -x "$SB_BIN" ]] || { echo "none"; return; }
-  "$SB_BIN" version 2>/dev/null | head -1 | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | tr -d 'v' || echo "unknown"
+  get_sb_ver_from_bin "$SB_BIN" || echo "unknown"
 }
 
 get_latest_sb_tag() {
   local tag=""
   tag=$(curl -sL --max-time 8 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name 2>/dev/null)
-  if [[ -n "$tag" && "$tag" != "null" ]]; then
+  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$tag"
     return 0
   fi
@@ -199,37 +233,58 @@ get_latest_sb_tag() {
   local final
   final=$(curl -sI --max-time 8 -o /dev/null -w "%{url_effective}" "https://github.com/SagerNet/sing-box/releases/latest")
   tag="${final##*/}"
-  if [[ "$tag" == v* ]]; then
+  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$tag"
     return 0
   fi
   return 1
 }
 
+get_release_asset_digest() {
+  local tag=$1 asset_name=$2 digest
+  digest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" |
+    jq -r --arg name "$asset_name" '.assets[]? | select(.name == $name) | .digest // empty' 2>/dev/null) || return 1
+  digest=${digest#sha256:}
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  echo "$digest"
+}
+
 init_meta_if_missing() {
-  mkdir -p "$SB_CONF_DIR" "$WORK_DIR"
+  mkdir -p "$SB_CONF_DIR" "$WORK_DIR" || return 1
   if [[ ! -f "$META_FILE" ]] || [[ ! -s "$META_FILE" ]]; then
-    echo '{}' > "$META_FILE"
-    chmod 600 "$META_FILE"
+    echo '{}' > "$META_FILE" || return 1
+    chmod 600 "$META_FILE" || return 1
   fi
 }
 
-# Ensure route.rules contains a leading {"action":"sniff"} (only once)
-ensure_route_sniff_rule() {
+# Resolve domains, reject private targets, then apply final routing actions.
+ensure_private_reject_rule() {
   local json_file=$1
-  jq '
-    .route.rules = (
-      if ((.route.rules // []) | any(.action? == "sniff")) then
-        (.route.rules // [])
-      else
-        ([{"action":"sniff"}] + (.route.rules // []))
-      end
-    )
-  ' "$json_file" > "${json_file}.sn" && mv "${json_file}.sn" "$json_file"
+  local stage="${json_file}.guard"
+  if jq '
+    (.route.rules // []) as $rules |
+    ($rules | map(select(.action? == "resolve" and (keys == ["action"]))) | first
+      // {"action": "resolve"}) as $resolver |
+    ($rules | map(select(
+      .ip_is_private? == true and .action? == "reject" and
+      (keys == ["action", "ip_is_private"])
+    )) | first
+      // {"ip_is_private": true, "action": "reject"}) as $guard |
+    .route.rules = ([$resolver, $guard] +
+      ($rules | map(select(
+        ((.action? == "resolve" and (keys == ["action"])) or
+         (.ip_is_private? == true and .action? == "reject" and
+          (keys == ["action", "ip_is_private"]))) | not
+      ))))
+  ' "$json_file" > "$stage" && mv "$stage" "$json_file"; then
+    return
+  fi
+  rm -f "$stage"
+  return 1
 }
 
 init_config_if_missing() {
-  mkdir -p "$SB_CONF_DIR" "$WORK_DIR"
+  mkdir -p "$SB_CONF_DIR" "$WORK_DIR" || return 1
   if [[ ! -f "$SB_CONF_FILE" ]] || [[ ! -s "$SB_CONF_FILE" ]]; then
     cat > "$SB_CONF_FILE" <<EOF
 {
@@ -241,34 +296,29 @@ init_config_if_missing() {
   "route": {
     "final": "direct",
     "rules": [
-      { "action": "sniff" },
+      { "action": "resolve" },
       { "ip_is_private": true, "action": "reject" }
     ]
   }
 }
 EOF
-    chmod 640 "$SB_CONF_FILE"
-  else
-    # If config exists, still ensure sniff rule exists (non-destructive)
-    local tmp
-    tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
-    _CLEANUP_FILES+=("$tmp")
-    cp "$SB_CONF_FILE" "$tmp"
-    ensure_route_sniff_rule "$tmp"
-    # write back only if valid JSON
-    if jq . "$tmp" >/dev/null 2>&1; then
-      cp "$tmp" "$SB_CONF_FILE"
-      chmod 640 "$SB_CONF_FILE"
-    fi
+    chmod 640 "$SB_CONF_FILE" || return 1
   fi
 }
 
 write_systemd() {
-  cat > "$SYSTEMD_FILE" <<EOF
+  local tmp_service
+  tmp_service=$(mktemp "${SYSTEMD_FILE}.new.XXXXXX") || {
+    echo -e "${RED}无法创建 systemd 服务临时文件。${PLAIN}" >&2
+    return 1
+  }
+  _CLEANUP_FILES+=("$tmp_service")
+  cat > "$tmp_service" <<EOF
 [Unit]
 Description=sing-box Service
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 User=root
@@ -284,8 +334,73 @@ LimitNOFILE=51200
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable sing-box >/dev/null 2>&1 || true
+  chmod 644 "$tmp_service" || return 1
+  mv -f "$tmp_service" "$SYSTEMD_FILE" || return 1
+  if ! systemctl daemon-reload; then
+    echo -e "${RED}systemd 配置重载失败。${PLAIN}" >&2
+    return 1
+  fi
+  if ! systemctl enable sing-box >/dev/null 2>&1; then
+    echo -e "${RED}sing-box 开机启动设置失败。${PLAIN}" >&2
+    return 1
+  fi
+}
+
+atomic_replace_file() {
+  local source=$1 destination=$2 mode=$3
+  local stage
+  stage=$(mktemp "${destination}.new.XXXXXX") || return 1
+  _CLEANUP_FILES+=("$stage")
+  install -m "$mode" "$source" "$stage" || return 1
+  mv -f "$stage" "$destination"
+}
+
+show_service_logs() {
+  journalctl -u sing-box --no-pager -n 30 2>/dev/null | tail -30
+}
+
+restart_singbox_checked() {
+  if ! systemctl restart sing-box; then
+    echo -e "${RED}sing-box 重启命令失败。${PLAIN}" >&2
+    show_service_logs
+    return 1
+  fi
+  sleep 1
+  if ! systemctl is-active --quiet sing-box; then
+    echo -e "${RED}sing-box 重启后未处于运行状态。${PLAIN}" >&2
+    show_service_logs
+    return 1
+  fi
+  return 0
+}
+
+migrate_route_guard_if_needed() {
+  [[ -x "$SB_BIN" && -s "$SB_CONF_FILE" ]] || return 0
+  jq -e '
+    (.route.rules[0] | .action? == "resolve" and (keys == ["action"])) and
+    (.route.rules[1] | .ip_is_private? == true and .action? == "reject" and
+      (keys == ["action", "ip_is_private"]))
+  ' "$SB_CONF_FILE" >/dev/null 2>&1 && return 0
+
+  local tmp
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  cp "$SB_CONF_FILE" "$tmp" || return 1
+  ensure_private_reject_rule "$tmp" || return 1
+  echo -e "${YELLOW}检测到旧版安全路由，正在补充域名解析和私网保护...${PLAIN}"
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    safe_save_config "$tmp"
+    return
+  fi
+
+  local out
+  out=$("$SB_BIN" check -c "$tmp" 2>&1) || {
+    echo -e "${RED}安全路由迁移校验失败，原配置未改动:${PLAIN}" >&2
+    echo "$out" | tail -12
+    return 1
+  }
+  atomic_replace_file "$tmp" "$SB_CONF_FILE" 640 || return 1
+  echo -e "${GREEN}安全路由已在服务停止状态下更新。${PLAIN}"
 }
 
 safe_save_config() {
@@ -308,30 +423,26 @@ safe_save_config() {
 
   local backup=""
   if [[ -f "$SB_CONF_FILE" ]] && [[ -s "$SB_CONF_FILE" ]]; then
-    backup="${SB_CONF_FILE}.bak"
-    cp "$SB_CONF_FILE" "$backup"
+    backup=$(mktemp "${SB_CONF_FILE}.bak.XXXXXX") || return 1
+    _CLEANUP_FILES+=("$backup")
+    cp -p "$SB_CONF_FILE" "$backup" || return 1
   fi
 
-  cp "$tmp_json" "$SB_CONF_FILE"
-  chmod 640 "$SB_CONF_FILE"
+  if ! atomic_replace_file "$tmp_json" "$SB_CONF_FILE" 640; then
+    echo -e "${RED}配置文件原子替换失败，现有配置未改动。${PLAIN}" >&2
+    return 1
+  fi
 
-  systemctl restart sing-box >/dev/null 2>&1 || true
-  sleep 1
-
-  if systemctl is-active --quiet sing-box; then
+  if restart_singbox_checked; then
     echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
-    rm -f "$backup"
+    [[ -n "$backup" ]] && rm -f "$backup"
     return 0
   fi
 
   echo -e "${RED}sing-box 启动失败! 正在回滚...${PLAIN}"
-  journalctl -u sing-box --no-pager -n 20 2>/dev/null | tail -20
 
   if [[ -n "$backup" && -f "$backup" ]]; then
-    cp "$backup" "$SB_CONF_FILE"
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    sleep 1
-    if systemctl is-active --quiet sing-box; then
+    if atomic_replace_file "$backup" "$SB_CONF_FILE" 640 && restart_singbox_checked; then
       echo -e "${YELLOW}已回滚到上一份有效配置，服务已恢复。${PLAIN}"
     else
       echo -e "${RED}回滚后仍无法启动，请手动检查: journalctl -u sing-box -n 80${PLAIN}"
@@ -343,7 +454,7 @@ safe_save_config() {
 
 install_shortcut_cmd() {
   if [[ "$(realpath "$0" 2>/dev/null)" == "$INSTALL_PATH" ]]; then return; fi
-  local tmp_script
+  local tmp_script remote_ver
   tmp_script=$(mktemp "${INSTALL_PATH}.install.XXXXXX") || {
     echo -e "${RED}无法创建快捷命令安装临时文件。${PLAIN}" >&2
     return 1
@@ -351,18 +462,24 @@ install_shortcut_cmd() {
   _CLEANUP_FILES+=("$tmp_script")
   if curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" \
       && validate_script_candidate "$tmp_script"; then
-    if ! chmod 755 "$tmp_script" || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
-      echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
-      return 1
+    remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2)
+    if ! version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
+      if ! chmod 755 "$tmp_script" || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
+        echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
+        return 1
+      fi
+      echo -e "${GREEN}快捷命令 '${SHORTCUT_NAME}' 已安装到 ${INSTALL_PATH}${PLAIN}"
+      return 0
     fi
-    echo -e "${GREEN}快捷命令 '${SHORTCUT_NAME}' 已安装到 ${INSTALL_PATH}${PLAIN}"
-  elif [[ -f "$0" ]] && validate_script_candidate "$0"; then
+    echo -e "${YELLOW}远端脚本 v${remote_ver} 低于当前 v${SCRIPT_VERSION}，改用当前脚本安装。${PLAIN}"
+  fi
+  if [[ -f "$0" ]] && validate_script_candidate "$0"; then
     if ! cp "$0" "$tmp_script" || ! chmod 755 "$tmp_script" \
         || ! mv -f "$tmp_script" "$INSTALL_PATH"; then
       echo -e "${RED}快捷命令本地安装失败，现有文件未被覆盖。${PLAIN}" >&2
       return 1
     fi
-    echo -e "${YELLOW}远程下载失败，快捷命令已从本地脚本安装。${PLAIN}"
+    echo -e "${YELLOW}快捷命令已从当前脚本安装。${PLAIN}"
   else
     echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
     return 1
@@ -371,8 +488,8 @@ install_shortcut_cmd() {
 
 install_singbox() {
   echo -e "${BLUE}>>> 安装/更新 sing-box 核心...${PLAIN}"
-  init_meta_if_missing
-  init_config_if_missing
+  init_meta_if_missing || return 1
+  init_config_if_missing || return 1
 
   local arch
   arch=$(map_arch_sb)
@@ -381,6 +498,10 @@ install_singbox() {
   local latest_ver=""
 
   if [[ -n "$PINNED_SB_VERSION" ]]; then
+    if ! [[ "$PINNED_SB_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo -e "${RED}固定版本格式无效: ${PINNED_SB_VERSION}${PLAIN}" >&2
+      return 1
+    fi
     latest_ver="$PINNED_SB_VERSION"
     latest_tag="v${PINNED_SB_VERSION}"
     echo -e "${YELLOW}使用固定版本: ${latest_tag}${PLAIN}"
@@ -397,24 +518,51 @@ install_singbox() {
   local curr_ver
   curr_ver=$(get_current_sb_ver)
 
+  if [[ -z "$PINNED_SB_VERSION" && "$curr_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+     version_is_older "$latest_ver" "$curr_ver"; then
+    echo -e "${RED}拒绝核心降级：远端稳定版 ${latest_ver} 低于当前 ${curr_ver}。${PLAIN}" >&2
+    return 1
+  fi
+
   if [[ "$curr_ver" == "$latest_ver" ]]; then
-    echo -e "${GREEN}当前已是最新版 (${curr_ver})，跳过更新。${PLAIN}"
-    write_systemd
-    systemctl restart sing-box >/dev/null 2>&1 || true
-    install_shortcut_cmd
-    return 0
+    echo -e "${GREEN}当前已是目标版本 (${curr_ver})，正在验证配置和服务。${PLAIN}"
+    local current_check
+    current_check=$("$SB_BIN" check -c "$SB_CONF_FILE" 2>&1) || {
+      echo -e "${RED}现有配置无法通过 sing-box ${curr_ver} 校验，未重启服务:${PLAIN}" >&2
+      echo "$current_check" | tail -20
+      return 1
+    }
+    write_systemd || return 1
+    restart_singbox_checked || return 1
+    migrate_route_guard_if_needed || return 1
+    install_shortcut_cmd || return 1
+    return
   fi
 
   echo -e "${YELLOW}正在下载 sing-box ${latest_ver} (${arch})...${PLAIN}"
-  local url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/sing-box-${latest_ver}-linux-${arch}.tar.gz"
+  local asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
+  local url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
   local tmp_tgz tmp_dir
   tmp_tgz=$(mktemp /tmp/sb_XXXXXX.tgz)
   tmp_dir=$(mktemp -d /tmp/sb_XXXXXX.dir)
   _CLEANUP_FILES+=("$tmp_tgz" "$tmp_dir")
 
-  if ! curl -L --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+  if ! curl -fL --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
     echo -e "${RED}下载失败：${url}${PLAIN}"
     return 1
+  fi
+
+  local expected_digest actual_digest
+  expected_digest=$(get_release_asset_digest "$latest_tag" "$asset_name") || expected_digest=""
+  if [[ -n "$expected_digest" ]]; then
+    actual_digest=$(openssl dgst -sha256 "$tmp_tgz" 2>/dev/null | awk '{print $NF}')
+    if [[ "$actual_digest" != "$expected_digest" ]]; then
+      echo -e "${RED}下载文件 SHA-256 校验失败，拒绝安装。${PLAIN}" >&2
+      return 1
+    fi
+    echo -e "${GREEN}发布文件 SHA-256 校验通过。${PLAIN}"
+  else
+    echo -e "${YELLOW}警告: 无法取得 GitHub 发布文件摘要，将继续执行版本和配置校验。${PLAIN}" >&2
   fi
 
   if ! tar -xzf "$tmp_tgz" -C "$tmp_dir"; then
@@ -429,22 +577,70 @@ install_singbox() {
     return 1
   fi
 
-  systemctl stop sing-box >/dev/null 2>&1 || true
-  install -m 755 "$extracted" "$SB_BIN"
+  chmod 755 "$extracted" || {
+    echo -e "${RED}无法设置候选核心的执行权限。${PLAIN}" >&2
+    return 1
+  }
 
-  write_systemd
-  systemctl restart sing-box >/dev/null 2>&1 || true
-
-  if systemctl is-active --quiet sing-box; then
-    echo -e "${GREEN}sing-box 已更新到 ${latest_ver} 并启动成功。${PLAIN}"
-  else
-    echo -e "${RED}sing-box 启动失败，请查看：journalctl -u sing-box -n 80${PLAIN}"
+  local candidate_ver
+  candidate_ver=$(get_sb_ver_from_bin "$extracted") || {
+    echo -e "${RED}无法读取候选核心版本，拒绝安装。${PLAIN}" >&2
+    return 1
+  }
+  if [[ "$candidate_ver" != "$latest_ver" ]]; then
+    echo -e "${RED}候选核心版本不匹配: 期望 ${latest_ver}，实际 ${candidate_ver}。${PLAIN}" >&2
+    return 1
   fi
 
-  install_shortcut_cmd
+  local candidate_check
+  candidate_check=$("$extracted" check -c "$SB_CONF_FILE" 2>&1) || {
+    echo -e "${RED}现有配置无法通过 sing-box ${candidate_ver} 校验，旧核心保持运行:${PLAIN}" >&2
+    echo "$candidate_check" | tail -20
+    return 1
+  }
+
+  local old_binary=""
+  if [[ -x "$SB_BIN" ]]; then
+    old_binary=$(mktemp "${SB_BIN}.bak.XXXXXX") || return 1
+    _CLEANUP_FILES+=("$old_binary")
+    cp -p "$SB_BIN" "$old_binary" || return 1
+  fi
+
+  if ! atomic_replace_file "$extracted" "$SB_BIN" 755; then
+    echo -e "${RED}核心文件原子替换失败，旧核心保持不变。${PLAIN}" >&2
+    return 1
+  fi
+
+  if write_systemd && restart_singbox_checked; then
+    echo -e "${GREEN}sing-box 已更新到 ${latest_ver} 并启动成功。${PLAIN}"
+    [[ -n "$old_binary" ]] && rm -f "$old_binary"
+    migrate_route_guard_if_needed || return 1
+    install_shortcut_cmd || return 1
+    return
+  fi
+
+  echo -e "${RED}新核心启动失败，正在回滚核心...${PLAIN}" >&2
+  if [[ -n "$old_binary" && -f "$old_binary" ]]; then
+    if atomic_replace_file "$old_binary" "$SB_BIN" 755 && restart_singbox_checked; then
+      echo -e "${YELLOW}已恢复 sing-box ${curr_ver}，服务重新运行。${PLAIN}"
+    else
+      echo -e "${RED}旧核心恢复失败，请立即检查: journalctl -u sing-box -n 80${PLAIN}" >&2
+    fi
+  else
+    rm -f "$SB_BIN"
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo -e "${RED}首次安装失败，已移除不可用核心。${PLAIN}" >&2
+  fi
+  return 1
 }
 
 gen_uuid() {
+  if [[ -x "$SB_BIN" ]]; then
+    "$SB_BIN" generate uuid 2>/dev/null && return
+  fi
   if [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid; return; fi
   openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
 }
@@ -513,10 +709,12 @@ gen_reality_keypair() {
 }
 
 ask_chain_proxy() {
-  local has
+  local has type label
   has=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .tag' "$SB_CONF_FILE" 2>/dev/null)
   [[ -z "$has" ]] && { echo ""; return; }
-  echo -e "${YELLOW}是否为此节点启用 SOCKS5 链式转发? [y/N]${PLAIN}" >&2
+  type=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .type' "$SB_CONF_FILE" 2>/dev/null)
+  [[ "$type" == "shadowsocks" ]] && label="SS2022 加密中继" || label="SOCKS5 上游"
+  echo -e "${YELLOW}是否为此节点启用 ${label}? [y/N]${PLAIN}" >&2
   read -p "选择: " sel
   sel=$(strip_cr "$sel")
   [[ "${sel,,}" == "y" ]] && echo "yes" || echo ""
@@ -525,29 +723,57 @@ ask_chain_proxy() {
 apply_chain_routing() {
   local json_file=$1
   local inbound_tag=$2
-  # Ensure sniff rule exists (recommended approach)
-  ensure_route_sniff_rule "$json_file"
-  jq --arg itag "$inbound_tag" '
-    .route.rules = ([{
-      "inbound": [$itag],
-      "action": "route",
-      "outbound": "chain_proxy"
-    }] + (.route.rules // []))
-  ' "$json_file" > "${json_file}.r" && mv "${json_file}.r" "$json_file"
+  ensure_private_reject_rule "$json_file" || return 1
+  local stage="${json_file}.route"
+  if jq --arg itag "$inbound_tag" '
+    .route.rules = (
+      ((.route.rules // []) | map(select(
+        ((.action? == "route") and (.outbound? == "chain_proxy") and
+         ((.inbound? // []) | index($itag) != null)) | not
+      ))) + [{
+        "inbound": [$itag],
+        "action": "route",
+        "outbound": "chain_proxy"
+      }]
+    )
+  ' "$json_file" > "$stage" && mv "$stage" "$json_file"; then
+    return
+  fi
+  rm -f "$stage"
+  return 1
+}
+
+remove_chain_routing() {
+  local json_file=$1
+  local inbound_tag=$2
+  local stage="${json_file}.route"
+  if jq --arg itag "$inbound_tag" '
+    .route.rules = ((.route.rules // []) | map(select(
+      ((.action? == "route") and (.outbound? == "chain_proxy") and
+       ((.inbound? // []) | index($itag) != null)) | not
+    )))
+  ' "$json_file" > "$stage" && mv "$stage" "$json_file"; then
+    return
+  fi
+  rm -f "$stage"
+  return 1
 }
 
 # ---- metadata helpers (pbk storage) ----
 meta_set_pubkey() {
   local tag=$1
   local pubk=$2
-  init_meta_if_missing
+  init_meta_if_missing || return 1
   local tmp
-  tmp=$(mktemp /tmp/sb_meta.XXXXXX.json)
+  tmp=$(mktemp "${META_FILE}.new.XXXXXX")
   _CLEANUP_FILES+=("$tmp")
-  jq --arg t "$tag" --arg pk "$pubk" '
+  if ! jq --arg t "$tag" --arg pk "$pubk" '
     .[$t] = (.[$t] // {}) | .[$t].public_key = $pk
-  ' "$META_FILE" > "$tmp" && mv "$tmp" "$META_FILE"
-  chmod 600 "$META_FILE"
+  ' "$META_FILE" > "$tmp"; then
+    echo -e "${RED}节点元数据更新失败。${PLAIN}" >&2
+    return 1
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$META_FILE"
 }
 
 meta_get_pubkey() {
@@ -560,10 +786,10 @@ meta_del_tag() {
   local tag=$1
   [[ -f "$META_FILE" ]] || return
   local tmp
-  tmp=$(mktemp /tmp/sb_meta.XXXXXX.json)
+  tmp=$(mktemp "${META_FILE}.new.XXXXXX")
   _CLEANUP_FILES+=("$tmp")
-  jq --arg t "$tag" 'del(.[$t])' "$META_FILE" > "$tmp" && mv "$tmp" "$META_FILE"
-  chmod 600 "$META_FILE"
+  jq --arg t "$tag" 'del(.[$t])' "$META_FILE" > "$tmp" || return 1
+  chmod 600 "$tmp" && mv -f "$tmp" "$META_FILE"
 }
 
 get_public_ip() {
@@ -683,12 +909,15 @@ add_reality() {
 
   local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
   _CLEANUP_FILES+=("$tmp")
+  _CLEANUP_FILES+=("${tmp}.1")
   cp "$SB_CONF_FILE" "$tmp"
 
-  # ensure sniff action exists globally
-  ensure_route_sniff_rule "$tmp"
+  ensure_private_reject_rule "$tmp" || {
+    echo -e "${RED}无法生成基础安全路由规则。${PLAIN}" >&2
+    return 1
+  }
 
-  jq --arg tag "$tag" --arg port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg privk "$privk" --arg sid "$sid" '
+  if ! jq --arg tag "$tag" --arg port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg privk "$privk" --arg sid "$sid" '
     .inbounds += [{
       "type": "vless",
       "tag": $tag,
@@ -709,16 +938,26 @@ add_reality() {
         }
       }
     }]
-  ' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+  ' "$tmp" > "${tmp}.1" || ! mv "${tmp}.1" "$tmp"; then
+    echo -e "${RED}Reality 配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
 
   if [[ -n "$chain" ]]; then
-    apply_chain_routing "$tmp" "$tag"
+    apply_chain_routing "$tmp" "$tag" || {
+      echo -e "${RED}Reality 链式转发规则生成失败。${PLAIN}" >&2
+      return 1
+    }
   fi
 
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    meta_set_pubkey "$tag" "$pubk"
-    open_port "$port"
+    if ! meta_set_pubkey "$tag" "$pubk"; then
+      echo -e "${YELLOW}节点已运行，但 Public Key 元数据保存失败，分享链接暂不可用。${PLAIN}" >&2
+    fi
+    if ! open_port "$port" tcp; then
+      echo -e "${YELLOW}Reality 节点已运行，但 TCP/${port} 防火墙规则添加失败，请手动放行。${PLAIN}" >&2
+    fi
     show_node_info "$tag"
   else
     rm -f "$tmp"
@@ -727,27 +966,32 @@ add_reality() {
 
 add_ss2022() {
   echo -e "${BLUE}>>> 添加 Shadowsocks-2022 节点${PLAIN}"
+  [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return 1; }
   local port; port=$(get_random_port)
   read -p "请输入端口 [随机 ${port}]: " inport
   inport=$(strip_cr "$inport")
   [[ -n "$inport" ]] && port="$inport"
   is_port_available "$port" || return
 
-  local method="2022-blake3-aes-128-gcm"
-  local key; key=$(openssl rand -base64 16)
+  local method="$SS2022_METHOD"
+  local key; key=$("$SB_BIN" generate rand --base64 "$SS2022_KEY_BYTES" 2>/dev/null)
+  [[ -n "$key" ]] || { echo -e "${RED}生成 Shadowsocks-2022 密钥失败。${PLAIN}"; return 1; }
   local tag="ss_${port}"
 
   local chain; chain=$(ask_chain_proxy)
 
   local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
   _CLEANUP_FILES+=("$tmp")
+  _CLEANUP_FILES+=("${tmp}.1")
   cp "$SB_CONF_FILE" "$tmp"
 
-  # ensure sniff action exists globally
-  ensure_route_sniff_rule "$tmp"
+  ensure_private_reject_rule "$tmp" || {
+    echo -e "${RED}无法生成基础安全路由规则。${PLAIN}" >&2
+    return 1
+  }
 
-  # ✅ FIX P0-1: DO NOT set network: "tcp,udp" (invalid in sing-box). Leave empty -> TCP+UDP by default.
-  jq --arg tag "$tag" --arg port "$port" --arg method "$method" --arg key "$key" '
+  # Official schema: omitting network enables both TCP and UDP.
+  if ! jq --arg tag "$tag" --arg port "$port" --arg method "$method" --arg key "$key" '
     .inbounds += [{
       "type": "shadowsocks",
       "tag": $tag,
@@ -756,18 +1000,138 @@ add_ss2022() {
       "method": $method,
       "password": $key
     }]
-  ' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
+  ' "$tmp" > "${tmp}.1" || ! mv "${tmp}.1" "$tmp"; then
+    echo -e "${RED}Shadowsocks-2022 配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
 
   if [[ -n "$chain" ]]; then
-    apply_chain_routing "$tmp" "$tag"
+    apply_chain_routing "$tmp" "$tag" || {
+      echo -e "${RED}Shadowsocks 链式转发规则生成失败。${PLAIN}" >&2
+      return 1
+    }
   fi
 
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    open_port "$port"
+    if ! open_port "$port" both; then
+      echo -e "${YELLOW}Shadowsocks 节点已运行，但 TCP/UDP ${port} 防火墙规则添加失败，请手动放行。${PLAIN}" >&2
+    fi
     show_node_info "$tag"
   else
     rm -f "$tmp"
+  fi
+}
+
+_RELAY_COUNT=0
+
+list_ss2022_relays() {
+  echo -e "${BLUE}================================================================${PLAIN}"
+  echo -e "   本机 SS2022 专用出口中继"
+  echo -e "${BLUE}================================================================${PLAIN}"
+  printf " %-4s %-20s %-8s\n" "ID" "Tag" "Port"
+  echo -e "----------------------------------------------------------------"
+  _RELAY_COUNT=0
+
+  local tag port
+  while IFS=$'\t' read -r tag port; do
+    [[ -n "$tag" ]] || continue
+    _RELAY_COUNT=$((_RELAY_COUNT+1))
+    printf " [%d]  %-20s %-8s\n" "$_RELAY_COUNT" "$tag" "$port"
+  done < <(jq -r '.inbounds[]? | select((.tag // "") | startswith("relay_")) | [.tag, .listen_port] | @tsv' "$SB_CONF_FILE" 2>/dev/null)
+
+  [[ "$_RELAY_COUNT" -gt 0 ]] || echo " (无专用中继)"
+  echo -e "----------------------------------------------------------------"
+}
+
+get_relay_tag_by_id() {
+  local target=$1 i=0 tag
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    i=$((i+1))
+    [[ "$i" -eq "$target" ]] && { echo "$tag"; return; }
+  done < <(jq -r '.inbounds[]? | select((.tag // "") | startswith("relay_")) | .tag' "$SB_CONF_FILE" 2>/dev/null)
+}
+
+show_ss2022_relay_info() {
+  local tag=$1 node ip display_ip
+  node=$(jq -c --arg t "$tag" '.inbounds[]? | select(.tag==$t)' "$SB_CONF_FILE" 2>/dev/null)
+  [[ -n "$node" ]] || return 1
+  ip=$(get_public_ip)
+  display_ip="$ip"
+  [[ "$ip" == *:* ]] && display_ip="[$ip]"
+  echo -e "${GREEN}SS2022 专用中继已就绪。请在 A 机配置以下上游:${PLAIN}"
+  echo " 地址: ${display_ip}:$(echo "$node" | jq -r '.listen_port')"
+  echo " 方法: $(echo "$node" | jq -r '.method')"
+  echo " 密钥: $(echo "$node" | jq -r '.password')"
+  echo -e "${YELLOW}脚本未修改防火墙。请自行放行该 TCP/UDP 端口；如需来源限制，请在云安全组中只允许 A 机 IP。${PLAIN}"
+}
+
+create_ss2022_relay() {
+  echo -e "${BLUE}>>> 在 B 机创建 SS2022 专用出口中继${PLAIN}"
+  [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return 1; }
+
+  local port default_port method key tag tmp
+  default_port=$(get_random_port)
+  read -p "中继端口 [随机 ${default_port}]: " port
+  port=$(strip_cr "$port")
+  [[ -n "$port" ]] || port="$default_port"
+  is_port_available "$port" || return 1
+
+  method="$SS2022_METHOD"
+  key=$("$SB_BIN" generate rand --base64 "$SS2022_KEY_BYTES" 2>/dev/null)
+  [[ -n "$key" ]] || { echo -e "${RED}生成中继密钥失败。${PLAIN}" >&2; return 1; }
+  tag="relay_${port}"
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp" "${tmp}.1")
+  cp "$SB_CONF_FILE" "$tmp" || return 1
+  ensure_private_reject_rule "$tmp" || return 1
+
+  if ! jq --arg tag "$tag" --arg port "$port" --arg method "$method" --arg key "$key" '
+    .inbounds += [{
+      "type": "shadowsocks",
+      "tag": $tag,
+      "listen": "::",
+      "listen_port": ($port|tonumber),
+      "method": $method,
+      "password": $key
+    }]
+  ' "$tmp" > "${tmp}.1" || ! mv "${tmp}.1" "$tmp"; then
+    echo -e "${RED}中继配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
+
+  if ! safe_save_config "$tmp"; then
+    return 1
+  fi
+
+  rm -f "$tmp"
+  show_ss2022_relay_info "$tag"
+}
+
+delete_ss2022_relay() {
+  list_ss2022_relays
+  [[ "$_RELAY_COUNT" -gt 0 ]] || return
+
+  local id tag tmp
+  read -p "输入要删除的中继 ID (0 返回): " id
+  id=$(strip_cr "$id")
+  [[ "$id" == "0" ]] && return
+  if ! [[ "$id" =~ ^[0-9]+$ ]] || [[ "$id" -lt 1 ]] || [[ "$id" -gt "$_RELAY_COUNT" ]]; then
+    echo -e "${RED}ID 无效。${PLAIN}"
+    return 1
+  fi
+  tag=$(get_relay_tag_by_id "$id")
+  [[ -n "$tag" ]] || return 1
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  if ! jq --arg t "$tag" 'del(.inbounds[] | select(.tag==$t))' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}中继删除配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
+  if safe_save_config "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${GREEN}中继已删除。${PLAIN}"
   fi
 }
 
@@ -833,83 +1197,252 @@ delete_node() {
   local tag; tag=$(get_node_tag_by_id "$id")
   [[ -z "$tag" ]] && { echo -e "${RED}未找到节点。${PLAIN}"; return; }
 
-  local port; port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$SB_CONF_FILE" 2>/dev/null)
+  local port proto
+  port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$SB_CONF_FILE" 2>/dev/null)
+  proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .type' "$SB_CONF_FILE" 2>/dev/null)
   echo -e "${YELLOW}正在删除: ${tag} ...${PLAIN}"
 
   local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
   _CLEANUP_FILES+=("$tmp")
-  jq --arg t "$tag" '
+  if ! jq --arg t "$tag" '
     del(.inbounds[] | select(.tag==$t)) |
     .route.rules |= [ .[] | select((.inbound // [] | index($t)) | not) ]
-  ' "$SB_CONF_FILE" > "$tmp"
+  ' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}节点删除配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
 
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    [[ -n "$port" && "$port" != "null" ]] && close_port "$port"
-    meta_del_tag "$tag"
+    [[ -n "$port" && "$port" != "null" ]] && close_port "$port" "$(network_mode_for_type "$proto")"
+    meta_del_tag "$tag" || echo -e "${YELLOW}警告: 节点已删除，但元数据清理失败。${PLAIN}" >&2
     echo -e "${GREEN}删除完成。${PLAIN}"
   else
     rm -f "$tmp"
   fi
 }
 
+CHAIN_HOST=""
+CHAIN_PORT=""
+
+parse_chain_address() {
+  local address=$1
+  CHAIN_HOST=""
+  CHAIN_PORT=""
+  if [[ "$address" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    CHAIN_HOST=${BASH_REMATCH[1]}
+    CHAIN_PORT=${BASH_REMATCH[2]}
+  elif [[ "$address" =~ ^([^:]+):([0-9]+)$ ]]; then
+    CHAIN_HOST=${BASH_REMATCH[1]}
+    CHAIN_PORT=${BASH_REMATCH[2]}
+  else
+    return 1
+  fi
+  [[ -n "$CHAIN_HOST" && ! "$CHAIN_HOST" =~ [[:space:]] &&
+     "$CHAIN_PORT" -ge 1 && "$CHAIN_PORT" -le 65535 ]]
+}
+
+manage_node_forwarding() {
+  if ! jq -e '.outbounds[]? | select(.tag == "chain_proxy")' "$SB_CONF_FILE" >/dev/null 2>&1; then
+    echo -e "${YELLOW}请先配置 SS2022 加密上游或兼容 SOCKS5 上游。${PLAIN}"
+    return 1
+  fi
+
+  list_nodes
+  [[ "$_NODE_COUNT" -eq 0 ]] && return
+  local id tag enabled choice tmp
+  read -p "输入要设置的节点 ID (0 返回): " id
+  id=$(strip_cr "$id")
+  [[ "$id" == "0" ]] && return
+  if ! [[ "$id" =~ ^[0-9]+$ ]] || [[ "$id" -lt 1 ]] || [[ "$id" -gt "$_NODE_COUNT" ]]; then
+    echo -e "${RED}ID 无效。${PLAIN}"
+    return 1
+  fi
+  tag=$(get_node_tag_by_id "$id")
+  [[ -n "$tag" ]] || return 1
+
+  enabled=$(jq -r --arg t "$tag" 'any(.route.rules[]?;
+    .action? == "route" and .outbound? == "chain_proxy" and ((.inbound? // []) | index($t) != null))'
+    "$SB_CONF_FILE" 2>/dev/null)
+  if [[ "$enabled" == "true" ]]; then
+    echo -e "当前 ${tag}: ${GREEN}已启用上游转发${PLAIN}"
+  else
+    echo -e "当前 ${tag}: ${YELLOW}直接出站${PLAIN}"
+  fi
+  read -p "输入 y 启用转发，n 关闭转发，其他键取消: " choice
+  choice=$(strip_cr "$choice")
+  [[ "${choice,,}" == "y" || "${choice,,}" == "n" ]] || return
+
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  cp "$SB_CONF_FILE" "$tmp" || return 1
+  ensure_private_reject_rule "$tmp" || return 1
+  if [[ "${choice,,}" == "y" ]]; then
+    apply_chain_routing "$tmp" "$tag" || return 1
+  else
+    remove_chain_routing "$tmp" "$tag" || return 1
+  fi
+  safe_save_config "$tmp"
+}
+
+delete_chain_proxy() {
+  local tmp
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  if ! jq '
+    del(.outbounds[] | select(.tag=="chain_proxy")) |
+    .route.rules = ([.route.rules[]?] | map(select(.outbound? != "chain_proxy")))
+  ' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}删除上游配置失败。${PLAIN}" >&2
+    return 1
+  fi
+  if safe_save_config "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${GREEN}上游及关联节点转发规则已删除。${PLAIN}"
+  fi
+}
+
+configure_ss2022_chain() {
+  local addr method password tmp
+  echo -e "${BLUE}>>> 在 A 机配置 SS2022 加密上游${PLAIN}"
+  read -p "输入 B 机中继地址 (如 203.0.113.20:40000)，留空=删除当前上游: " addr
+  addr=$(strip_cr "$addr")
+  [[ -n "$addr" ]] || { delete_chain_proxy; return; }
+  if ! parse_chain_address "$addr"; then
+    echo -e "${RED}B 机地址格式或端口无效。${PLAIN}" >&2
+    return 1
+  fi
+
+  method="$SS2022_METHOD"
+  read -s -p "输入 B 机中继密钥: " password
+  echo
+  password=$(strip_cr "$password")
+  [[ -n "$password" ]] || { echo -e "${RED}SS2022 中继密钥不能为空。${PLAIN}" >&2; return 1; }
+
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  if ! jq --arg h "$CHAIN_HOST" --arg p "$CHAIN_PORT" --arg method "$method" --arg password "$password" '
+    del(.outbounds[] | select(.tag=="chain_proxy")) |
+    .outbounds += [{
+      "type": "shadowsocks",
+      "tag": "chain_proxy",
+      "server": $h,
+      "server_port": ($p|tonumber),
+      "method": $method,
+      "password": $password
+    }]
+  ' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}SS2022 上游配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
+  if safe_save_config "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${GREEN}SS2022 加密上游已配置；请选择要使用 B 机出口的节点。${PLAIN}"
+  fi
+}
+
+configure_socks5_chain() {
+  local addr username password tmp
+  echo -e "${YELLOW}SOCKS5 仅为旧配置兼容；公网跨机转发推荐使用 SS2022。${PLAIN}"
+  read -p "输入上游 SOCKS5 (如 127.0.0.1:40000)，留空=删除当前上游: " addr
+  addr=$(strip_cr "$addr")
+  [[ -n "$addr" ]] || { delete_chain_proxy; return; }
+  if ! parse_chain_address "$addr"; then
+    echo -e "${RED}SOCKS5 地址格式或端口无效。${PLAIN}" >&2
+    return 1
+  fi
+
+  read -p "SOCKS5 用户名（无认证请留空）: " username
+  username=$(strip_cr "$username")
+  password=""
+  if [[ -n "$username" ]]; then
+    read -s -p "SOCKS5 密码: " password
+    echo
+    password=$(strip_cr "$password")
+  fi
+
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  if ! jq --arg h "$CHAIN_HOST" --arg p "$CHAIN_PORT" --arg u "$username" --arg pw "$password" '
+    del(.outbounds[] | select(.tag=="chain_proxy")) |
+    .outbounds += [({
+      "type": "socks",
+      "tag": "chain_proxy",
+      "server": $h,
+      "server_port": ($p|tonumber),
+      "version": "5"
+    } + (if $u != "" then {"username": $u, "password": $pw} else {} end))]
+  ' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}SOCKS5 转发配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
+  safe_save_config "$tmp" && rm -f "$tmp"
+}
+
+clear_chain_routes() {
+  local tmp
+  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  _CLEANUP_FILES+=("$tmp")
+  if ! jq '
+    .route.rules = ([.route.rules[]?] | map(select(.outbound? != "chain_proxy")))
+  ' "$SB_CONF_FILE" > "$tmp"; then
+    echo -e "${RED}默认路由配置生成失败。${PLAIN}" >&2
+    return 1
+  fi
+  ensure_private_reject_rule "$tmp" || return 1
+  safe_save_config "$tmp" && rm -f "$tmp"
+}
+
+chain_proxy_summary() {
+  jq -r '.outbounds[]? | select(.tag=="chain_proxy") |
+    (if .type == "shadowsocks" then "SS2022 加密上游" elif .type == "socks" then "SOCKS5 兼容上游" else .type end) +
+    " · " +
+    (if (.server | contains(":")) then "[\(.server)]:\(.server_port)" else "\(.server):\(.server_port)" end)
+  ' "$SB_CONF_FILE" 2>/dev/null
+}
+
 configure_advanced() {
   while true; do
     clear
-    echo -e "${BLUE}=== 进阶功能 (Advanced) ===${PLAIN}"
-    local chain
-    chain=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | "\(.server):\(.server_port)"' "$SB_CONF_FILE" 2>/dev/null)
-    if [[ -n "$chain" && "$chain" != "null:null" ]]; then
-      echo -e " 当前 SOCKS5 链: ${GREEN}${chain}${PLAIN}"
+    echo -e "${BLUE}=== 加密出口中继 / 路由 ===${PLAIN}"
+    local chain relay_count choice
+    chain=$(chain_proxy_summary)
+    relay_count=$(jq '[.inbounds[]? | select((.tag // "") | startswith("relay_"))] | length' "$SB_CONF_FILE" 2>/dev/null)
+    if [[ -n "$chain" ]]; then
+      echo -e " 当前 A 机上游: ${GREEN}${chain}${PLAIN}"
     else
-      echo -e " 当前 SOCKS5 链: ${YELLOW}未配置${PLAIN}"
+      echo -e " 当前 A 机上游: ${YELLOW}未配置${PLAIN}"
     fi
+    echo -e " 本机 B 机中继: ${GREEN}${relay_count:-0} 个${PLAIN}"
     echo
-    echo " 1) 配置/删除 上游 SOCKS5 链式代理"
-    echo " 2) 恢复默认路由规则(保留 sniff + 屏蔽私网IP)"
+    echo " 1) B机：创建 SS2022 专用出口中继"
+    echo " 2) B机：查看/删除 SS2022 专用中继"
+    echo " 3) A机：配置/替换/删除 SS2022 加密上游"
+    echo " 4) A机：设置现有节点是否走 B 机"
+    echo " 5) 兼容：配置/删除旧 SOCKS5 上游"
+    echo " 6) 清除全部节点转发规则（保留上游）"
     echo " 0) 返回"
     echo "----------------------------------------"
     read -p "请选择: " choice
     choice=$(strip_cr "$choice")
     case "$choice" in
-      1)
-        read -p "输入上游 SOCKS5 (如 127.0.0.1:40000)，留空=删除: " addr
-        addr=$(strip_cr "$addr")
-        local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
-        _CLEANUP_FILES+=("$tmp")
-
-        if [[ -z "$addr" ]]; then
-          jq '
-            del(.outbounds[] | select(.tag=="chain_proxy")) |
-            .route.rules |= [ .[] | select(.outbound != "chain_proxy") ]
-          ' "$SB_CONF_FILE" > "$tmp"
-          safe_save_config "$tmp" && rm -f "$tmp"
-        else
-          local host="${addr%:*}"
-          local port="${addr#*:}"
-          jq 'del(.outbounds[] | select(.tag=="chain_proxy"))' "$SB_CONF_FILE" > "$tmp"
-          jq --arg h "$host" --arg p "$port" '
-            .outbounds += [{
-              "type": "socks",
-              "tag": "chain_proxy",
-              "server": $h,
-              "server_port": ($p|tonumber)
-            }]
-          ' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
-          safe_save_config "$tmp" && rm -f "$tmp"
+      1) run_menu_action "创建 SS2022 专用中继" create_ss2022_relay; read -p "按回车继续..." ;;
+      2)
+        list_ss2022_relays
+        if [[ "$_RELAY_COUNT" -gt 0 ]]; then
+          read -p "输入中继 ID 查看连接信息，输入 d 删除，其他键返回: " choice
+          choice=$(strip_cr "$choice")
+          if [[ "${choice,,}" == "d" ]]; then
+            run_menu_action "删除 SS2022 专用中继" delete_ss2022_relay
+          elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$_RELAY_COUNT" ]]; then
+            show_ss2022_relay_info "$(get_relay_tag_by_id "$choice")"
+          fi
         fi
         read -p "按回车继续..." ;;
-      2)
-        local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
-        _CLEANUP_FILES+=("$tmp")
-        jq '
-          .route.rules = [
-            { "action":"sniff" },
-            { "ip_is_private": true, "action": "reject" }
-          ] + ([.route.rules[]?] | map(select(.action? != "sniff" and .ip_is_private? != true and .outbound? != "chain_proxy")))
-        ' "$SB_CONF_FILE" > "$tmp"
-        safe_save_config "$tmp" && rm -f "$tmp"
-        read -p "按回车继续..." ;;
+      3) run_menu_action "配置 SS2022 加密上游" configure_ss2022_chain; read -p "按回车继续..." ;;
+      4) run_menu_action "设置节点出口" manage_node_forwarding; read -p "按回车继续..." ;;
+      5) run_menu_action "配置 SOCKS5 兼容上游" configure_socks5_chain; read -p "按回车继续..." ;;
+      6) run_menu_action "清除节点转发规则" clear_chain_routes; read -p "按回车继续..." ;;
       0) return ;;
     esac
   done
@@ -961,13 +1494,22 @@ uninstall_all() {
   cf=$(strip_cr "$cf")
   [[ "${cf,,}" != "yes" ]] && return
 
-  if [[ -f "$SB_CONF_FILE" ]]; then
-    for p in $(jq -r '.inbounds[]?.listen_port // empty' "$SB_CONF_FILE" 2>/dev/null); do
-      close_port "$p"
-    done
+  if systemctl is-active --quiet sing-box 2>/dev/null && ! systemctl stop sing-box; then
+    echo -e "${RED}sing-box 停止失败；为避免中继端口在清理防火墙时暴露，已取消卸载。${PLAIN}" >&2
+    return 1
   fi
 
-  systemctl stop sing-box >/dev/null 2>&1 || true
+  if [[ -f "$SB_CONF_FILE" ]]; then
+    while IFS=$'\t' read -r p proto tag; do
+      [[ -n "$p" ]] || continue
+      if [[ "$tag" == relay_* ]]; then
+        continue
+      else
+        close_port "$p" "$(network_mode_for_type "$proto")"
+      fi
+    done < <(jq -r '.inbounds[]? | select(.listen_port != null) | [.listen_port, .type, .tag] | @tsv' "$SB_CONF_FILE" 2>/dev/null)
+  fi
+
   systemctl disable sing-box >/dev/null 2>&1 || true
   rm -f "$SYSTEMD_FILE"
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -982,7 +1524,13 @@ uninstall_all() {
 
 main_menu() {
   check_deps
-  init_meta_if_missing
+  init_meta_if_missing || exit 1
+  if [[ -x "$SB_BIN" ]]; then
+    migrate_route_guard_if_needed || {
+      echo -e "${RED}旧版安全路由迁移失败，现有配置未被静默覆盖。${PLAIN}" >&2
+      read -p "按回车继续..."
+    }
+  fi
   while true; do
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
@@ -1003,7 +1551,7 @@ main_menu() {
     echo " 3) 添加 Shadowsocks-2022 节点"
     echo " 4) 查看节点/导出分享链接"
     echo " 5) 删除节点"
-    echo " 6) 进阶配置(链式代理/路由)"
+    echo " 6) SS2022 加密出口/路由"
     echo " 7) 更新脚本"
     echo " 8) 卸载 sing-box + 删除全部配置"
     echo " 0) 退出"
@@ -1034,6 +1582,6 @@ main_menu() {
 }
 
 check_root
-init_meta_if_missing
-init_config_if_missing
+init_meta_if_missing || exit 1
+init_config_if_missing || exit 1
 main_menu

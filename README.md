@@ -25,10 +25,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 | 脚本 | 功能 | 快捷命令 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **[vt.sh](vt.sh)** | **总控工具箱** | `vt` | 统一管理入口，查看组件状态，一键清理环境。 |
-| **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**动态 QoS 限速**、Telegram 通知、在线 IP 上报。 |
+| **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**动态 QoS 限速**、用户到期提醒、Telegram 通知、在线 IP 上报。 |
 | **[snell.sh](SNELL_DOC.md)** | **Snell 管理** | `snell` | 专为 Snell 协议设计，支持 **Systemd 模板化多实例**。 |
 | **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 支持 VLESS-Vision-REALITY 和 Shadowsocks-2022，配置回滚保护。 |
-| **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | Sing-Box 内核专用，支持 Reality 和链式代理，元数据分离设计。 |
+| **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | 支持 Reality、SS2022、跨机 SS2022 加密出口及核心更新回滚。 |
 | **[fw.sh](fw.sh)** | **端口转发** | `fw` | 基于 **realm** 的轻量级端口转发，支持 TCP/UDP。 |
 
 ---
@@ -38,6 +38,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 本工具箱支持将多台 VPS 的流量数据推送到 Cloudflare Worker，实现集中监控和多租户权限管理。
 
 *   👉 **[点击查看 Cloudflare 部署指南](部署教程.md)**
+
+Cloudflare 中控支持为每个监控端口设置用户到期日期，到期前 3 天通过 Telegram Bot 向管理员提醒一次。
 
 ---
 
