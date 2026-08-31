@@ -2,7 +2,6 @@
 # sb (sing-box edition) - multi-protocol manager
 # - VLESS Vision REALITY (TCP)
 # - Shadowsocks 2022
-# - Optional encrypted Shadowsocks 2022 relay / legacy SOCKS5 chain
 # - Safe config check + rollback
 # - Script self-update (GitHub raw)
 
@@ -12,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -374,33 +373,67 @@ restart_singbox_checked() {
   return 0
 }
 
-migrate_route_guard_if_needed() {
+migrate_config_if_needed() {
   [[ -x "$SB_BIN" && -s "$SB_CONF_FILE" ]] || return 0
-  jq -e '
+  local needs_guard=0 has_removed_exit=0
+  if ! jq -e '
     (.route.rules[0] | .action? == "resolve" and (keys == ["action"])) and
     (.route.rules[1] | .ip_is_private? == true and .action? == "reject" and
       (keys == ["action", "ip_is_private"]))
-  ' "$SB_CONF_FILE" >/dev/null 2>&1 && return 0
+  ' "$SB_CONF_FILE" >/dev/null 2>&1; then
+    needs_guard=1
+  fi
+  if jq -e '
+    any(.inbounds[]?; ((.tag // "") | startswith("relay_"))) or
+    any(.outbounds[]?; .tag == "chain_proxy") or
+    any(.route.rules[]?; .outbound? == "chain_proxy")
+  ' "$SB_CONF_FILE" >/dev/null 2>&1; then
+    has_removed_exit=1
+  fi
+  [[ "$needs_guard" -eq 0 && "$has_removed_exit" -eq 0 ]] && return 0
 
-  local tmp
+  local tmp stage
   tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
   _CLEANUP_FILES+=("$tmp")
   cp "$SB_CONF_FILE" "$tmp" || return 1
+  if [[ "$has_removed_exit" -eq 1 ]]; then
+    stage="${tmp}.legacy"
+    _CLEANUP_FILES+=("$stage")
+    if ! jq '
+      .inbounds = [.inbounds[]? | select(((.tag // "") | startswith("relay_")) | not)] |
+      .outbounds = [.outbounds[]? | select(.tag != "chain_proxy")] |
+      .route.rules = [.route.rules[]? | select(.outbound? != "chain_proxy")]
+    ' "$tmp" > "$stage" || ! mv "$stage" "$tmp"; then
+      echo -e "${RED}旧跨机出口配置清理失败，原配置未改动。${PLAIN}" >&2
+      return 1
+    fi
+  fi
   ensure_private_reject_rule "$tmp" || return 1
-  echo -e "${YELLOW}检测到旧版安全路由，正在补充域名解析和私网保护...${PLAIN}"
+  if [[ "$has_removed_exit" -eq 1 ]]; then
+    echo -e "${YELLOW}检测到已移除的跨机出口配置，正在清理中继、出口连接和关联路由...${PLAIN}"
+  else
+    echo -e "${YELLOW}检测到旧版安全路由，正在补充域名解析和私网保护...${PLAIN}"
+  fi
   if systemctl is-active --quiet sing-box 2>/dev/null; then
-    safe_save_config "$tmp"
-    return
+    if safe_save_config "$tmp"; then
+      [[ "$has_removed_exit" -eq 1 ]] && echo -e "${GREEN}旧跨机出口配置已清理，普通节点保持不变。${PLAIN}"
+      return 0
+    fi
+    return 1
   fi
 
   local out
   out=$("$SB_BIN" check -c "$tmp" 2>&1) || {
-    echo -e "${RED}安全路由迁移校验失败，原配置未改动:${PLAIN}" >&2
+    echo -e "${RED}配置迁移校验失败，原配置未改动:${PLAIN}" >&2
     echo "$out" | tail -12
     return 1
   }
   atomic_replace_file "$tmp" "$SB_CONF_FILE" 640 || return 1
-  echo -e "${GREEN}安全路由已在服务停止状态下更新。${PLAIN}"
+  if [[ "$has_removed_exit" -eq 1 ]]; then
+    echo -e "${GREEN}旧跨机出口配置已在服务停止状态下清理，普通节点保持不变。${PLAIN}"
+  else
+    echo -e "${GREEN}安全路由已在服务停止状态下更新。${PLAIN}"
+  fi
 }
 
 safe_save_config() {
@@ -534,7 +567,7 @@ install_singbox() {
     }
     write_systemd || return 1
     restart_singbox_checked || return 1
-    migrate_route_guard_if_needed || return 1
+    migrate_config_if_needed || return 1
     install_shortcut_cmd || return 1
     return
   fi
@@ -614,7 +647,7 @@ install_singbox() {
   if write_systemd && restart_singbox_checked; then
     echo -e "${GREEN}sing-box 已更新到 ${latest_ver} 并启动成功。${PLAIN}"
     [[ -n "$old_binary" ]] && rm -f "$old_binary"
-    migrate_route_guard_if_needed || return 1
+    migrate_config_if_needed || return 1
     install_shortcut_cmd || return 1
     return
   fi
@@ -706,57 +739,6 @@ pick_sni() {
 gen_reality_keypair() {
   [[ -x "$SB_BIN" ]] || return 1
   "$SB_BIN" generate reality-keypair 2>/dev/null
-}
-
-ask_chain_proxy() {
-  local has type label
-  has=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .tag' "$SB_CONF_FILE" 2>/dev/null)
-  [[ -z "$has" ]] && { echo ""; return; }
-  type=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .type' "$SB_CONF_FILE" 2>/dev/null)
-  [[ "$type" == "shadowsocks" ]] && label="B 机出口" || label="SOCKS5 出口"
-  echo -e "${YELLOW}是否让此节点使用 ${label}? [y/N]${PLAIN}" >&2
-  read -p "选择: " sel
-  sel=$(strip_cr "$sel")
-  [[ "${sel,,}" == "y" ]] && echo "yes" || echo ""
-}
-
-apply_chain_routing() {
-  local json_file=$1
-  local inbound_tag=$2
-  ensure_private_reject_rule "$json_file" || return 1
-  local stage="${json_file}.route"
-  if jq --arg itag "$inbound_tag" '
-    .route.rules = (
-      ((.route.rules // []) | map(select(
-        ((.action? == "route") and (.outbound? == "chain_proxy") and
-         ((.inbound? // []) | index($itag) != null)) | not
-      ))) + [{
-        "inbound": [$itag],
-        "action": "route",
-        "outbound": "chain_proxy"
-      }]
-    )
-  ' "$json_file" > "$stage" && mv "$stage" "$json_file"; then
-    return
-  fi
-  rm -f "$stage"
-  return 1
-}
-
-remove_chain_routing() {
-  local json_file=$1
-  local inbound_tag=$2
-  local stage="${json_file}.route"
-  if jq --arg itag "$inbound_tag" '
-    .route.rules = ((.route.rules // []) | map(select(
-      ((.action? == "route") and (.outbound? == "chain_proxy") and
-       ((.inbound? // []) | index($itag) != null)) | not
-    )))
-  ' "$json_file" > "$stage" && mv "$stage" "$json_file"; then
-    return
-  fi
-  rm -f "$stage"
-  return 1
 }
 
 # ---- metadata helpers (pbk storage) ----
@@ -905,8 +887,6 @@ add_reality() {
   local sid; sid=$(openssl rand -hex 4)
   local tag="reality_${port}"
 
-  local chain; chain=$(ask_chain_proxy)
-
   local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
   _CLEANUP_FILES+=("$tmp")
   _CLEANUP_FILES+=("${tmp}.1")
@@ -943,13 +923,6 @@ add_reality() {
     return 1
   fi
 
-  if [[ -n "$chain" ]]; then
-    apply_chain_routing "$tmp" "$tag" || {
-      echo -e "${RED}Reality 链式转发规则生成失败。${PLAIN}" >&2
-      return 1
-    }
-  fi
-
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
     if ! meta_set_pubkey "$tag" "$pubk"; then
@@ -978,8 +951,6 @@ add_ss2022() {
   [[ -n "$key" ]] || { echo -e "${RED}生成 Shadowsocks-2022 密钥失败。${PLAIN}"; return 1; }
   local tag="ss_${port}"
 
-  local chain; chain=$(ask_chain_proxy)
-
   local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
   _CLEANUP_FILES+=("$tmp")
   _CLEANUP_FILES+=("${tmp}.1")
@@ -1005,13 +976,6 @@ add_ss2022() {
     return 1
   fi
 
-  if [[ -n "$chain" ]]; then
-    apply_chain_routing "$tmp" "$tag" || {
-      echo -e "${RED}Shadowsocks 链式转发规则生成失败。${PLAIN}" >&2
-      return 1
-    }
-  fi
-
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
     if ! open_port "$port" both; then
@@ -1020,118 +984,6 @@ add_ss2022() {
     show_node_info "$tag"
   else
     rm -f "$tmp"
-  fi
-}
-
-_RELAY_COUNT=0
-
-list_ss2022_relays() {
-  echo -e "${BLUE}================================================================${PLAIN}"
-  echo -e "   本机 SS2022 专用出口中继"
-  echo -e "${BLUE}================================================================${PLAIN}"
-  printf " %-4s %-20s %-8s\n" "ID" "Tag" "Port"
-  echo -e "----------------------------------------------------------------"
-  _RELAY_COUNT=0
-
-  local tag port
-  while IFS=$'\t' read -r tag port; do
-    [[ -n "$tag" ]] || continue
-    _RELAY_COUNT=$((_RELAY_COUNT+1))
-    printf " [%d]  %-20s %-8s\n" "$_RELAY_COUNT" "$tag" "$port"
-  done < <(jq -r '.inbounds[]? | select((.tag // "") | startswith("relay_")) | [.tag, .listen_port] | @tsv' "$SB_CONF_FILE" 2>/dev/null)
-
-  [[ "$_RELAY_COUNT" -gt 0 ]] || echo " (无专用中继)"
-  echo -e "----------------------------------------------------------------"
-}
-
-get_relay_tag_by_id() {
-  local target=$1 i=0 tag
-  while IFS= read -r tag; do
-    [[ -n "$tag" ]] || continue
-    i=$((i+1))
-    [[ "$i" -eq "$target" ]] && { echo "$tag"; return; }
-  done < <(jq -r '.inbounds[]? | select((.tag // "") | startswith("relay_")) | .tag' "$SB_CONF_FILE" 2>/dev/null)
-}
-
-show_ss2022_relay_info() {
-  local tag=$1 node ip display_ip
-  node=$(jq -c --arg t "$tag" '.inbounds[]? | select(.tag==$t)' "$SB_CONF_FILE" 2>/dev/null)
-  [[ -n "$node" ]] || return 1
-  ip=$(get_public_ip)
-  display_ip="$ip"
-  [[ "$ip" == *:* ]] && display_ip="[$ip]"
-  echo -e "${GREEN}SS2022 专用中继已就绪。请在 A 机配置以下上游:${PLAIN}"
-  echo " 地址: ${display_ip}:$(echo "$node" | jq -r '.listen_port')"
-  echo " 方法: $(echo "$node" | jq -r '.method')"
-  echo " 密钥: $(echo "$node" | jq -r '.password')"
-  echo -e "${YELLOW}脚本未修改防火墙。请自行放行该 TCP/UDP 端口；如需来源限制，请在云安全组中只允许 A 机 IP。${PLAIN}"
-}
-
-create_ss2022_relay() {
-  echo -e "${BLUE}>>> 在 B 机创建 SS2022 专用出口中继${PLAIN}"
-  [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return 1; }
-
-  local port default_port method key tag tmp
-  default_port=$(get_random_port)
-  read -p "中继端口 [随机 ${default_port}]: " port
-  port=$(strip_cr "$port")
-  [[ -n "$port" ]] || port="$default_port"
-  is_port_available "$port" || return 1
-
-  method="$SS2022_METHOD"
-  key=$("$SB_BIN" generate rand --base64 "$SS2022_KEY_BYTES" 2>/dev/null)
-  [[ -n "$key" ]] || { echo -e "${RED}生成中继密钥失败。${PLAIN}" >&2; return 1; }
-  tag="relay_${port}"
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp" "${tmp}.1")
-  cp "$SB_CONF_FILE" "$tmp" || return 1
-  ensure_private_reject_rule "$tmp" || return 1
-
-  if ! jq --arg tag "$tag" --arg port "$port" --arg method "$method" --arg key "$key" '
-    .inbounds += [{
-      "type": "shadowsocks",
-      "tag": $tag,
-      "listen": "::",
-      "listen_port": ($port|tonumber),
-      "method": $method,
-      "password": $key
-    }]
-  ' "$tmp" > "${tmp}.1" || ! mv "${tmp}.1" "$tmp"; then
-    echo -e "${RED}中继配置生成失败。${PLAIN}" >&2
-    return 1
-  fi
-
-  if ! safe_save_config "$tmp"; then
-    return 1
-  fi
-
-  rm -f "$tmp"
-  show_ss2022_relay_info "$tag"
-}
-
-delete_ss2022_relay() {
-  list_ss2022_relays
-  [[ "$_RELAY_COUNT" -gt 0 ]] || return
-
-  local id tag tmp
-  read -p "输入要删除的中继 ID (0 返回): " id
-  id=$(strip_cr "$id")
-  [[ "$id" == "0" ]] && return
-  if ! [[ "$id" =~ ^[0-9]+$ ]] || [[ "$id" -lt 1 ]] || [[ "$id" -gt "$_RELAY_COUNT" ]]; then
-    echo -e "${RED}ID 无效。${PLAIN}"
-    return 1
-  fi
-  tag=$(get_relay_tag_by_id "$id")
-  [[ -n "$tag" ]] || return 1
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  if ! jq --arg t "$tag" 'del(.inbounds[] | select(.tag==$t))' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}中继删除配置生成失败。${PLAIN}" >&2
-    return 1
-  fi
-  if safe_save_config "$tmp"; then
-    rm -f "$tmp"
-    echo -e "${GREEN}中继已删除。${PLAIN}"
   fi
 }
 
@@ -1222,248 +1074,6 @@ delete_node() {
   fi
 }
 
-CHAIN_HOST=""
-CHAIN_PORT=""
-
-parse_chain_address() {
-  local address=$1
-  CHAIN_HOST=""
-  CHAIN_PORT=""
-  if [[ "$address" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
-    CHAIN_HOST=${BASH_REMATCH[1]}
-    CHAIN_PORT=${BASH_REMATCH[2]}
-  elif [[ "$address" =~ ^([^:]+):([0-9]+)$ ]]; then
-    CHAIN_HOST=${BASH_REMATCH[1]}
-    CHAIN_PORT=${BASH_REMATCH[2]}
-  else
-    return 1
-  fi
-  [[ -n "$CHAIN_HOST" && ! "$CHAIN_HOST" =~ [[:space:]] &&
-     "$CHAIN_PORT" -ge 1 && "$CHAIN_PORT" -le 65535 ]]
-}
-
-manage_node_forwarding() {
-  if ! jq -e '.outbounds[]? | select(.tag == "chain_proxy")' "$SB_CONF_FILE" >/dev/null 2>&1; then
-    echo -e "${YELLOW}请先配置出口连接（推荐连接 B 机，或使用兼容 SOCKS5）。${PLAIN}"
-    return 1
-  fi
-
-  list_nodes
-  [[ "$_NODE_COUNT" -eq 0 ]] && return
-  local id tag enabled choice tmp
-  read -p "输入要设置的节点 ID (0 返回): " id
-  id=$(strip_cr "$id")
-  [[ "$id" == "0" ]] && return
-  if ! [[ "$id" =~ ^[0-9]+$ ]] || [[ "$id" -lt 1 ]] || [[ "$id" -gt "$_NODE_COUNT" ]]; then
-    echo -e "${RED}ID 无效。${PLAIN}"
-    return 1
-  fi
-  tag=$(get_node_tag_by_id "$id")
-  [[ -n "$tag" ]] || return 1
-
-  enabled=$(jq -r --arg t "$tag" 'any(.route.rules[]?;
-    .action? == "route" and .outbound? == "chain_proxy" and ((.inbound? // []) | index($t) != null))'
-    "$SB_CONF_FILE" 2>/dev/null)
-  if [[ "$enabled" == "true" ]]; then
-    echo -e "当前 ${tag}: ${GREEN}使用已配置出口${PLAIN}"
-  else
-    echo -e "当前 ${tag}: ${YELLOW}使用本机出口${PLAIN}"
-  fi
-  read -p "输入 y 使用已配置出口，n 使用本机出口，其他键取消: " choice
-  choice=$(strip_cr "$choice")
-  [[ "${choice,,}" == "y" || "${choice,,}" == "n" ]] || return
-
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  cp "$SB_CONF_FILE" "$tmp" || return 1
-  ensure_private_reject_rule "$tmp" || return 1
-  if [[ "${choice,,}" == "y" ]]; then
-    apply_chain_routing "$tmp" "$tag" || return 1
-  else
-    remove_chain_routing "$tmp" "$tag" || return 1
-  fi
-  safe_save_config "$tmp"
-}
-
-delete_chain_proxy() {
-  local tmp
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  if ! jq '
-    del(.outbounds[] | select(.tag=="chain_proxy")) |
-    .route.rules = ([.route.rules[]?] | map(select(.outbound? != "chain_proxy")))
-  ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}删除出口连接失败。${PLAIN}" >&2
-    return 1
-  fi
-  if safe_save_config "$tmp"; then
-    rm -f "$tmp"
-    echo -e "${GREEN}出口连接已断开，相关节点已改回本机出口。${PLAIN}"
-  fi
-}
-
-configure_ss2022_chain() {
-  local addr method password tmp
-  echo -e "${BLUE}>>> 在 A 机连接 B 机出口${PLAIN}"
-  read -p "输入 B 机给出的中继地址 (如 203.0.113.20:40000)，留空=断开连接: " addr
-  addr=$(strip_cr "$addr")
-  [[ -n "$addr" ]] || { delete_chain_proxy; return; }
-  if ! parse_chain_address "$addr"; then
-    echo -e "${RED}B 机地址格式或端口无效。${PLAIN}" >&2
-    return 1
-  fi
-
-  method="$SS2022_METHOD"
-  read -s -p "输入 B 机中继密钥: " password
-  echo
-  password=$(strip_cr "$password")
-  [[ -n "$password" ]] || { echo -e "${RED}SS2022 中继密钥不能为空。${PLAIN}" >&2; return 1; }
-
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  if ! jq --arg h "$CHAIN_HOST" --arg p "$CHAIN_PORT" --arg method "$method" --arg password "$password" '
-    del(.outbounds[] | select(.tag=="chain_proxy")) |
-    .outbounds += [{
-      "type": "shadowsocks",
-      "tag": "chain_proxy",
-      "server": $h,
-      "server_port": ($p|tonumber),
-      "method": $method,
-      "password": $password
-    }]
-  ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}SS2022 上游配置生成失败。${PLAIN}" >&2
-    return 1
-  fi
-  if safe_save_config "$tmp"; then
-    rm -f "$tmp"
-    echo -e "${GREEN}B 机出口连接已保存；请继续选择哪些节点使用该出口。${PLAIN}"
-  fi
-}
-
-configure_socks5_chain() {
-  local addr username password tmp
-  echo -e "${YELLOW}SOCKS5 仅为旧配置兼容；公网跨机转发推荐使用 SS2022。${PLAIN}"
-  read -p "输入 SOCKS5 出口地址 (如 127.0.0.1:40000)，留空=断开连接: " addr
-  addr=$(strip_cr "$addr")
-  [[ -n "$addr" ]] || { delete_chain_proxy; return; }
-  if ! parse_chain_address "$addr"; then
-    echo -e "${RED}SOCKS5 地址格式或端口无效。${PLAIN}" >&2
-    return 1
-  fi
-
-  read -p "SOCKS5 用户名（无认证请留空）: " username
-  username=$(strip_cr "$username")
-  password=""
-  if [[ -n "$username" ]]; then
-    read -s -p "SOCKS5 密码: " password
-    echo
-    password=$(strip_cr "$password")
-  fi
-
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  if ! jq --arg h "$CHAIN_HOST" --arg p "$CHAIN_PORT" --arg u "$username" --arg pw "$password" '
-    del(.outbounds[] | select(.tag=="chain_proxy")) |
-    .outbounds += [({
-      "type": "socks",
-      "tag": "chain_proxy",
-      "server": $h,
-      "server_port": ($p|tonumber),
-      "version": "5"
-    } + (if $u != "" then {"username": $u, "password": $pw} else {} end))]
-  ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}SOCKS5 出口配置生成失败。${PLAIN}" >&2
-    return 1
-  fi
-  if safe_save_config "$tmp"; then
-    rm -f "$tmp"
-    echo -e "${GREEN}SOCKS5 出口连接已保存。${PLAIN}"
-  fi
-}
-
-clear_chain_routes() {
-  local tmp
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
-  _CLEANUP_FILES+=("$tmp")
-  if ! jq '
-    .route.rules = ([.route.rules[]?] | map(select(.outbound? != "chain_proxy")))
-  ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}默认路由配置生成失败。${PLAIN}" >&2
-    return 1
-  fi
-  ensure_private_reject_rule "$tmp" || return 1
-  if safe_save_config "$tmp"; then
-    rm -f "$tmp"
-    echo -e "${GREEN}所有节点已改回本机出口，出口连接仍保留。${PLAIN}"
-  fi
-}
-
-chain_proxy_summary() {
-  jq -r '.outbounds[]? | select(.tag=="chain_proxy") |
-    (if .type == "shadowsocks" then "SS2022" elif .type == "socks" then "SOCKS5 兼容" else .type end) +
-    " · " +
-    (if (.server | contains(":")) then "[\(.server)]:\(.server_port)" else "\(.server):\(.server_port)" end)
-  ' "$SB_CONF_FILE" 2>/dev/null
-}
-
-configure_advanced() {
-  while true; do
-    clear
-    echo -e "${BLUE}=== 跨机出口（A → B）===${PLAIN}"
-    echo " 用途: 让 A 机上的指定节点从 B 机访问网站"
-    echo " 步骤: 先在 B 机选 1，再在 A 机选 4 和 5"
-    echo
-    local chain relay_count routed_count choice
-    chain=$(chain_proxy_summary)
-    relay_count=$(jq '[.inbounds[]? | select((.tag // "") | startswith("relay_"))] | length' "$SB_CONF_FILE" 2>/dev/null)
-    routed_count=$(jq '[.route.rules[]? | select(.action? == "route" and .outbound? == "chain_proxy") | .inbound[]?] | unique | length' "$SB_CONF_FILE" 2>/dev/null)
-    if [[ -n "$chain" ]]; then
-      echo -e " 出口连接: ${GREEN}${chain}${PLAIN}"
-    else
-      echo -e " 出口连接: ${YELLOW}未配置${PLAIN}"
-    fi
-    echo -e " 使用该出口: ${GREEN}${routed_count:-0} 个节点${PLAIN}"
-    echo -e " 本机中继: ${GREEN}${relay_count:-0} 个${PLAIN}"
-    echo
-    echo " [B 机：提供出口]"
-    echo " 1) 创建中继"
-    echo " 2) 查看中继连接信息"
-    echo " 3) 删除中继"
-    echo
-    echo " [A 机：使用 B 机出口]"
-    echo " 4) 连接、更换或断开 B 机"
-    echo " 5) 选择要走 B 机的节点"
-    echo " 6) 所有节点改回本机出口（保留连接）"
-    echo
-    echo " [兼容功能]"
-    echo " 7) 配置旧 SOCKS5 出口"
-    echo " 0) 返回"
-    echo "----------------------------------------"
-    read -p "请选择: " choice
-    choice=$(strip_cr "$choice")
-    case "$choice" in
-      1) run_menu_action "创建 SS2022 专用中继" create_ss2022_relay; read -p "按回车继续..." ;;
-      2)
-        list_ss2022_relays
-        if [[ "$_RELAY_COUNT" -gt 0 ]]; then
-          read -p "输入中继 ID 查看连接信息 (0 返回): " choice
-          choice=$(strip_cr "$choice")
-          if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$_RELAY_COUNT" ]]; then
-            show_ss2022_relay_info "$(get_relay_tag_by_id "$choice")"
-          fi
-        fi
-        read -p "按回车继续..." ;;
-      3) run_menu_action "删除 SS2022 中继" delete_ss2022_relay; read -p "按回车继续..." ;;
-      4) run_menu_action "连接 B 机出口" configure_ss2022_chain; read -p "按回车继续..." ;;
-      5) run_menu_action "选择节点出口" manage_node_forwarding; read -p "按回车继续..." ;;
-      6) run_menu_action "节点改回本机出口" clear_chain_routes; read -p "按回车继续..." ;;
-      7) run_menu_action "配置 SOCKS5 兼容出口" configure_socks5_chain; read -p "按回车继续..." ;;
-      0) return ;;
-    esac
-  done
-}
-
 update_script() {
   echo -e "${BLUE}>>> 更新脚本...${PLAIN}"
   local tmp
@@ -1511,13 +1121,14 @@ uninstall_all() {
   [[ "${cf,,}" != "yes" ]] && return
 
   if systemctl is-active --quiet sing-box 2>/dev/null && ! systemctl stop sing-box; then
-    echo -e "${RED}sing-box 停止失败；为避免中继端口在清理防火墙时暴露，已取消卸载。${PLAIN}" >&2
+    echo -e "${RED}sing-box 停止失败；为避免服务状态与清理结果不一致，已取消卸载。${PLAIN}" >&2
     return 1
   fi
 
   if [[ -f "$SB_CONF_FILE" ]]; then
     while IFS=$'\t' read -r p proto tag; do
       [[ -n "$p" ]] || continue
+      # 旧版跨机出口端口从未由脚本放行，卸载时也不修改其防火墙规则。
       if [[ "$tag" == relay_* ]]; then
         continue
       else
@@ -1542,8 +1153,8 @@ main_menu() {
   check_deps
   init_meta_if_missing || exit 1
   if [[ -x "$SB_BIN" ]]; then
-    migrate_route_guard_if_needed || {
-      echo -e "${RED}旧版安全路由迁移失败，现有配置未被静默覆盖。${PLAIN}" >&2
+    migrate_config_if_needed || {
+      echo -e "${RED}配置迁移失败，现有配置未被静默覆盖。${PLAIN}" >&2
       read -p "按回车继续..."
     }
   fi
@@ -1567,9 +1178,8 @@ main_menu() {
     echo " 3) 添加 Shadowsocks-2022 节点"
     echo " 4) 查看节点/导出分享链接"
     echo " 5) 删除节点"
-    echo " 6) 跨机出口（A → B）"
-    echo " 7) 更新脚本"
-    echo " 8) 卸载 sing-box + 删除全部配置"
+    echo " 6) 更新脚本"
+    echo " 7) 卸载 sing-box + 删除全部配置"
     echo " 0) 退出"
     echo "----------------------------------------------------------------"
     read -p "请选择: " choice
@@ -1589,9 +1199,8 @@ main_menu() {
         fi
         read -p "按回车继续..." ;;
       5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
-      6) configure_advanced ;;
-      7) run_menu_action "更新 sb 管理脚本" update_script ;;
-      8) run_menu_action "卸载 sing-box" uninstall_all ;;
+      6) run_menu_action "更新 sb 管理脚本" update_script ;;
+      7) run_menu_action "卸载 sing-box" uninstall_all ;;
       0) exit 0 ;;
     esac
   done

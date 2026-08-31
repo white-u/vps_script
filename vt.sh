@@ -2,17 +2,16 @@
 #
 # VPS Toolbox — 调度器 & 状态监视器
 # 纯调度, 不包含子脚本业务逻辑
-# 子脚本: snell (Snell代理), x-sb (Xray多协议), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
+# 子脚本: snell (Snell代理), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="2.1.2"
+VT_VERSION="2.2.0"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
 
 # 子脚本远程地址
 SNELL_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
-XSB_URL="https://raw.githubusercontent.com/white-u/vps_script/main/x-sb.sh"
 SB_URL="https://raw.githubusercontent.com/white-u/vps_script/main/sb.sh"
 PM_URL="https://raw.githubusercontent.com/white-u/vps_script/main/pm.sh"
 FW_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
@@ -122,14 +121,12 @@ install_self() {
 # ─────────────────── 状态检测 ───────────────────
 
 snell_installed() { [[ -f /usr/local/bin/snell-server ]]; }
-xray_installed()  { [[ -f /usr/local/bin/xray ]]; }
 sb_installed()    { [[ -f /usr/local/bin/sing-box ]]; }
 pm_installed()    { [[ -d /etc/port_monitor ]]; }
 fw_installed()    { [[ -x /usr/local/bin/realm ]]; }
 
 # 获取版本号
 snell_version() { cat /etc/snell/.version 2>/dev/null || echo "?"; }
-xray_version()  { /usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}' || echo "?"; }
 sb_version()    { /usr/local/bin/sing-box version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
 pm_version() {
     local version
@@ -193,7 +190,7 @@ nuke_all() {
     echo -e "${RED}  警告: 即将卸载所有组件并清除全部数据!${PLAIN}"
     echo -e "${RED}════════════════════════════════════════${PLAIN}"
     echo ""
-    echo " 将清除: Snell 实例 / Xray 节点 / sing-box 节点 / PM 流量监控 / FW 端口转发 / 内核规则"
+    echo " 将清除: Snell 实例 / sing-box 节点 / PM 流量监控 / FW 端口转发 / 内核规则"
     echo ""
     read -p " 输入 yes 确认: " cf
     cf=$(strip_cr "$cf")
@@ -221,28 +218,6 @@ nuke_all() {
             cleanup_warn "Snell 文件或运行实例仍然存在"
         else
             echo -e " ${GREEN}  Snell 已清除${PLAIN}"
-        fi
-    fi
-
-    # === Xray ===
-    if xray_installed || [[ -d /usr/local/etc/xray ]]; then
-        echo -e " ${YELLOW}清理 Xray...${PLAIN}"
-        # 关闭防火墙中已放行的端口
-        if [[ -f /usr/local/etc/xray/config.json ]]; then
-            local p
-            for p in $(jq -r '.inbounds[]?.port // empty' /usr/local/etc/xray/config.json 2>/dev/null); do
-                close_port "$p"
-            done
-        fi
-        systemctl stop xray 2>/dev/null || true
-        systemctl disable xray 2>/dev/null || true
-        rm -f /etc/systemd/system/xray.service
-        rm -rf /usr/local/etc/xray /usr/local/bin/xray /usr/local/share/xray /var/log/xray
-        rm -f /usr/local/bin/x-sb
-        if xray_installed || [[ -d /usr/local/etc/xray ]] || systemctl is-active --quiet xray 2>/dev/null; then
-            cleanup_warn "Xray 文件或服务仍然存在"
-        else
-            echo -e " ${GREEN}  Xray 已清除${PLAIN}"
         fi
     fi
 
@@ -396,17 +371,15 @@ main_menu() {
         echo -e " 组件状态:"
         echo -e " ──────────────────────────────────────────────"
         status_line "Snell 代理管理  " snell_installed "$(snell_version)" "snell"
-        status_line "Xray  多协议管理" xray_installed  "$(xray_version)"  "x-sb"
         status_line "SB    sing-box  " sb_installed     "$(sb_version)"    "sb"
         status_line "PM    端口流量  " pm_installed     "$(pm_version)"    "pm"
         status_line "FW    端口转发  " fw_installed     "$(fw_version)"    "fw"
         echo -e " ──────────────────────────────────────────────"
         echo ""
         echo -e "  1. Snell 代理管理"
-        echo -e "  2. Xray 多协议管理"
-        echo -e "  3. sing-box 多协议管理"
-        echo -e "  4. 端口流量监控"
-        echo -e "  5. 端口转发管理"
+        echo -e "  2. sing-box 多协议管理"
+        echo -e "  3. 端口流量监控"
+        echo -e "  4. 端口转发管理"
         echo -e " ──────────────────────────────────────────────"
         echo -e "  8. ${RED}全部卸载 (暴力清空)${PLAIN}"
         echo -e "  9. 更新工具箱"
@@ -417,10 +390,9 @@ main_menu() {
 
         case $choice in
             1) dispatch "Snell" "snell" "$SNELL_URL" ;;
-            2) dispatch "Xray"  "x-sb"  "$XSB_URL"  ;;
-            3) dispatch "sing-box" "sb"  "$SB_URL"   ;;
-            4) dispatch "PM"    "pm"    "$PM_URL"    ;;
-            5) dispatch "FW"    "fw"    "$FW_URL"    ;;
+            2) dispatch "sing-box" "sb"  "$SB_URL"   ;;
+            3) dispatch "PM"    "pm"    "$PM_URL"    ;;
+            4) dispatch "FW"    "fw"    "$FW_URL"    ;;
             8) nuke_all ;;
             9) update_self; read -p " 按回车继续..." ;;
             0) exit 0 ;;
