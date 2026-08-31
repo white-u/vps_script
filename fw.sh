@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.2.2
+# 端口转发管理脚本 (基于 realm) v2.3.0
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -35,8 +35,8 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.2.2"
-REALM_VERSION="2.7.0"
+SCRIPT_VERSION="2.3.0"
+REALM_VERSION="2.9.6"
 
 REALM_BIN="/usr/local/bin/realm"
 CONFIG_DIR="/etc/realm"
@@ -114,37 +114,75 @@ sync_script() {
         curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
     fi
 
-    if validate_script_candidate "$tmp_script" && chmod 755 "$tmp_script" \
-        && mv -f "$tmp_script" "$SCRIPT_PATH"; then
+    local candidate_ver installed_ver=""
+    candidate_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+    if [[ -f "$SCRIPT_PATH" ]]; then
+        installed_ver=$(grep '^SCRIPT_VERSION=' "$SCRIPT_PATH" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+    fi
+
+    if validate_script_candidate "$tmp_script" \
+        && { [[ -z "$installed_ver" ]] || ! version_is_older "$candidate_ver" "$installed_ver"; } \
+        && chmod 755 "$tmp_script" && mv -f "$tmp_script" "$SCRIPT_PATH"; then
         return 0
     fi
-    warn "快捷命令同步失败，继续运行当前脚本；现有快捷命令未被覆盖。"
+    if [[ -n "$installed_ver" && -n "$candidate_ver" ]] \
+        && version_is_older "$candidate_ver" "$installed_ver"; then
+        warn "拒绝用旧脚本 v${candidate_ver} 覆盖现有快捷命令 v${installed_ver}。"
+    else
+        warn "快捷命令同步失败，继续运行当前脚本；现有快捷命令未被覆盖。"
+    fi
     return 0
 }
 
 # 依赖检查
 check_deps() {
-    command -v jq &>/dev/null && return 0
+    local commands=(jq curl tar find ss sha256sum install realpath cmp)
+    local missing=() cmd
+    for cmd in "${commands[@]}"; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
     info "安装必要依赖..."
     if [ -f /etc/debian_version ]; then
         if ! apt-get update -qq; then
-            warn "部分 APT 软件源刷新失败；将使用现有索引继续安装 jq。请检查上方报错的软件源。"
+            warn "部分 APT 软件源刷新失败；将使用现有索引继续安装。请检查上方报错的软件源。"
         fi
-        apt-get install -y -qq jq || true
+        apt-get install -y -qq jq curl tar findutils iproute2 coreutils diffutils || true
     elif [ -f /etc/redhat-release ]; then
-        yum install -y jq >/dev/null 2>&1 || true
-    elif [ -f /etc/alpine-release ]; then
-        apk add jq >/dev/null 2>&1 || true
+        local rpm_pm="yum"
+        command -v dnf &>/dev/null && rpm_pm="dnf"
+        "$rpm_pm" install -y jq curl tar findutils iproute coreutils diffutils || true
+    else
+        err "不支持当前系统的自动依赖安装，缺少: ${missing[*]}"
     fi
-    command -v jq &>/dev/null || err "jq 安装失败，请手动安装"
+
+    missing=()
+    for cmd in "${commands[@]}"; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -eq 0 ]] || err "依赖安装失败，缺少: ${missing[*]}"
 }
 
-# 架构检测
-detect_arch() {
+check_platform() {
+    [[ "$(uname -s)" == "Linux" ]] || err "fw 仅支持 Linux"
+    [[ ! -f /etc/alpine-release ]] || err "fw 依赖 systemd，当前不支持 Alpine/OpenRC"
+    command -v systemctl &>/dev/null || err "未找到 systemctl，当前系统不支持"
+    [[ -d /run/systemd/system ]] || err "systemd 未运行，无法管理 realm 服务"
+}
+
+# Realm 发行资产与官方 SHA256（glibc 2.28 兼容 Debian 10+）
+detect_realm_asset() {
     case $(uname -m) in
-        x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-        armv7*)        echo "armv7-unknown-linux-gnueabihf" ;;
+        x86_64|amd64)
+            printf '%s\t%s\n' "x86_64-unknown-linux-gnu-glibc2.28" \
+                "a85652b940fa23bf08fd29582e33e87ea9c940a71bcc7d21df9c0bd03f351149" ;;
+        aarch64|arm64)
+            printf '%s\t%s\n' "aarch64-unknown-linux-gnu-glibc2.28" \
+                "0e277d58df7a9ee9eaca1277223b54b29b1af27a1fad04ae83c7b938d451c5f8" ;;
+        armv7*)
+            printf '%s\t%s\n' "armv7-unknown-linux-gnueabihf-glibc2.28" \
+                "cb7058702c1f74bcbd45920cd778c2c5e7db98c3944ac6e05910b0e1386e4c4b" ;;
         *) err "不支持的架构: $(uname -m)" ;;
     esac
 }
@@ -166,7 +204,7 @@ get_realm_status() {
 # 获取已安装的 realm 版本
 get_realm_version() {
     if realm_installed; then
-        "$REALM_BIN" --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || true
+        "$REALM_BIN" --version 2>/dev/null | grep -Eo '[0-9]+([.][0-9]+)+' | head -1 || true
     fi
 }
 
@@ -175,15 +213,34 @@ get_realm_version() {
 init_meta() {
     mkdir -p "$CONFIG_DIR"
     if [[ ! -f "$META_FILE" ]]; then
-        echo '{"rules":[]}' > "$META_FILE"
+        local tmp_meta
+        tmp_meta=$(mktemp "${META_FILE}.init.XXXXXX") || err "无法创建规则文件"
+        _CLEANUP_FILES+=("$tmp_meta")
+        printf '%s\n' '{"rules":[]}' > "$tmp_meta"
+        chmod 600 "$tmp_meta"
+        mv -f "$tmp_meta" "$META_FILE"
         return
     fi
-    # JSON 完整性校验：保留损坏现场，禁止静默清空规则。
-    if ! jq empty "$META_FILE" 2>/dev/null; then
+    # 同时校验 JSON 语法、字段类型和端口唯一性。
+    if ! jq -e '
+        type == "object" and (.rules | type == "array") and
+        all(.rules[];
+            . as $r |
+            ($r | type == "object") and
+            ($r.src_port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+            ($r.dst_port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+            ($r.dst_ip | type == "string" and
+                test("^[0-9]{1,3}([.][0-9]{1,3}){3}$") and
+                (split(".") | all(.[]; (tonumber >= 0 and tonumber <= 255)))) and
+            (($r.comment // "") | type == "string")
+        ) and
+        (([.rules[].src_port] | length) == ([.rules[].src_port] | unique | length))
+    ' "$META_FILE" >/dev/null 2>&1; then
         local backup="${META_FILE}.corrupt.$(date +%Y%m%d%H%M%S)"
         cp -p "$META_FILE" "$backup" 2>/dev/null || true
-        err "fw.json 已损坏，已保留为 ${backup}，请修复后重试"
+        err "fw.json 格式或规则结构无效，已保留为 ${backup}，请修复后重试"
     fi
+    chmod 600 "$META_FILE" 2>/dev/null || true
 }
 
 rule_count() {
@@ -216,43 +273,6 @@ validate_ipv4() {
             warn "无效 IP: $ip"; return 1
         fi
     done
-}
-
-# ==================== 防火墙工具 ====================
-
-open_port() {
-    local port=$1
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow "$port" >/dev/null 2>&1
-    elif command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
-        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-        iptables -I INPUT -p udp --dport "$port" -j ACCEPT
-        if command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables 2>/dev/null || true
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
-    fi
-}
-
-close_port() {
-    local port=$1
-    if command -v ufw >/dev/null 2>&1; then
-        ufw delete allow "$port" >/dev/null 2>&1 || true
-    elif command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
-        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
-    fi
 }
 
 # ==================== IPv6 检测 ====================
