@@ -12,7 +12,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -713,8 +713,8 @@ ask_chain_proxy() {
   has=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .tag' "$SB_CONF_FILE" 2>/dev/null)
   [[ -z "$has" ]] && { echo ""; return; }
   type=$(jq -r '.outbounds[]? | select(.tag=="chain_proxy") | .type' "$SB_CONF_FILE" 2>/dev/null)
-  [[ "$type" == "shadowsocks" ]] && label="SS2022 加密中继" || label="SOCKS5 上游"
-  echo -e "${YELLOW}是否为此节点启用 ${label}? [y/N]${PLAIN}" >&2
+  [[ "$type" == "shadowsocks" ]] && label="B 机出口" || label="SOCKS5 出口"
+  echo -e "${YELLOW}是否让此节点使用 ${label}? [y/N]${PLAIN}" >&2
   read -p "选择: " sel
   sel=$(strip_cr "$sel")
   [[ "${sel,,}" == "y" ]] && echo "yes" || echo ""
@@ -1244,7 +1244,7 @@ parse_chain_address() {
 
 manage_node_forwarding() {
   if ! jq -e '.outbounds[]? | select(.tag == "chain_proxy")' "$SB_CONF_FILE" >/dev/null 2>&1; then
-    echo -e "${YELLOW}请先配置 SS2022 加密上游或兼容 SOCKS5 上游。${PLAIN}"
+    echo -e "${YELLOW}请先配置出口连接（推荐连接 B 机，或使用兼容 SOCKS5）。${PLAIN}"
     return 1
   fi
 
@@ -1265,11 +1265,11 @@ manage_node_forwarding() {
     .action? == "route" and .outbound? == "chain_proxy" and ((.inbound? // []) | index($t) != null))'
     "$SB_CONF_FILE" 2>/dev/null)
   if [[ "$enabled" == "true" ]]; then
-    echo -e "当前 ${tag}: ${GREEN}已启用上游转发${PLAIN}"
+    echo -e "当前 ${tag}: ${GREEN}使用已配置出口${PLAIN}"
   else
-    echo -e "当前 ${tag}: ${YELLOW}直接出站${PLAIN}"
+    echo -e "当前 ${tag}: ${YELLOW}使用本机出口${PLAIN}"
   fi
-  read -p "输入 y 启用转发，n 关闭转发，其他键取消: " choice
+  read -p "输入 y 使用已配置出口，n 使用本机出口，其他键取消: " choice
   choice=$(strip_cr "$choice")
   [[ "${choice,,}" == "y" || "${choice,,}" == "n" ]] || return
 
@@ -1293,19 +1293,19 @@ delete_chain_proxy() {
     del(.outbounds[] | select(.tag=="chain_proxy")) |
     .route.rules = ([.route.rules[]?] | map(select(.outbound? != "chain_proxy")))
   ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}删除上游配置失败。${PLAIN}" >&2
+    echo -e "${RED}删除出口连接失败。${PLAIN}" >&2
     return 1
   fi
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    echo -e "${GREEN}上游及关联节点转发规则已删除。${PLAIN}"
+    echo -e "${GREEN}出口连接已断开，相关节点已改回本机出口。${PLAIN}"
   fi
 }
 
 configure_ss2022_chain() {
   local addr method password tmp
-  echo -e "${BLUE}>>> 在 A 机配置 SS2022 加密上游${PLAIN}"
-  read -p "输入 B 机中继地址 (如 203.0.113.20:40000)，留空=删除当前上游: " addr
+  echo -e "${BLUE}>>> 在 A 机连接 B 机出口${PLAIN}"
+  read -p "输入 B 机给出的中继地址 (如 203.0.113.20:40000)，留空=断开连接: " addr
   addr=$(strip_cr "$addr")
   [[ -n "$addr" ]] || { delete_chain_proxy; return; }
   if ! parse_chain_address "$addr"; then
@@ -1337,14 +1337,14 @@ configure_ss2022_chain() {
   fi
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    echo -e "${GREEN}SS2022 加密上游已配置；请选择要使用 B 机出口的节点。${PLAIN}"
+    echo -e "${GREEN}B 机出口连接已保存；请继续选择哪些节点使用该出口。${PLAIN}"
   fi
 }
 
 configure_socks5_chain() {
   local addr username password tmp
   echo -e "${YELLOW}SOCKS5 仅为旧配置兼容；公网跨机转发推荐使用 SS2022。${PLAIN}"
-  read -p "输入上游 SOCKS5 (如 127.0.0.1:40000)，留空=删除当前上游: " addr
+  read -p "输入 SOCKS5 出口地址 (如 127.0.0.1:40000)，留空=断开连接: " addr
   addr=$(strip_cr "$addr")
   [[ -n "$addr" ]] || { delete_chain_proxy; return; }
   if ! parse_chain_address "$addr"; then
@@ -1373,10 +1373,13 @@ configure_socks5_chain() {
       "version": "5"
     } + (if $u != "" then {"username": $u, "password": $pw} else {} end))]
   ' "$SB_CONF_FILE" > "$tmp"; then
-    echo -e "${RED}SOCKS5 转发配置生成失败。${PLAIN}" >&2
+    echo -e "${RED}SOCKS5 出口配置生成失败。${PLAIN}" >&2
     return 1
   fi
-  safe_save_config "$tmp" && rm -f "$tmp"
+  if safe_save_config "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${GREEN}SOCKS5 出口连接已保存。${PLAIN}"
+  fi
 }
 
 clear_chain_routes() {
@@ -1390,12 +1393,15 @@ clear_chain_routes() {
     return 1
   fi
   ensure_private_reject_rule "$tmp" || return 1
-  safe_save_config "$tmp" && rm -f "$tmp"
+  if safe_save_config "$tmp"; then
+    rm -f "$tmp"
+    echo -e "${GREEN}所有节点已改回本机出口，出口连接仍保留。${PLAIN}"
+  fi
 }
 
 chain_proxy_summary() {
   jq -r '.outbounds[]? | select(.tag=="chain_proxy") |
-    (if .type == "shadowsocks" then "SS2022 加密上游" elif .type == "socks" then "SOCKS5 兼容上游" else .type end) +
+    (if .type == "shadowsocks" then "SS2022" elif .type == "socks" then "SOCKS5 兼容" else .type end) +
     " · " +
     (if (.server | contains(":")) then "[\(.server)]:\(.server_port)" else "\(.server):\(.server_port)" end)
   ' "$SB_CONF_FILE" 2>/dev/null
@@ -1404,23 +1410,34 @@ chain_proxy_summary() {
 configure_advanced() {
   while true; do
     clear
-    echo -e "${BLUE}=== 加密出口中继 / 路由 ===${PLAIN}"
-    local chain relay_count choice
+    echo -e "${BLUE}=== 跨机出口（A → B）===${PLAIN}"
+    echo " 用途: 让 A 机上的指定节点从 B 机访问网站"
+    echo " 步骤: 先在 B 机选 1，再在 A 机选 4 和 5"
+    echo
+    local chain relay_count routed_count choice
     chain=$(chain_proxy_summary)
     relay_count=$(jq '[.inbounds[]? | select((.tag // "") | startswith("relay_"))] | length' "$SB_CONF_FILE" 2>/dev/null)
+    routed_count=$(jq '[.route.rules[]? | select(.action? == "route" and .outbound? == "chain_proxy") | .inbound[]?] | unique | length' "$SB_CONF_FILE" 2>/dev/null)
     if [[ -n "$chain" ]]; then
-      echo -e " 当前 A 机上游: ${GREEN}${chain}${PLAIN}"
+      echo -e " 出口连接: ${GREEN}${chain}${PLAIN}"
     else
-      echo -e " 当前 A 机上游: ${YELLOW}未配置${PLAIN}"
+      echo -e " 出口连接: ${YELLOW}未配置${PLAIN}"
     fi
-    echo -e " 本机 B 机中继: ${GREEN}${relay_count:-0} 个${PLAIN}"
+    echo -e " 使用该出口: ${GREEN}${routed_count:-0} 个节点${PLAIN}"
+    echo -e " 本机中继: ${GREEN}${relay_count:-0} 个${PLAIN}"
     echo
-    echo " 1) B机：创建 SS2022 专用出口中继"
-    echo " 2) B机：查看/删除 SS2022 专用中继"
-    echo " 3) A机：配置/替换/删除 SS2022 加密上游"
-    echo " 4) A机：设置现有节点是否走 B 机"
-    echo " 5) 兼容：配置/删除旧 SOCKS5 上游"
-    echo " 6) 清除全部节点转发规则（保留上游）"
+    echo " [B 机：提供出口]"
+    echo " 1) 创建中继"
+    echo " 2) 查看中继连接信息"
+    echo " 3) 删除中继"
+    echo
+    echo " [A 机：使用 B 机出口]"
+    echo " 4) 连接、更换或断开 B 机"
+    echo " 5) 选择要走 B 机的节点"
+    echo " 6) 所有节点改回本机出口（保留连接）"
+    echo
+    echo " [兼容功能]"
+    echo " 7) 配置旧 SOCKS5 出口"
     echo " 0) 返回"
     echo "----------------------------------------"
     read -p "请选择: " choice
@@ -1430,19 +1447,18 @@ configure_advanced() {
       2)
         list_ss2022_relays
         if [[ "$_RELAY_COUNT" -gt 0 ]]; then
-          read -p "输入中继 ID 查看连接信息，输入 d 删除，其他键返回: " choice
+          read -p "输入中继 ID 查看连接信息 (0 返回): " choice
           choice=$(strip_cr "$choice")
-          if [[ "${choice,,}" == "d" ]]; then
-            run_menu_action "删除 SS2022 专用中继" delete_ss2022_relay
-          elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$_RELAY_COUNT" ]]; then
+          if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$_RELAY_COUNT" ]]; then
             show_ss2022_relay_info "$(get_relay_tag_by_id "$choice")"
           fi
         fi
         read -p "按回车继续..." ;;
-      3) run_menu_action "配置 SS2022 加密上游" configure_ss2022_chain; read -p "按回车继续..." ;;
-      4) run_menu_action "设置节点出口" manage_node_forwarding; read -p "按回车继续..." ;;
-      5) run_menu_action "配置 SOCKS5 兼容上游" configure_socks5_chain; read -p "按回车继续..." ;;
-      6) run_menu_action "清除节点转发规则" clear_chain_routes; read -p "按回车继续..." ;;
+      3) run_menu_action "删除 SS2022 中继" delete_ss2022_relay; read -p "按回车继续..." ;;
+      4) run_menu_action "连接 B 机出口" configure_ss2022_chain; read -p "按回车继续..." ;;
+      5) run_menu_action "选择节点出口" manage_node_forwarding; read -p "按回车继续..." ;;
+      6) run_menu_action "节点改回本机出口" clear_chain_routes; read -p "按回车继续..." ;;
+      7) run_menu_action "配置 SOCKS5 兼容出口" configure_socks5_chain; read -p "按回车继续..." ;;
       0) return ;;
     esac
   done
@@ -1551,7 +1567,7 @@ main_menu() {
     echo " 3) 添加 Shadowsocks-2022 节点"
     echo " 4) 查看节点/导出分享链接"
     echo " 5) 删除节点"
-    echo " 6) SS2022 加密出口/路由"
+    echo " 6) 跨机出口（A → B）"
     echo " 7) 更新脚本"
     echo " 8) 卸载 sing-box + 删除全部配置"
     echo " 0) 退出"
