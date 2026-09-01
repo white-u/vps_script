@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 v5.3.1
+# Snell 多实例管理脚本 v5.3.2
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
@@ -35,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="5.3.1"
+SCRIPT_VERSION="5.3.2"
 SNELL_VERSION="5.0.1"
 
 SNELL_BIN="/usr/local/bin/snell-server"
@@ -55,6 +55,7 @@ SNELL_AARCH64_BINARY_SHA256="c9e1cc1f1a86e7d2958f2bc41ff9dc668edf479455a651ea05c
 SCRIPT_PATH="/usr/local/bin/snell"
 # 脚本远程地址 (用于管道运行时自动下载安装快捷命令)
 SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh"
+FIREWALL_BACKEND=""
 
 # 读取已安装的 Snell 主版本号
 get_installed_major_ver() {
@@ -105,6 +106,67 @@ err() { echo -e "${RED}❌ 错误: $1${PLAIN}"; exit 1; }
 info() { echo -e "${GREEN}INFO: $1${PLAIN}"; }
 warn() { echo -e "${YELLOW}警告: $1${PLAIN}"; }
 strip_cr() { echo "${1//$'\r'/}"; }
+
+open_port() {
+    local port=$1 proto rc=0
+    local protocols=(tcp udp)
+    FIREWALL_BACKEND=""
+
+    if command -v ufw >/dev/null 2>&1; then
+        FIREWALL_BACKEND="ufw"
+        for proto in "${protocols[@]}"; do
+            ufw allow "${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        FIREWALL_BACKEND="firewalld"
+        for proto in "${protocols[@]}"; do
+            firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || rc=1
+    elif command -v iptables >/dev/null 2>&1; then
+        FIREWALL_BACKEND="iptables"
+        for proto in "${protocols[@]}"; do
+            if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || rc=1
+            fi
+        done
+        if command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables 2>/dev/null || true
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || rc=1
+        fi
+    fi
+    return "$rc"
+}
+
+close_port() {
+    local port=$1 proto rc=0
+    local protocols=(tcp udp)
+    FIREWALL_BACKEND=""
+
+    if command -v ufw >/dev/null 2>&1; then
+        FIREWALL_BACKEND="ufw"
+        for proto in "${protocols[@]}"; do
+            ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        FIREWALL_BACKEND="firewalld"
+        for proto in "${protocols[@]}"; do
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || rc=1
+    elif command -v iptables >/dev/null 2>&1; then
+        FIREWALL_BACKEND="iptables"
+        for proto in "${protocols[@]}"; do
+            if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || rc=1
+            fi
+        done
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || rc=1
+        fi
+    fi
+    return "$rc"
+}
 
 run_menu_action() {
     local label=$1
@@ -754,7 +816,14 @@ EOF
     info "实例 (端口: $port) 启动成功!"
     [[ "$existing" == "true" ]] && warn "PSK 已更换，请同步更新客户端配置。"
     show_single_config "$port" || warn "实例已运行，但客户端配置展示失败。"
-    echo -e " ${DIM}脚本未修改防火墙；公网使用时请自行放行 TCP/UDP ${port}。${PLAIN}"
+    if open_port "$port"; then
+        if [[ -n "$FIREWALL_BACKEND" ]]; then
+            info "已通过 ${FIREWALL_BACKEND} 放行 TCP/UDP ${port}。"
+        fi
+    else
+        warn "实例已运行，但 TCP/UDP ${port} 防火墙规则添加失败，请手动放行。"
+        return 1
+    fi
 }
 
 # 3. 删除实例
@@ -824,8 +893,20 @@ del_instance() {
             fi
             return 1
         fi
+        if ! close_port "$target_port"; then
+            warn "TCP/UDP ${target_port} 防火墙规则清理失败，配置未删除。"
+            open_port "$target_port" || warn "防火墙规则恢复失败，请立即检查。"
+            if [[ "$was_enabled" == "true" ]]; then
+                systemctl enable "snell@${target_port}" >/dev/null 2>&1 || warn "原开机启动状态恢复失败"
+            fi
+            if [[ "$was_active" == "true" ]]; then
+                systemctl start "snell@${target_port}" >/dev/null 2>&1 || warn "原运行状态恢复失败"
+            fi
+            return 1
+        fi
         if ! rm -f "${SNELL_CONF_DIR}/${target_port}.conf"; then
             warn "实例 ${target_port} 配置删除失败，正在恢复服务状态。"
+            open_port "$target_port" || warn "防火墙规则恢复失败，请立即检查。"
             if [[ "$was_enabled" == "true" ]]; then
                 systemctl enable "snell@${target_port}" >/dev/null 2>&1 || warn "原开机启动状态恢复失败"
             fi
@@ -1084,6 +1165,28 @@ uninstall_all() {
             return 1
         fi
     done
+
+    local firewall_failed=false
+    for port in "${ports[@]+"${ports[@]}"}"; do
+        if ! close_port "$port"; then
+            warn "TCP/UDP ${port} 防火墙规则清理失败，已取消卸载。"
+            firewall_failed=true
+        fi
+    done
+    if [[ "$firewall_failed" == "true" ]]; then
+        local restore_failed=false
+        for port in "${ports[@]+"${ports[@]}"}"; do
+            open_port "$port" || restore_failed=true
+        done
+        for port in "${enabled_ports[@]+"${enabled_ports[@]}"}"; do
+            systemctl enable "snell@${port}" >/dev/null 2>&1 || restore_failed=true
+        done
+        for port in "${active_ports[@]+"${active_ports[@]}"}"; do
+            systemctl start "snell@${port}" >/dev/null 2>&1 || restore_failed=true
+        done
+        [[ "$restore_failed" == "true" ]] && warn "部分防火墙或服务状态恢复失败，请立即检查。"
+        return 1
+    fi
 
     local remove_user=false failed=false
     [[ -f "$USER_MARKER" && ! -L "$USER_MARKER" ]] && remove_user=true
