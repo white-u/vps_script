@@ -11,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -989,33 +989,47 @@ add_ss2022() {
 
 _NODE_COUNT=0
 
+get_node_count() {
+  local count
+  count=$(jq -r '[.inbounds[]? | select((.tag // "") | test("^(reality_|ss_)"))] | length' "$SB_CONF_FILE" 2>/dev/null) || count=0
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  echo "$count"
+}
+
 list_nodes() {
-  echo -e "${BLUE}================================================================${PLAIN}"
-  echo -e "   当前节点列表"
-  echo -e "${BLUE}================================================================${PLAIN}"
-  printf " %-4s %-20s %-12s %-8s\n" "ID" "Tag" "Type" "Port"
-  echo -e "----------------------------------------------------------------"
+  local mode=${1:-full}
+  local nodes tag type port type_label
+  if [[ "$mode" == "full" ]]; then
+    echo -e "${BLUE}========================================================================${PLAIN}"
+    echo -e "  当前节点"
+    echo -e "${BLUE}========================================================================${PLAIN}"
+  fi
+  echo " ID    类型          端口      节点标签"
+  echo "------------------------------------------------------------------------"
   _NODE_COUNT=0
 
-  local nodes; nodes=$(jq -c '.inbounds[]?' "$SB_CONF_FILE" 2>/dev/null) || true
+  nodes=$(jq -r '
+    .inbounds[]? |
+    select((.tag // "") | test("^(reality_|ss_)")) |
+    [.tag, .type, .listen_port] | @tsv
+  ' "$SB_CONF_FILE" 2>/dev/null) || nodes=""
   if [[ -z "$nodes" ]]; then
-    echo -e " (无节点)"
-    echo -e "----------------------------------------------------------------"
+    echo -e " ${YELLOW}暂无节点，请先添加 Reality 或 SS2022 节点。${PLAIN}"
+    echo "------------------------------------------------------------------------"
     return
   fi
 
-  while IFS= read -r node; do
-    [[ -z "$node" ]] && continue
-    local tag type port
-    tag=$(echo "$node" | jq -r '.tag')
-    type=$(echo "$node" | jq -r '.type')
-    port=$(echo "$node" | jq -r '.listen_port')
-    if [[ "$tag" == reality_* || "$tag" == ss_* ]]; then
-      _NODE_COUNT=$((_NODE_COUNT+1))
-      printf " [%d]  %-20s %-12s %-8s\n" "$_NODE_COUNT" "$tag" "$type" "$port"
-    fi
+  while IFS=$'\t' read -r tag type port; do
+    [[ -z "$tag" ]] && continue
+    _NODE_COUNT=$((_NODE_COUNT+1))
+    case "$type" in
+      vless) type_label="Reality" ;;
+      shadowsocks) type_label="SS2022" ;;
+      *) type_label="$type" ;;
+    esac
+    printf " [%d]   %-12s  %-8s  %s\n" "$_NODE_COUNT" "$type_label" "$port" "$tag"
   done <<< "$nodes"
-  echo -e "----------------------------------------------------------------"
+  echo "------------------------------------------------------------------------"
 }
 
 get_node_tag_by_id() {
@@ -1150,6 +1164,7 @@ uninstall_all() {
 }
 
 main_menu() {
+  local choice id t
   check_deps
   init_meta_if_missing || exit 1
   if [[ -x "$SB_BIN" ]]; then
@@ -1160,29 +1175,41 @@ main_menu() {
   fi
   while true; do
     clear
-    echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e "  sb (sing-box)  v${SCRIPT_VERSION}"
-    echo -e "  Script update URL: ${SCRIPT_URL}"
-    echo -e "  Meta file: ${META_FILE}"
-    echo -e "${BLUE}================================================================${PLAIN}"
+    echo -e "${BLUE}========================================================================${PLAIN}"
+    echo -e "  SB 多协议管理 · v${SCRIPT_VERSION}"
+    echo -e "${BLUE}========================================================================${PLAIN}"
 
-    local st="${RED}未运行${PLAIN}"
-    local ver; ver=$(get_current_sb_ver)
-    if systemctl is-active --quiet sing-box; then st="${GREEN}✅ 运行中 (core ${ver})${PLAIN}"; fi
+    local st ver ver_text="" node_count
+    ver=$(get_current_sb_ver)
+    [[ "$ver" != "none" && "$ver" != "unknown" ]] && ver_text=" v${ver}"
+    if [[ ! -x "$SB_BIN" ]]; then
+      st="${YELLOW}● 未安装${PLAIN}"
+    elif systemctl is-active --quiet sing-box; then
+      st="${GREEN}● 运行中${PLAIN}"
+    else
+      st="${RED}● 已停止${PLAIN}"
+    fi
+    node_count=$(get_node_count)
 
-    echo -e " 核心状态: ${st}"
-    echo -e " 配置文件: ${SB_CONF_FILE}"
-    echo "----------------------------------------------------------------"
-    echo " 1) 安装/更新 sing-box 核心"
-    echo " 2) 添加 VLESS-Vision-REALITY 节点"
-    echo " 3) 添加 Shadowsocks-2022 节点"
-    echo " 4) 查看节点/导出分享链接"
-    echo " 5) 删除节点"
-    echo " 6) 更新脚本"
-    echo " 7) 卸载 sing-box + 删除全部配置"
-    echo " 0) 退出"
-    echo "----------------------------------------------------------------"
-    read -p "请选择: " choice
+    echo -e " sing-box: ${st}${ver_text}    节点: ${node_count} 个"
+    echo "------------------------------------------------------------------------"
+    list_nodes compact
+    echo -e "${BLUE}========================================================================${PLAIN}"
+    echo
+    if [[ -x "$SB_BIN" ]]; then
+      echo " 1. 检查或更新 sing-box"
+    else
+      echo -e " 1. ${GREEN}安装 sing-box${PLAIN}"
+    fi
+    echo -e " 2. ${GREEN}添加 Reality 节点${PLAIN}"
+    echo -e " 3. ${GREEN}添加 SS2022 节点${PLAIN}"
+    echo " 4. 查看节点详情与分享"
+    echo " 5. 删除节点"
+    echo " 6. 更新 SB 脚本"
+    echo -e " 7. ${RED}卸载全部${PLAIN}"
+    echo " 0. 退出"
+    echo -e "${BLUE}========================================================================${PLAIN}"
+    read -rp " 请输入选项: " choice
     choice=$(strip_cr "$choice")
 
     case "$choice" in
@@ -1191,17 +1218,23 @@ main_menu() {
       3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read -p "按回车继续..." ;;
       4)
         list_nodes
-        read -p "输入节点 ID 查看详情(0返回): " id
-        id=$(strip_cr "$id")
-        if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$id" -ge 1 ]] && [[ "$id" -le "$_NODE_COUNT" ]]; then
-          t=$(get_node_tag_by_id "$id")
-          [[ -n "$t" ]] && show_node_info "$t"
+        if [[ "$_NODE_COUNT" -gt 0 ]]; then
+          read -rp " 请输入节点 ID（0 返回）: " id
+          id=$(strip_cr "$id")
+          [[ "$id" == "0" ]] && continue
+          if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$id" -ge 1 ]] && [[ "$id" -le "$_NODE_COUNT" ]]; then
+            t=$(get_node_tag_by_id "$id")
+            [[ -n "$t" ]] && show_node_info "$t"
+          else
+            echo -e "${RED}节点 ID 无效。${PLAIN}"
+          fi
         fi
         read -p "按回车继续..." ;;
       5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
       6) run_menu_action "更新 sb 管理脚本" update_script ;;
       7) run_menu_action "卸载 sing-box" uninstall_all ;;
       0) exit 0 ;;
+      *) echo -e "${RED}无效选项，请输入 0-7。${PLAIN}"; read -p "按回车继续..." ;;
     esac
   done
 }
