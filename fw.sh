@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.3.0
+# 端口转发管理脚本 (基于 realm) v2.3.1
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -35,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 REALM_VERSION="2.9.6"
 
 REALM_BIN="/usr/local/bin/realm"
@@ -137,7 +137,7 @@ sync_script() {
 
 # 依赖检查
 check_deps() {
-    local commands=(jq curl tar find ss sha256sum install realpath cmp)
+    local commands=(jq curl tar find ss sha256sum install realpath cmp timeout)
     local missing=() cmd
     for cmd in "${commands[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
@@ -666,7 +666,97 @@ show_all_configs() {
     echo -e " ${DIM}提示: 配额/限速请在 pm.sh 中为对应端口添加监控。${PLAIN}"
 }
 
-# 7. 更新管理脚本
+# 7. 测试转发规则
+test_forward_rule() {
+    CURRENT_ACTION="测试 realm 转发规则"
+    init_meta
+    local preset_port=${1:-}
+
+    local count
+    count=$(rule_count)
+    if [[ "$count" -eq 0 ]]; then
+        warn "暂无转发规则。"
+        return 0
+    fi
+
+    local rule src_port dst_ip dst_port
+    if [[ -n "$preset_port" ]]; then
+        validate_port "$preset_port" "源端口" || return 0
+        preset_port=$((10#$preset_port))
+        if ! rule=$(jq -r --argjson p "$preset_port" \
+            '.rules[]? | select(.src_port == $p) | [.src_port, .dst_ip, .dst_port] | @tsv' "$META_FILE"); then
+            warn "无法读取转发规则"
+            return 0
+        fi
+    else
+        echo -e "\n${BLUE}>>> 测试转发规则${PLAIN}\n"
+        print_rule_table || return 0
+        echo
+
+        local choice
+        read -rp " 请选择要测试的序号 (输入 0 取消): " choice
+        choice=$(strip_cr "$choice")
+        [[ "$choice" == "0" ]] && return 0
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "$count" ]]; then
+            warn "序号无效"
+            return 0
+        fi
+
+        local idx=$((choice - 1))
+        if ! rule=$(jq -r ".rules[$idx] | [.src_port, .dst_ip, .dst_port] | @tsv" "$META_FILE"); then
+            warn "无法读取转发规则"
+            return 0
+        fi
+    fi
+    if [[ -z "$rule" ]]; then
+        warn "未找到转发规则"
+        return 0
+    fi
+    if ! IFS=$'\t' read -r src_port dst_ip dst_port <<< "$rule"; then
+        warn "无法读取转发规则"
+        return 0
+    fi
+    if [[ -z "$src_port" || -z "$dst_ip" || -z "$dst_port" ]]; then
+        warn "转发规则内容不完整"
+        return 0
+    fi
+
+    echo
+    echo -e " 检测: :${src_port} → ${dst_ip}:${dst_port}"
+    echo -e " ─────────────────────────────────────────────"
+
+    local tcp_socket udp_socket
+    if realm_running; then
+        echo -e " ${GREEN}✓ Realm 服务运行中${PLAIN}"
+    else
+        echo -e " ${RED}✗ Realm 服务未运行${PLAIN}"
+    fi
+
+    tcp_socket=$(ss -H -ltnp "sport = :${src_port}" 2>/dev/null || true)
+    if [[ "$tcp_socket" == *'"realm"'* ]]; then
+        echo -e " ${GREEN}✓ TCP ${src_port} 由 Realm 监听${PLAIN}"
+    else
+        echo -e " ${RED}✗ TCP ${src_port} 未由 Realm 监听${PLAIN}"
+    fi
+
+    udp_socket=$(ss -H -lunp "sport = :${src_port}" 2>/dev/null || true)
+    if [[ "$udp_socket" == *'"realm"'* ]]; then
+        echo -e " ${GREEN}✓ UDP ${src_port} 由 Realm 监听${PLAIN}"
+    else
+        echo -e " ${YELLOW}! UDP ${src_port} 未由 Realm 监听${PLAIN}"
+    fi
+
+    if timeout 4 bash -c 'exec 3<>"/dev/tcp/${1}/${2}"' _ "$dst_ip" "$dst_port" \
+        >/dev/null 2>&1; then
+        echo -e " ${GREEN}✓ 本机可连接目标 TCP ${dst_ip}:${dst_port}${PLAIN}"
+    else
+        echo -e " ${RED}✗ 本机无法连接目标 TCP ${dst_ip}:${dst_port}${PLAIN}"
+    fi
+
+    echo -e " ─────────────────────────────────────────────"
+}
+
+# 8. 更新管理脚本
 update_script() {
     CURRENT_ACTION="更新 fw 管理脚本"
     local mode=${1:-menu}
@@ -715,7 +805,7 @@ update_script() {
     [[ "$mode" == "menu" ]] && exec "$SCRIPT_PATH"
 }
 
-# 8. 完整卸载
+# 9. 完整卸载
 uninstall_all() {
     CURRENT_ACTION="卸载 realm"
     echo
@@ -776,6 +866,11 @@ menu_add() {
     echo
     if ! add_forward "$src_port" "$dst_ip" "$dst_port" "$comment"; then
         warn "添加失败，请查看上方信息"
+    else
+        local test_now
+        read -rp " 是否立即测试? [Y/n] " test_now || true
+        test_now=$(strip_cr "$test_now")
+        [[ "$test_now" =~ ^[nN] ]] || test_forward_rule "$src_port"
     fi
     return 0
 }
@@ -889,25 +984,25 @@ menu() {
 
     echo -e "========================================================================"
     echo
-    echo -e " 1. ${GREEN}添加转发规则${PLAIN}"
-    echo -e " 2. 删除转发规则"
-    echo -e " 3. 服务状态与日志"
-
     if ! realm_installed; then
-        echo -e " 4. ${GREEN}安装 Realm${PLAIN}"
+        echo -e " 1. ${GREEN}安装 Realm${PLAIN}"
     else
-        echo -e " 4. 更新或重装 Realm"
+        echo -e " 1. 更新或重装 Realm"
     fi
-
-    echo -e " 5. 更新 FW 脚本"
-    echo -e " 6. ${RED}卸载全部${PLAIN}"
+    echo -e " 2. ${GREEN}添加转发规则${PLAIN}"
+    echo -e " 3. 测试转发规则"
+    echo -e " 4. 服务状态与日志"
+    echo -e " 5. 删除转发规则"
+    echo -e " 6. 更新 FW 脚本"
+    echo -e " 7. ${RED}卸载全部${PLAIN}"
     echo -e " 0. 退出"
     echo -e "========================================================================"
     read -rp " 请输入选项: " choice
     choice=$(strip_cr "$choice")
 
     case $choice in
-        1)
+        1) install_realm; read -rp " 按回车返回..." ;;
+        2)
             if ! realm_installed; then
                 warn "realm 未安装"
                 read -rp " 现在安装? [Y/n] " c || return
@@ -916,11 +1011,11 @@ menu() {
                 install_realm
             fi
             menu_add; read -rp " 按回车返回..." ;;
-        2) menu_delete; read -rp " 按回车返回..." ;;
-        3) menu_status; read -rp " 按回车返回..." ;;
-        4) install_realm; read -rp " 按回车返回..." ;;
-        5) update_script menu; read -rp " 按回车返回..." ;;
-        6) uninstall_all ;;
+        3) test_forward_rule; read -rp " 按回车返回..." ;;
+        4) menu_status; read -rp " 按回车返回..." ;;
+        5) menu_delete; read -rp " 按回车返回..." ;;
+        6) update_script menu; read -rp " 按回车返回..." ;;
+        7) uninstall_all ;;
         0) exit 0 ;;
         *) ;;
     esac

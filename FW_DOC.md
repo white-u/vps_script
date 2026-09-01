@@ -2,6 +2,8 @@
 
 `fw.sh` 是基于 [Realm](https://github.com/zhboner/realm) 的轻量端口转发管理脚本，默认同时转发 TCP 和 UDP。
 
+**脚本版本**：v2.3.1　|　**快捷命令**：`fw`
+
 ## 支持范围
 
 - 系统：Debian 10+ / Ubuntu 20.04+ 及其他使用 systemd、glibc 2.28+ 的 Linux。
@@ -19,6 +21,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/fw.s
 
 安装后使用 `fw` 打开交互菜单。
 
+菜单顺序与 SB 模块保持一致：
+
+```text
+1. 安装 Realm / 更新或重装 Realm
+2. 添加转发规则
+3. 测试转发规则
+4. 服务状态与日志
+5. 删除转发规则
+6. 更新 FW 脚本
+7. 卸载全部
+0. 退出
+```
+
 ## 常用命令
 
 ```bash
@@ -31,6 +46,16 @@ fw status
 fw update                  # 更新 FW 脚本
 fw uninstall
 ```
+
+## 内置连通性测试
+
+通过交互菜单添加规则成功后，脚本会询问是否立即测试；之后也可以选择“测试转发规则”重新检测。脚本会检查：
+
+- Realm 服务是否运行。
+- 该源端口是否由 Realm 监听 TCP 和 UDP。
+- 本机能否在 4 秒内连接目标 TCP 端口。
+
+该检查不会修改规则或防火墙，也不会把本机监听误报为公网端到端成功。云安全组、UFW/firewalld、外部客户端入口以及 UDP 应用层通信仍需按实际协议验证。
 
 ## 防火墙
 

@@ -1,133 +1,117 @@
-# Snell 多实例管理脚本 (snell.sh)
+# Snell 多实例管理
 
-**版本**: v5.2.1 | **快捷命令**: `snell` | **安装路径**: `/usr/local/bin/snell`
+`snell.sh` 用一个 systemd 模板服务管理多个 Snell v5 实例，每个端口拥有独立配置和 PSK。
 
----
+**脚本版本**：v5.3.1　|　**稳定核心**：v5.0.1　|　**快捷命令**：`snell`
 
-## 1. 概述
+## 版本策略
 
-`snell.sh` 是一个专为 **Snell Server** 设计的高级管理脚本。它摒弃了传统脚本“一个端口一个服务文件”的臃肿设计，采用了 **Systemd 模板化服务** (`snell@.service`)，能够轻松管理单机上的多个 Snell 实例。
+脚本固定使用 Surge 官方稳定版 Snell v5.0.1，不会自动安装 v6 Beta/RC。发行包和二进制均校验固定 SHA256，校验失败时拒绝替换现有核心。
 
-### 1.1 核心特性
+- [Snell 官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)
+- [Surge Snell 配置手册](https://manual.nssurge.com/policies/snell.html)
 
-*   **多实例支持:** 在同一台 VPS 上运行多个独立的 Snell 服务，每个实例拥有独立的端口、密码和配置文件。
-*   **Systemd 模板化:** 所有实例共用一个 `snell@.service` 模板，管理极其方便。
-    *   启动端口 10000: `systemctl start snell@10000`
-    *   查看端口 20000 日志: `journalctl -u snell@20000`
-*   **自动更新:** 尝试从 Surge 官方知识库抓取最新版本号，自动下载并平滑升级。
-*   **权限安全:**
-    *   创建独立用户 `snell` 运行服务。
-    *   使用 `AmbientCapabilities=CAP_NET_BIND_SERVICE`，允许非 root 用户绑定 80/443 等低端口。
+## 支持范围
 
----
+- Linux、systemd、glibc。
+- amd64、arm64。
+- Debian/Ubuntu 和使用 yum/dnf 的 RHEL 系发行版。
+- Alpine/OpenRC、i386、armv7 暂不支持。
 
-## 2. 安装与使用
-
-### 2.1 一键安装
+## 安装
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/snell.sh)
 ```
 
-### 2.2 常用命令
-
-| 命令 | 说明 |
-|------|------|
-| `snell` | 进入交互式管理菜单 (主入口) |
-| `snell add` | 快速添加一个新实例 |
-| `snell update` | 更新管理脚本自身 |
-| `snell install` | 强制重新安装/更新 Snell 核心 |
-
-### 2.3 交互菜单
-
-运行 `snell` 后可以看到如下界面：
+安装后运行 `snell`：
 
 ```text
-=========================================================================================
-   Snell 多实例管理脚本 (v5.2.1)
-=========================================================================================
- 核心状态: v4.1.1    架构: x86_64
------------------------------------------------------------------------------------------
- 序号   端口         状态  IPv6      混淆      PSK
- ─────────────────────────────────────────────────────────────────────────────────────
- [1]    10086        运行中  true      off       aBcD1234...
- [2]    20000        已停止  true      http      xYz98765...
-=========================================================================================
- 1. 安装 / 更新 Snell 核心
- 2. 添加实例 (新端口)
- 3. 删除实例
- 4. 查看客户端配置 (Surge/Stash)
- 5. 更新管理脚本
- 6. 卸载全部
- 0. 退出
-=========================================================================================
+1. 安装 Snell / 检查或更新 Snell
+2. 添加实例 (新端口)
+3. 服务状态与日志
+4. 查看客户端配置
+5. 删除实例
+6. 更新 Snell 脚本
+7. 卸载全部
+0. 退出
 ```
 
----
+## 常用命令
 
-## 3. 配置文件
+```bash
+snell                 # 交互菜单
+snell install         # 检查、安装或修复稳定版核心
+snell add             # 添加实例
+snell list            # 查看 Surge 客户端配置
+snell status          # 查看实例状态和最近日志
+snell delete          # 删除实例
+snell update          # 更新管理脚本
+snell uninstall       # 卸载全部
+snell help
+```
 
-### 3.1 路径说明
+## 实例配置
 
-*   **配置文件目录:** `/etc/snell/`
-    *   每个实例对应一个文件，命名规则为 `<端口号>.conf` (例如: `/etc/snell/10086.conf`)。
-*   **Systemd 服务文件:** `/etc/systemd/system/snell@.service`
-*   **二进制文件:** `/usr/local/bin/snell-server`
-
-### 3.2 配置文件示例 (10086.conf)
+新增实例会生成 32 字符随机 PSK，配置示例：
 
 ```ini
 [snell-server]
 listen = ::0:10086
-psk = <自动生成的随机密钥>
+psk = <32 字符随机 PSK>
 ipv6 = true
 tfo = true
 obfs = off
 dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888
 ```
 
-### 3.3 客户端配置格式
-
-脚本生成的分享链接/配置段可以直接复制到 Surge、Stash、Shadowrocket 等客户端使用：
+对应的 Surge 配置：
 
 ```text
-snell-node = snell, 1.2.3.4, 10086, psk=YourPassword, version=4, tfo=true, reuse=true
+snell-10086 = snell, 1.2.3.4, 10086, psk=<PSK>, version=5, tfo=true, reuse=true
 ```
 
----
+如手动将服务端改为 `obfs = http`，脚本会在客户端配置中追加 `obfs=http`。Snell v5 不支持 TLS 混淆。
 
-## 4. 常见问题
+## 更新与失败恢复
 
-**Q: 如何手动重启某个实例？**
-```bash
-systemctl restart snell@端口号
-# 例如重启 10086 端口
-systemctl restart snell@10086
-```
+核心更新按以下顺序执行：
 
-**Q: 如何查看特定实例的日志？**
-```bash
-journalctl -u snell@端口号 -n 20
-# 例如查看 10086 端口的最近 20 行日志
-journalctl -u snell@10086 -n 20
-```
+1. 下载并验证官方稳定版发行包。
+2. 备份核心、systemd 服务和版本记录。
+3. 记录当前正在运行的实例并短暂停止它们。
+4. 原子替换文件，仅恢复更新前处于运行状态的实例。
+5. 新核心启动失败时自动恢复旧核心及原运行状态。
 
-**Q: 如何修改端口密码？**
-1.  编辑配置文件: `nano /etc/snell/端口号.conf`
-2.  修改 `psk = ...` 这一行。
-3.  重启服务: `systemctl restart snell@端口号`
+已经停止的实例不会因为更新而被自动启动。核心已是正确的 v5.0.1 时只检查配置权限，不产生停机。
 
-**Q: 支持 HTTP 混淆吗？**
-A: 支持。虽然脚本默认关闭混淆 (`obfs = off`) 以获得最佳性能，但你可以手动编辑配置文件开启 `obfs = http`。
+覆盖现有端口会生成新 PSK。新配置启动失败时会恢复旧配置、旧 PSK 及原来的启用/运行状态。
 
----
+## 防火墙
 
-## 5. 卸载
+脚本不会修改 UFW、firewalld、nftables、iptables 或云安全组。公网使用时请根据实际策略自行放行实例端口的 TCP 和 UDP。
 
-在菜单中选择 `6. 卸载全部`。
-卸载会自动清理：
-*   停止并禁用所有 Snell 服务实例。
-*   删除 Systemd 服务文件。
-*   删除配置文件目录 `/etc/snell`。
-*   删除 `snell` 用户。
-*   删除脚本自身。
+旧版脚本可能添加过无法确认归属的通用放行规则。新版更新或卸载不会冒险删除这些规则，请按服务器当前防火墙策略人工检查。
+
+## 安全说明
+
+Snell 优先追求性能。官方明确说明它不提供前向保密，也没有专用重放保护机制；PSK 派生参数同样偏向低开销。需要更强安全保证时，应优先选择基于 TLS 的代理协议。
+
+脚本使用官方建议长度的 32 字符随机 PSK，并使用独立的 `snell` 用户运行服务。配置由 `root:snell` 持有，普通 Snell 进程只能读取，不能修改其他实例的 PSK。
+
+配置目录、实例配置、版本文件或用户归属标记若被替换为符号链接，涉及权限迁移或卸载的操作会拒绝继续，避免越过 `/etc/snell` 的文件边界。
+
+## 文件与权限
+
+- 管理脚本：`/usr/local/bin/snell`
+- Snell 核心：`/usr/local/bin/snell-server`
+- 配置目录：`/etc/snell`，权限 `750 root:snell`
+- 实例配置：`/etc/snell/<端口>.conf`，权限 `640 root:snell`
+- systemd 模板：`/etc/systemd/system/snell@.service`
+- 日志：`journalctl -u 'snell@*' -n 50 --no-pager`
+
+## 卸载
+
+卸载前会先确认所有实例均已停止并取消开机启动；任一步失败时不会继续删除文件。完成后会验证核心、配置、服务和快捷命令是否残留。
+
+脚本只删除带有归属标记、能够确认由本版本创建的 `snell` 用户。升级前已经存在且归属不明的同名用户会被保留并明确提示。
