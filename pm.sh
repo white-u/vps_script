@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.2 (通知与推送菜单整理)
+# 版本: v5.6.3 (终端列表布局优化)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.2"
+SCRIPT_VERSION="5.6.3"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -41,6 +41,8 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 PLAIN='\033[0m'
 TG_DIVIDER="━━━━━━━━━━━━━━"
+UI_DIVIDER="=============================================================================="
+UI_SEPARATOR="------------------------------------------------------------------------------"
 
 pm_error() {
     local message="$*"
@@ -148,6 +150,13 @@ _ensure_unique_connection_snapshot() {
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
 strip_cr() { echo "${1//$'\r'/}"; }
+
+confirm_yes() {
+    local prompt=$1 answer
+    read -r -p "${prompt} [y/N，默认 N]: " answer
+    answer=$(strip_cr "$answer")
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
 
 validate_expiry_date() {
     local value=$1 normalized
@@ -1497,24 +1506,24 @@ configure_ip_sentinel() {
         [ "$ip_act" = "block" ] && act_str="${RED}自动阻断${PLAIN}"
 
         clear
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 接入监控 (IP Sentinel) - 端口 $port"
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 状态:     $([ "$ip_en" = "true" ] && echo "${GREEN}已启用${PLAIN}" || echo "${YELLOW}未启用${PLAIN}")"
         echo -e " 允许 IP:  $ip_max"
         echo -e " 升级告警: 超过 $((ip_max + 2)) IP"
         echo -e " 处理策略: $act_str"
         echo -e " 冷却时间: ${ip_cd} 分钟"
         echo -e " 白名单:   $ip_wl"
-        echo -e "========================================"
+        echo -e "$UI_SEPARATOR"
         echo -e " 1. 启用/禁用"
         echo -e " 2. 设置 允许 IP 数"
         echo -e " 3. 设置 处理策略"
         echo -e " 4. 设置 冷却时间"
         echo -e " 5. 管理 白名单"
         echo -e " 0. 返回"
-        echo -e "========================================"
-        read -p "> " sc; sc=$(strip_cr "$sc")
+        echo -e "$UI_DIVIDER"
+        read -r -p "请选择: " sc; sc=$(strip_cr "$sc")
         local tmp=$(mktemp)
 
         case $sc in
@@ -1525,7 +1534,7 @@ configure_ip_sentinel() {
                     _reset_ip_alert_state "$port" || pm_error "端口 ${port} 的接入告警状态重置失败"
                     sleep 0.5
                 else sleep 1; fi ;;
-            2)  read -p "最大允许独立 IP 数: " val; val=$(strip_cr "$val")
+            2)  read -r -p "最大允许独立 IP 数（1-65535）: " val; val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 65535 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.max_ips = $v' \
                         "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已更新。" "最大 IP 数写入失败"; then
@@ -1533,9 +1542,17 @@ configure_ip_sentinel() {
                         sleep 0.5
                     else sleep 1; fi
                 else echo -e "${RED}无效输入，请输入 1-65535。${PLAIN}"; sleep 1; fi ;;
-            3)  echo -e "1. 仅报警 (alert)  2. 自动阻断 (block)"
-                read -p "> " am; am=$(strip_cr "$am")
-                local nact="alert"; [ "$am" = "2" ] && nact="block"
+            3)  echo -e " 1. 仅报警"
+                echo -e " 2. 自动断开多余 IP"
+                echo -e " 0. 取消"
+                read -r -p "请选择 [0-2，默认 0]: " am; am=$(strip_cr "$am")
+                local nact
+                case "$am" in
+                    1) nact="alert" ;;
+                    2) nact="block" ;;
+                    ""|0) rm -f "$tmp"; continue ;;
+                    *) echo -e "${RED}无效选项。${PLAIN}"; rm -f "$tmp"; sleep 1; continue ;;
+                esac
                 if jq --arg v "$nact" --arg p "$port" '.ports[$p].ip_limit.action = $v' \
                     "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已更新。" "接入监控策略写入失败"; then
                     _reset_ip_alert_state "$port" || pm_error "端口 ${port} 的接入告警状态重置失败"
@@ -1545,7 +1562,7 @@ configure_ip_sentinel() {
                     fi
                 fi
                 sleep 1 ;;
-            4)  read -p "冷却时间 (分钟, 同级持续超限的提醒间隔): " val; val=$(strip_cr "$val")
+            4)  read -r -p "冷却时间（分钟，同级持续超限的提醒间隔）: " val; val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 525600 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.cooldown_min = $v' \
                         "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已更新。" "冷却时间写入失败"; then
@@ -1554,9 +1571,9 @@ configure_ip_sentinel() {
                 else echo -e "${RED}无效输入，请输入 1-525600 分钟。${PLAIN}"; sleep 1; fi ;;
             5)  echo -e "\n当前白名单: $ip_wl"
                 echo -e " 1. 添加 IP  2. 清空白名单  0. 返回"
-                read -p "> " wc; wc=$(strip_cr "$wc")
+                read -r -p "请选择 [0-2，默认 0]: " wc; wc=$(strip_cr "$wc")
                 if [ "$wc" = "1" ]; then
-                    read -p "输入 IP 地址 (支持 IPv4/IPv6): " wip; wip=$(strip_cr "$wip")
+                    read -r -p "输入 IP 地址（支持 IPv4/IPv6，留空取消）: " wip; wip=$(strip_cr "$wip")
                     if [ -n "$wip" ]; then
                         if jq --arg ip "$wip" --arg p "$port" '.ports[$p].ip_limit.whitelist += [$ip] | .ports[$p].ip_limit.whitelist |= unique' \
                             "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已添加。" "白名单写入失败"; then
@@ -1966,11 +1983,10 @@ show_main_menu() {
     start_edit_lock || exit 1
 
     clear
-    echo -e "========================================================================================="
-    echo -e "   Linux 端口流量管理 (v${SCRIPT_VERSION}) - 后台每分钟刷新"
-    echo -e "========================================================================================="
-    printf " %-4s %-12s %-10s %-30s %-15s %-15s\n" "ID" "端口" "模式" "已用流量 / 总配额" "突发限速" "用户"
-    echo -e "-----------------------------------------------------------------------------------------"
+    echo -e "$UI_DIVIDER"
+    echo -e "  Linux 端口流量管理 v${SCRIPT_VERSION}"
+    echo -e "  每分钟刷新 · 编辑期间后台任务暂停"
+    echo -e "$UI_DIVIDER"
 
     local port_list=()
     local i=1
@@ -2004,10 +2020,10 @@ show_main_menu() {
         # 从 state 文件读取运行数据
         _load_port_state "$port"
         
-        local mode_str="[双向]"
+        local mode_str="双向"
         local total_used=0
         if [ "$mode" == "out_only" ]; then
-            mode_str="[仅出站]"
+            mode_str="仅出站"
             total_used=$s_acc_out
         else
             total_used=$((s_acc_in + s_acc_out))
@@ -2026,30 +2042,38 @@ show_main_menu() {
         
         local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
         local quota_str="${status_clean} / ${quota} GB"
-        if [ "$reset_day" -gt 0 ] 2>/dev/null; then quota_str="${quota_str} [R${reset_day}]"; fi
+        local reset_str=""
+        if [ "$reset_day" -gt 0 ] 2>/dev/null; then reset_str=" · ${reset_day} 日重置"; fi
         
         local limit_str=""
         if [ "$burst_enabled" == "true" ] && [ "$s_is_punished" == "true" ]; then
-            limit_str="${RED}${BURST_LIMIT_MBPS}Mbps(生效中)${PLAIN}"
+            limit_str="${RED}${BURST_LIMIT_MBPS} Mbps（生效中）${PLAIN}"
         elif [ "$burst_enabled" == "true" ]; then
             limit_str="${GREEN}已接入${PLAIN}"
         else
             limit_str="未接入"
         fi
-        
-        # 显示组ID
-        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
-            mode_str="${mode_str} ${BLUE}[G:${gid}]${PLAIN}"
-        fi
 
-        printf " [%d]  %-12s %-20b %-30s %-24b %-15s\n" \
-            "$i" "$port" "$mode_str" "$quota_str" "$limit_str" "$comment"
+        local group_str=""
+        if [ -n "$gid" ] && [ "$gid" != "null" ]; then
+            group_str=" · 分组 ${gid}"
+        fi
+        [ -z "$comment" ] && comment="未设置"
+
+        [ "$i" -gt 1 ] && echo
+        printf " [%d] %s · %s%s · 用户 %s\n" \
+            "$i" "$port" "$mode_str" "$group_str" "$comment"
+        printf "     流量 %s%s · 突发 %b\n" \
+            "$quota_str" "$reset_str" "$limit_str"
         
         port_list[$i]=$port
         i=$((i + 1))
     done
-    echo -e "-----------------------------------------------------------------------------------------"
-    echo -e " 说明: [G:xxx]表示组。流量每分钟更新。当前正在编辑中，后台刷新已暂停。\n"
+    if [ "$i" -eq 1 ]; then
+        echo -e " 暂无监控端口"
+    fi
+    echo -e "$UI_SEPARATOR"
+    echo -e " 提示：分组端口显示组内合计流量。\n"
 
     local tg_status=$(telegram_status_text)
     local push_status=$(push_status_text)
@@ -2061,8 +2085,8 @@ show_main_menu() {
     echo -e " 5. 更新 脚本"
     echo -e " 6. ${RED}卸载 脚本${PLAIN}"
     echo -e " 0. 退出"
-    echo -e "========================================================================================="
-    read -p "请输入选项: " choice
+    echo -e "$UI_DIVIDER"
+    read -r -p "请选择: " choice
     choice=$(strip_cr "$choice")
     
     case $choice in
@@ -2079,11 +2103,9 @@ show_main_menu() {
 
 add_port_flow() {
     local scan_data=$(scan_active_services)
-    echo -e "\n======================================================================"
-    echo -e "   系统当前活跃端口 (TCP/UDP)"
-    echo -e "======================================================================"
-    printf " %-4s %-15s %-25s %-10s\n" "ID" "端口/协议" "进程名称" "状态"
-    echo -e "----------------------------------------------------------------------"
+    echo -e "\n$UI_DIVIDER"
+    echo -e "  系统当前活跃端口 · TCP/UDP"
+    echo -e "$UI_DIVIDER"
     local map_ports=()
     local idx=1
     while read -r line; do
@@ -2094,18 +2116,22 @@ add_port_flow() {
         local is_monitored=false
         if jq -e ".ports[\"$p_port\"]" "$CONFIG_FILE" >/dev/null; then is_monitored=true; fi
         if [ "$is_monitored" = true ]; then
-            echo -e " [${idx}]  ${p_port}/${p_proto}\t\t${p_proc}\t\t${YELLOW}[已监控]${PLAIN}"
+            printf " [%d] %s · %s · %b\n" \
+                "$idx" "${p_port}/${p_proto}" "$p_proc" "${YELLOW}已监控${PLAIN}"
         else
-            printf " [%d]  %-15s %-25s %-10s\n" $idx "${p_port}/${p_proto}" "$p_proc" "[可选]"
+            printf " [%d] %s · %s · 可选\n" "$idx" "${p_port}/${p_proto}" "$p_proc"
         fi
         map_ports[$idx]=$p_port
         idx=$((idx + 1))
     done <<< "$scan_data"
-    echo -e "----------------------------------------------------------------------"
-    echo -e " [M]   手动输入端口号"
-    echo -e " [0]   返回主菜单"
-    echo -e "======================================================================"
-    read -p "请输入选项: " sel
+    if [ "$idx" -eq 1 ]; then
+        echo -e " 未发现活跃端口，可选择手动输入。"
+    fi
+    echo -e "$UI_SEPARATOR"
+    echo -e " [M] 手动输入端口号"
+    echo -e " [0] 返回主菜单"
+    echo -e "$UI_DIVIDER"
+    read -r -p "请选择: " sel
     sel=$(strip_cr "$sel")
     local target_port=""
     if [ "$sel" == "0" ]; then return; fi
@@ -2115,7 +2141,7 @@ add_port_flow() {
             echo -e "${RED}该端口已在监控列表中!${PLAIN}"; sleep 2; return
         fi
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
-        read -p "请输入端口号: " target_port
+        read -r -p "请输入端口号: " target_port
         target_port=$(strip_cr "$target_port")
     else
         return
@@ -2125,34 +2151,38 @@ add_port_flow() {
     fi
     echo -e "\n>> 正在配置端口: $target_port"
     
-    read -p "月流量配额 (纯数字, GB): " quota
+    read -r -p "月流量配额（GB，正整数）: " quota
     quota=$(strip_cr "$quota")
     if [[ ! "$quota" =~ ^[0-9]+$ ]] || [ "$quota" -eq 0 ] || [ "$quota" -gt "$MAX_QUOTA_GB" ]; then
         echo -e "${RED}错误: 配额必须是 1-${MAX_QUOTA_GB} 的整数!${PLAIN}"; sleep 2; return
     fi
 
-    echo "计费模式: 1.双向计费(默认)  2.仅出站计费"
-    read -p "选择模式 [1/2]: " mode_idx
+    echo "计费模式：1. 双向计费  2. 仅出站计费"
+    read -r -p "选择模式 [1/2，默认 1]: " mode_idx
     mode_idx=$(strip_cr "$mode_idx")
-    local mode="in_out"
-    [ "$mode_idx" == "2" ] && mode="out_only"
+    local mode
+    case "$mode_idx" in
+        ""|1) mode="in_out" ;;
+        2) mode="out_only" ;;
+        *) echo -e "${RED}无效模式，请输入 1 或 2。${PLAIN}"; sleep 1; return ;;
+    esac
 
     echo -e "突发限速: 出站连续 ${BURST_TRIGGER_MINUTES} 分钟超过 ${BURST_TRIGGER_MBPS} Mbps，"
     echo -e "          临时限制为 ${BURST_LIMIT_MBPS} Mbps，持续 ${BURST_DURATION_MINUTES} 分钟。"
-    read -p "是否接入突发限速? [y/N]: " burst_choice
-    burst_choice=$(strip_cr "$burst_choice")
     local burst_enabled=false
-    [[ "$burst_choice" == "y" || "$burst_choice" == "Y" ]] && burst_enabled=true
+    confirm_yes "是否接入突发限速？" && burst_enabled=true
 
-    read -p "每月自动重置日 (1-31, 0为不自动重置): " reset_day
+    read -r -p "每月自动重置日 [0-31，默认 0（不自动重置）]: " reset_day
     reset_day=$(strip_cr "$reset_day")
-    if [[ ! "$reset_day" =~ ^[0-9]+$ ]]; then reset_day=0; fi
-    if [ "$reset_day" -gt 31 ]; then echo -e "${RED}错误!${PLAIN}"; sleep 2; return; fi
+    [ -z "$reset_day" ] && reset_day=0
+    if [[ ! "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -gt 31 ]; then
+        echo -e "${RED}无效重置日，请输入 0-31。${PLAIN}"; sleep 1; return
+    fi
 
-    read -p "用户: " comment
+    read -r -p "用户（可留空）: " comment
     comment=$(strip_cr "$comment")
 
-    read -p "用户到期日期 (YYYY-MM-DD，留空为不提醒): " expiry_date
+    read -r -p "用户到期日期（YYYY-MM-DD，留空为不提醒）: " expiry_date
     expiry_date=$(strip_cr "$expiry_date")
     if [ -n "$expiry_date" ] && ! validate_expiry_date "$expiry_date"; then
         echo -e "${RED}错误: 到期日期必须是有效的 YYYY-MM-DD。${PLAIN}"
@@ -2202,12 +2232,15 @@ add_port_flow() {
 
 config_port_menu() {
     local arr=("$@")
-    echo -e "\n请输入要配置的端口 ID (查看上方列表): "
-    read -p "ID > " id
+    echo
+    read -r -p "请输入要配置的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
-    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
+    [ "$id" = "0" ] && return
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then
+        echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return
+    fi
     local port=${arr[$((id-1))]}
-    if [ -z "$port" ]; then return; fi
+    if [ -z "$port" ]; then echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return; fi
     
     while true; do
         local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
@@ -2226,9 +2259,9 @@ config_port_menu() {
         local ip_max=$(echo "$conf" | jq -r '.ip_limit.max_ips // 3')
         
         clear
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 当前配置: [$id]  $port"
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 流量配额: $quota GB"
         echo -e " 用户:     $([ -n "$comment" ] && echo "$comment" || echo "${YELLOW}未设置${PLAIN}")"
         echo -e " 流量分组: $gid_display"
@@ -2237,19 +2270,19 @@ config_port_menu() {
         [ "$dyn_enable" == "true" ] && echo -e " 固定策略: >${BURST_TRIGGER_MBPS} Mbps ${BURST_TRIGGER_MINUTES}分钟 → ${BURST_LIMIT_MBPS} Mbps ${BURST_DURATION_MINUTES}分钟"
         if [ "$reset_day" -gt 0 ] 2>/dev/null; then echo -e " 自动重置: 每月 ${GREEN}${reset_day}${PLAIN} 日"; else echo -e " 自动重置: ${YELLOW}未设置${PLAIN}"; fi
         if [ -n "$expiry_date" ]; then echo -e " 用户到期: ${GREEN}${expiry_date}${PLAIN} (提前 3 天提醒)"; else echo -e " 用户到期: ${YELLOW}未设置${PLAIN}"; fi
-        echo -e "========================================"
+        echo -e "$UI_SEPARATOR"
         echo -e " 1. 修改 流量配额"
         echo -e " 2. 修改 计费模式"
         echo -e " 3. 设置 突发限速"
         echo -e " 4. 修改 用户"
         echo -e " 5. 重置 统计数据 (清零)"
         echo -e " 6. 修改 自动重置日"
-        echo -e " 7. 设置/修改 分组 ID (Group)"
-        echo -e " 8. 设置 IP接入监控 $([ "$ip_enable" == "true" ] && echo "[已开启，>${ip_max} 告警]" || echo "[未开启]")"
+        echo -e " 7. 设置/修改 分组 ID"
+        echo -e " 8. 设置 IP 接入监控 $([ "$ip_enable" == "true" ] && echo "[已开启，>${ip_max} 告警]" || echo "[未开启]")"
         echo -e " 9. 设置 用户到期提醒"
         echo -e " 0. 返回主菜单"
-        echo -e "========================================"
-        read -p "请输入选项: " sub_choice
+        echo -e "$UI_DIVIDER"
+        read -r -p "请选择: " sub_choice
         sub_choice=$(strip_cr "$sub_choice")
         
         local tmp=$(mktemp)
@@ -2257,7 +2290,7 @@ config_port_menu() {
 
         case $sub_choice in
             1) 
-                read -p "新配额 (纯数字, GB): " val
+                read -r -p "新配额（GB，正整数）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ] && [ "$val" -le "$MAX_QUOTA_GB" ]; then
                     local sync_gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
@@ -2274,14 +2307,20 @@ config_port_menu() {
                 fi 
                 ;;
             2) 
-                read -p "模式 (1.双向 2.仅出站): " m
+                read -r -p "选择模式 [1 双向 / 2 仅出站，留空取消]: " m
                 m=$(strip_cr "$m")
-                local nm="in_out"; [ "$m" == "2" ] && nm="out_only"
+                local nm
+                case "$m" in
+                    "") rm -f "$tmp"; continue ;;
+                    1) nm="in_out" ;;
+                    2) nm="out_only" ;;
+                    *) echo -e "${RED}无效模式，请输入 1 或 2。${PLAIN}"; rm -f "$tmp"; sleep 1; continue ;;
+                esac
                 if jq --arg v "$nm" --arg p "$port" '.ports[$p].quota_mode = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then success=true; fi
                 ;;
             3) rm -f "$tmp"; configure_burst_limit "$port" ;;
             4)
-                read -p "新用户: " val
+                read -r -p "新用户（留空清除）: " val
                 val=$(strip_cr "$val")
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then success=true; fi
                 ;;
@@ -2289,9 +2328,7 @@ config_port_menu() {
                 if [ -n "$gid" ]; then
                     echo -e "${YELLOW}端口属于组 [${gid}]，将清零该组全部端口。${PLAIN}"
                 fi
-                read -p "确定清零吗? [y/N]: " confirm
-                confirm=$(strip_cr "$confirm")
-                if [[ "$confirm" == "y" ]]; then
+                if confirm_yes "确定清零吗？"; then
                    local reset_ports="$port"
                    if [ -n "$gid" ]; then
                        reset_ports=$(jq -r --arg g "$gid" '.ports | to_entries[] | select(.value.group_id == $g) | .key' "$CONFIG_FILE")
@@ -2320,7 +2357,7 @@ config_port_menu() {
                 fi 
                 ;;
             6)
-                read -p "自动重置日 (1-31, 0为关闭): " val
+                read -r -p "自动重置日（1-31，0 为关闭）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 31 ]; then
                     local sync_gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
@@ -2338,7 +2375,9 @@ config_port_menu() {
                 ;;
             7)
                 # [优化] 自动列出已有分组供选择
-                echo -e "\n--- 设置分组 (Group) ---"
+                echo -e "\n$UI_SEPARATOR"
+                echo -e " 分组设置"
+                echo -e "$UI_SEPARATOR"
                 local existing_groups=$(jq -r '.ports | to_entries[] | select(.value.group_id != null and .value.group_id != "") | "\(.value.group_id)|\(.value.quota_gb)"' "$CONFIG_FILE" | sort -t'|' -k1,1 -u)
                 declare -A group_map
                 group_map=()
@@ -2351,10 +2390,10 @@ config_port_menu() {
                         group_map[$g_idx]="$g_name"
                         g_idx=$((g_idx + 1))
                     done <<< "$existing_groups"
-                    echo -e " ------------------------"
+                    echo -e "$UI_SEPARATOR"
                 fi
                 
-                read -p "请输入分组 ID (输入新名称新建，或输入序号选择，留空清除): " input_val
+                read -r -p "分组 ID（输入名称新建/输入序号选择/留空清除）: " input_val
                 input_val=$(strip_cr "$input_val")
                 
                 local val=""
@@ -2417,7 +2456,7 @@ config_port_menu() {
 configure_user_expiry() {
     local port=$1 value tmp
     echo -e "\n用户到期前 3 天将通过本机 Telegram 告警提醒一次。"
-    read -p "到期日期 (YYYY-MM-DD，0 为关闭，留空取消): " value
+    read -r -p "到期日期（YYYY-MM-DD，0 为关闭，留空取消）: " value
     value=$(strip_cr "$value")
     [ -z "$value" ] && return 0
     [ "$value" = "0" ] && value=""
@@ -2460,9 +2499,9 @@ configure_burst_limit() {
     enabled=$(echo "$conf" | jq -r '.enable // false')
     _load_port_state "$port"
 
-    echo -e "\n========================================"
+    echo -e "\n$UI_DIVIDER"
     echo -e " 突发限速 - 端口 $port"
-    echo -e "========================================"
+    echo -e "$UI_DIVIDER"
     echo -e " 状态: $([ "$enabled" == "true" ] && echo "${GREEN}已接入${PLAIN}" || echo "${YELLOW}未接入${PLAIN}")"
     echo -e " 规则: 出站连续 ${BURST_TRIGGER_MINUTES} 分钟 > ${BURST_TRIGGER_MBPS} Mbps"
     echo -e "       限制为 ${BURST_LIMIT_MBPS} Mbps，持续 ${BURST_DURATION_MINUTES} 分钟后恢复不限速"
@@ -2471,12 +2510,12 @@ configure_burst_limit() {
         echo -e " 当前: $([ "$s_is_punished" == "true" ] && echo "${RED}限速生效中${PLAIN}" || echo "等待触发")"
         echo -e " 累计: $((s_high_seconds / 60)) / ${BURST_TRIGGER_MINUTES} 分钟"
     fi
-    echo -e "========================================"
+    echo -e "$UI_SEPARATOR"
     if [ "$enabled" == "true" ]; then action="关闭"; target=false; else action="开启"; target=true; fi
     echo -e " 1. ${action}突发限速"
     echo -e " 0. 取消"
-    echo -e "========================================"
-    read -p "> " choice; choice=$(strip_cr "$choice")
+    echo -e "$UI_DIVIDER"
+    read -r -p "请选择 [0-1，默认 0]: " choice; choice=$(strip_cr "$choice")
     [ "$choice" != "1" ] && return 0
 
     old_config=$(cat "$CONFIG_FILE") || { pm_error "无法备份当前配置"; return 1; }
@@ -2520,17 +2559,17 @@ configure_notifications() {
         local tg_status=$(telegram_status_text)
         local push_status=$(push_status_text)
         clear
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e "   通知与推送"
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " Telegram 告警    $tg_status"
         echo -e " Cloudflare 上报  $push_status"
-        echo -e "========================================"
+        echo -e "$UI_SEPARATOR"
         echo -e " 1. Telegram 告警设置"
         echo -e " 2. Cloudflare 云端推送"
         echo -e " 0. 返回主菜单"
-        echo -e "========================================"
-        read -p "请输入选项: " choice
+        echo -e "$UI_DIVIDER"
+        read -r -p "请选择: " choice
         choice=$(strip_cr "$choice")
         case $choice in
             1) configure_telegram ;;
@@ -2556,22 +2595,22 @@ configure_telegram() {
         [ "$t_api" == "https://api.telegram.org" ] && api_str="官方 API"
 
         clear
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e "   Telegram 告警设置"
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 状态:      $status_str"
         echo -e " Bot 配置:  $bot_str"
         echo -e " 流量阈值:  ${t_thr}%"
         echo -e " API 地址:  $api_str"
-        echo -e "========================================"
+        echo -e "$UI_SEPARATOR"
         echo -e " 1. 开启/关闭通知"
         echo -e " 2. 配置 Bot (Token + Chat ID)"
         echo -e " 3. 发送测试消息"
         echo -e " 4. 设置流量提醒阈值"
         echo -e " 5. 设置 API 地址"
         echo -e " 0. 返回通知与推送"
-        echo -e "========================================"
-        read -p "请输入选项: " c
+        echo -e "$UI_DIVIDER"
+        read -r -p "请选择: " c
         c=$(strip_cr "$c")
         local tmp=$(mktemp)
 
@@ -2587,9 +2626,9 @@ configure_telegram() {
                 else sleep 1; fi ;;
             2)
                 local new_token new_chatid
-                read -rsp "Bot Token（留空保留当前值）: " new_token; echo
+                read -r -s -p "Bot Token（留空保留当前值）: " new_token; echo
                 new_token=$(strip_cr "$new_token")
-                read -p "Chat ID（留空保留当前值）: " new_chatid
+                read -r -p "Chat ID（留空保留当前值）: " new_chatid
                 new_chatid=$(strip_cr "$new_chatid")
                 [ -z "$new_token" ] && new_token="$t_token"
                 [ -z "$new_chatid" ] && new_chatid="$t_chatid"
@@ -2626,7 +2665,7 @@ ${TG_DIVIDER}
                 fi ;;
             4)
                 echo -e "当前阈值: ${t_thr}%"
-                read -p "请输入新阈值（逗号分隔，如 50,80,100）: " val
+                read -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
                     local arr_json=$(echo "$val" | tr ',' '\n' | jq -s '.')
@@ -2638,7 +2677,7 @@ ${TG_DIVIDER}
             5)
                 echo -e "当前 API: $t_api"
                 echo -e "留空恢复默认：https://api.telegram.org"
-                read -p "请输入新 API 地址: " val
+                read -r -p "新 API 地址（留空恢复官方 API）: " val
                 val=$(strip_cr "$val")
                 [ -z "$val" ] && val="https://api.telegram.org"
                 if jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" \
@@ -2666,21 +2705,21 @@ configure_push() {
         [ -n "$p_nkey" ] && [ "$p_nkey" != "" ] && nkey_str="${GREEN}${p_nkey}${PLAIN}"
 
         clear
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e "   Cloudflare Worker 云端推送"
-        echo -e "========================================"
+        echo -e "$UI_DIVIDER"
         echo -e " 状态:     $status_str"
         echo -e " Worker:   $url_str"
         echo -e " Secret:   $secret_str"
         echo -e " Node Key: $nkey_str"
-        echo -e "========================================"
+        echo -e "$UI_SEPARATOR"
         echo -e " 1. 开启/关闭推送"
         echo -e " 2. 配置 Worker URL"
         echo -e " 3. 配置 Secret"
         echo -e " 4. 配置 Node Key"
         echo -e " 0. 返回通知与推送"
-        echo -e "========================================"
-        read -p "请输入选项: " c
+        echo -e "$UI_DIVIDER"
+        read -r -p "请选择: " c
         c=$(strip_cr "$c")
         local tmp=$(mktemp)
 
@@ -2695,19 +2734,20 @@ configure_push() {
                     sleep 0.5
                 else sleep 1; fi ;;
             2)
-                read -p "请输入 Worker URL: " val; val=$(strip_cr "$val")
+                read -r -p "Worker URL（留空取消）: " val; val=$(strip_cr "$val")
                 if [ -n "$val" ]; then
                     if jq --arg v "$val" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" \
                         && commit_generated_config "$tmp" "已更新。" "Worker URL 写入失败"; then sleep 0.5; else sleep 1; fi
                 fi ;;
             3)
-                read -rsp "请输入 Secret: " val; echo; val=$(strip_cr "$val")
+                read -r -s -p "Secret（留空取消）: " val; echo; val=$(strip_cr "$val")
                 if [ -n "$val" ]; then
                     if jq --arg v "$val" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" \
                         && commit_generated_config "$tmp" "已更新。" "Worker Secret 写入失败"; then sleep 0.5; else sleep 1; fi
                 fi ;;
             4)
-                read -p "请输入 Node Key: " val; val=$(strip_cr "$val")
+                read -r -p "Node Key（留空取消）: " val; val=$(strip_cr "$val")
+                [ -z "$val" ] && { rm -f "$tmp"; continue; }
                 val=${val,,}
                 if [[ "$val" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
                     if jq --arg v "$val" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" \
@@ -2723,15 +2763,16 @@ configure_push() {
 
 delete_port_flow() {
     local arr=("$@")
-    read -p "ID to delete: " id
+    read -r -p "请输入要删除的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
-    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then return; fi
+    [ "$id" = "0" ] && return
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then
+        echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return
+    fi
     local port=${arr[$((id-1))]}
     if [ -z "$port" ]; then echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return; fi
 
-    read -p "确认删除端口 ${port}? [y/N]: " confirm
-    confirm=$(strip_cr "$confirm")
-    [ "$confirm" != "y" ] && return
+    confirm_yes "确认删除端口 ${port}？" || return
 
     # 配置、Nftables 与 TC 作为一个操作处理；失败时恢复原配置。
     local backup
@@ -2803,7 +2844,7 @@ update_script() {
 
 uninstall_script() {
     echo -e "${RED}警告: 将删除所有配置和监控规则!${PLAIN}"
-    read -p "确认卸载? (输入 yes): " c
+    read -r -p "确认卸载？输入 yes 确认，直接回车取消: " c
     c=$(strip_cr "$c")
     [ "$c" != "yes" ] && return
 
@@ -2897,15 +2938,25 @@ if [ "${1:-}" == "--monitor" ]; then
         exit 1
     fi
 elif [ "${1:-}" == "--ipl" ]; then
-    echo -e "端口\t在线IP数\tIP列表"
-    echo -e "----\t--------\t------"
+    echo -e "$UI_DIVIDER"
+    echo -e " 当前 TCP 接入"
+    echo -e "$UI_DIVIDER"
     _ensure_unique_connection_snapshot || true
+    displayed=false
     for p in $(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n); do
         ips=$(_sentinel_scan_ips "$p")
-        cnt=0; [ -n "$ips" ] && cnt=$(echo "$ips" | wc -l)
-        list="-"; [ -n "$ips" ] && list=$(echo "$ips" | tr '\n' ' ')
-        echo -e "${p}\t${cnt}\t\t${list}"
+        cnt=0; [ -n "$ips" ] && cnt=$(printf '%s\n' "$ips" | grep -c .)
+        [ "$displayed" = "true" ] && echo
+        printf " 端口 %s · 在线 %s IP\n" "$p" "$cnt"
+        if [ -n "$ips" ]; then
+            while IFS= read -r ip; do
+                [ -n "$ip" ] && printf "   - %s\n" "$ip"
+            done <<< "$ips"
+        fi
+        displayed=true
     done
+    [ "$displayed" = "false" ] && echo -e " 暂无监控端口"
+    echo -e "$UI_DIVIDER"
 elif [ "${1:-}" == "update" ]; then
     update_script
 elif [ "${1:-}" == "uninstall" ]; then
