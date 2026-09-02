@@ -1582,7 +1582,7 @@ _update_burst_state() {
 
     if [ "$s_is_punished" == "true" ]; then
         if (( current_ts >= s_punish_end_ts )); then
-            s_is_punished=false; s_high_seconds=0
+            s_is_punished=false; s_high_seconds=0; s_punish_end_ts=0
             s_rules_dirty=true
             s_pending_qos_notice="recover"
         fi
