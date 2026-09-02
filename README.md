@@ -39,7 +39,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 
 *   👉 **[点击查看 Cloudflare 部署指南](部署教程.md)**
 
-PM 支持为每个监控端口设置用户到期日期，到期前 3 天通过本机 Telegram 告警提醒一次；Cloudflare 中控继续展示到期状态。
+PM 支持为每个监控端口设置用户到期日期，到期前 3 天通过本机 Telegram 通知提醒一次；Cloudflare 中控继续展示到期状态。
 
 ---
 

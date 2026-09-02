@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.3 (终端列表布局优化)
+# 版本: v5.6.4 (Telegram 模板与菜单整理)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.3"
+SCRIPT_VERSION="5.6.4"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -969,14 +969,12 @@ get_host_label() {
     
     # 附加用户 + 组名（底层继续使用 comment 字段以兼容旧配置与 Worker）
     local raw="$host_part"
-    local suffix=""
-    if [ -n "$group_id" ] && [ "$group_id" != "null" ]; then
-        suffix="${suffix} [组:$group_id]"
-    fi
     if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
-        suffix="${suffix} ($comment)"
+        raw="${raw} · ${comment}"
     fi
-    raw="${raw}${suffix}"
+    if [ -n "$group_id" ] && [ "$group_id" != "null" ]; then
+        raw="${raw} · 组 ${group_id}"
+    fi
     
     # 转义 Telegram Markdown V1 特殊字符: * _ ` [
     echo "$raw" | sed 's/[_*`\[]/\\&/g'
@@ -984,12 +982,12 @@ get_host_label() {
 
 fmt_bytes_plain() {
     local b=$1
-    [ -z "$b" ] || [ "$b" -eq 0 ] 2>/dev/null && echo "0B" && return
+    [ -z "$b" ] || [ "$b" -eq 0 ] 2>/dev/null && echo "0 B" && return
     echo "$b" | awk '{
-        if ($1>=1073741824) printf "%.1fGB", $1/1073741824
-        else if ($1>=1048576) printf "%.1fMB", $1/1048576
-        else if ($1>=1024) printf "%.1fKB", $1/1024
-        else printf "%dB", $1
+        if ($1>=1073741824) printf "%.1f GB", $1/1073741824
+        else if ($1>=1048576) printf "%.1f MB", $1/1048576
+        else if ($1>=1024) printf "%.1f KB", $1/1024
+        else printf "%d B", $1
     }'
 }
 
@@ -1073,17 +1071,11 @@ tg_notify_quota() {
     local icon="⚠️"
     [ "$threshold" -ge 100 ] && icon="🔴"
     
-    local port_info="\`${port}\`"
-    if [ -n "$group_id" ] && [ "$group_id" != "null" ]; then
-        local safe_group_id=$(echo "$group_id" | sed 's/[_*`\[]/\\&/g')
-        port_info="\`${port}\` (Group: $safe_group_id)"
-    fi
-
     tg_send "${icon} *流量预警*
 ${TG_DIVIDER}
 🖥 *${label}*
-├ 🔌 端口  ${port_info}
-├ 📦 流量  ${used_fmt} / ${quota_gb}GB
+├ 🔌 端口  \`${port}\`
+├ 📦 流量  ${used_fmt} / ${quota_gb} GB
 ├ 📋 统计  ${mode_str}
 └ 📈 使用  *${percent}%*
 ${TG_DIVIDER}
@@ -1096,16 +1088,16 @@ tg_notify_blocked() {
     local reset_str="手动重置"
     [ "$reset_day" -gt 0 ] 2>/dev/null && reset_str="每月 ${reset_day} 日自动重置"
     
-    local title="端口已封禁"
+    local title="流量已耗尽"
     if [ -n "$group_id" ] && [ "$group_id" != "null" ]; then
-        title="组流量耗尽 (Group Blocked)"
+        title="组流量已耗尽"
     fi
 
     tg_send "🚫 *${title}*
 ${TG_DIVIDER}
 🖥 *${label}*
 ├ 🔌 端口  \`${port}\`
-├ 📦 配额  ${quota_gb}GB
+├ 📦 配额  ${quota_gb} GB
 └ 🔄 重置  ${reset_str}
 ${TG_DIVIDER}
 ⛔ 流量配额已耗尽，服务连接已阻断"
@@ -2455,7 +2447,7 @@ config_port_menu() {
 
 configure_user_expiry() {
     local port=$1 value tmp
-    echo -e "\n用户到期前 3 天将通过本机 Telegram 告警提醒一次。"
+    echo -e "\n用户到期前 3 天将通过本机 Telegram 通知提醒一次。"
     read -r -p "到期日期（YYYY-MM-DD，0 为关闭，留空取消）: " value
     value=$(strip_cr "$value")
     [ -z "$value" ] && return 0
@@ -2562,10 +2554,10 @@ configure_notifications() {
         echo -e "$UI_DIVIDER"
         echo -e "   通知与推送"
         echo -e "$UI_DIVIDER"
-        echo -e " Telegram 告警    $tg_status"
+        echo -e " Telegram 通知    $tg_status"
         echo -e " Cloudflare 上报  $push_status"
         echo -e "$UI_SEPARATOR"
-        echo -e " 1. Telegram 告警设置"
+        echo -e " 1. Telegram 通知"
         echo -e " 2. Cloudflare 云端推送"
         echo -e " 0. 返回主菜单"
         echo -e "$UI_DIVIDER"
@@ -2596,18 +2588,18 @@ configure_telegram() {
 
         clear
         echo -e "$UI_DIVIDER"
-        echo -e "   Telegram 告警设置"
+        echo -e "   Telegram 通知"
         echo -e "$UI_DIVIDER"
         echo -e " 状态:      $status_str"
         echo -e " Bot 配置:  $bot_str"
         echo -e " 流量阈值:  ${t_thr}%"
         echo -e " API 地址:  $api_str"
         echo -e "$UI_SEPARATOR"
-        echo -e " 1. 开启/关闭通知"
-        echo -e " 2. 配置 Bot (Token + Chat ID)"
-        echo -e " 3. 发送测试消息"
-        echo -e " 4. 设置流量提醒阈值"
-        echo -e " 5. 设置 API 地址"
+        echo -e " 1. 配置 Bot（Token + Chat ID）"
+        echo -e " 2. 开启/关闭通知"
+        echo -e " 3. 设置 流量提醒阈值"
+        echo -e " 4. 设置 API 地址"
+        echo -e " 5. 发送测试消息"
         echo -e " 0. 返回通知与推送"
         echo -e "$UI_DIVIDER"
         read -r -p "请选择: " c
@@ -2616,15 +2608,6 @@ configure_telegram() {
 
         case $c in
             1)
-                local nv="true"; [ "$t_enable" == "true" ] && nv="false"
-                if [ "$nv" == "true" ] && { [ -z "$t_token" ] || [ -z "$t_chatid" ]; }; then
-                    echo -e "${RED}请先完成 Bot Token 和 Chat ID 配置。${PLAIN}"
-                    sleep 1
-                elif jq --argjson v "$nv" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。" "Telegram 状态写入失败"; then
-                    sleep 0.5
-                else sleep 1; fi ;;
-            2)
                 local new_token new_chatid
                 read -r -s -p "Bot Token（留空保留当前值）: " new_token; echo
                 new_token=$(strip_cr "$new_token")
@@ -2640,7 +2623,35 @@ configure_telegram() {
                     && commit_generated_config "$tmp" "Bot 配置已更新。" "Bot 配置写入失败"; then
                     sleep 0.5
                 else sleep 1; fi ;;
+            2)
+                local nv="true"; [ "$t_enable" == "true" ] && nv="false"
+                if [ "$nv" == "true" ] && { [ -z "$t_token" ] || [ -z "$t_chatid" ]; }; then
+                    echo -e "${RED}请先完成 Bot Token 和 Chat ID 配置。${PLAIN}"
+                    sleep 1
+                elif jq --argjson v "$nv" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" \
+                    && commit_generated_config "$tmp" "已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。" "Telegram 状态写入失败"; then
+                    sleep 0.5
+                else sleep 1; fi ;;
             3)
+                echo -e "当前阈值: ${t_thr}%"
+                read -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
+                val=$(strip_cr "$val")
+                if [[ "$val" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+                    local arr_json=$(echo "$val" | tr ',' '\n' | jq -s '.')
+                    if jq --argjson v "$arr_json" '.telegram.thresholds=$v' "$CONFIG_FILE" > "$tmp" \
+                        && commit_generated_config "$tmp" "阈值已更新。" "通知阈值写入失败"; then sleep 0.5; else sleep 1; fi
+                elif [ -n "$val" ]; then
+                    echo -e "${RED}格式错误，请输入纯数字并用逗号分隔。${PLAIN}"; sleep 1
+                fi ;;
+            4)
+                echo -e "当前 API: $t_api"
+                echo -e "留空恢复默认：https://api.telegram.org"
+                read -r -p "新 API 地址（留空恢复官方 API）: " val
+                val=$(strip_cr "$val")
+                [ -z "$val" ] && val="https://api.telegram.org"
+                if jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" \
+                    && commit_generated_config "$tmp" "API 地址已更新。" "Telegram API 地址写入失败"; then sleep 0.5; else sleep 1; fi ;;
+            5)
                 echo -e "${YELLOW}正在发送测试消息...${PLAIN}"
                 if [ -z "$t_token" ] || [ -z "$t_chatid" ]; then
                     echo -e "${RED}请先配置 Bot Token 和 Chat ID。${PLAIN}"; sleep 1
@@ -2663,25 +2674,6 @@ ${TG_DIVIDER}
                     fi
                     sleep 2
                 fi ;;
-            4)
-                echo -e "当前阈值: ${t_thr}%"
-                read -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
-                val=$(strip_cr "$val")
-                if [[ "$val" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-                    local arr_json=$(echo "$val" | tr ',' '\n' | jq -s '.')
-                    if jq --argjson v "$arr_json" '.telegram.thresholds=$v' "$CONFIG_FILE" > "$tmp" \
-                        && commit_generated_config "$tmp" "阈值已更新。" "通知阈值写入失败"; then sleep 0.5; else sleep 1; fi
-                elif [ -n "$val" ]; then
-                    echo -e "${RED}格式错误，请输入纯数字并用逗号分隔。${PLAIN}"; sleep 1
-                fi ;;
-            5)
-                echo -e "当前 API: $t_api"
-                echo -e "留空恢复默认：https://api.telegram.org"
-                read -r -p "新 API 地址（留空恢复官方 API）: " val
-                val=$(strip_cr "$val")
-                [ -z "$val" ] && val="https://api.telegram.org"
-                if jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "API 地址已更新。" "Telegram API 地址写入失败"; then sleep 0.5; else sleep 1; fi ;;
             0) rm -f "$tmp"; break ;;
         esac
         rm -f "$tmp"

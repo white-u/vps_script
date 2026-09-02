@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v3.0
+ * Cloudflare Worker - 端口流量查询中控 v3.2
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -13,6 +13,8 @@
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
+ * v3.2 变更: 增加 TG-ID 查询、权限操作引导、真实端口校验与删除确认
+ * v3.1 变更: 精简流量卡片并补全 Telegram 按钮菜单
  * v3.0 变更: 用户到期提醒改由 PM 本机 Telegram 发送，Worker 仅展示到期状态
  * v2.9 变更: 展示 PM v5.6.0 固定突发限速状态，并兼容旧节点基础限速字段
  * ============================================================
@@ -156,6 +158,8 @@ async function handleTelegram(request, env) {
       return isAdmin ? handleDelNode(env, chatId, text) : new Response("OK");
     case "/users":
       return isAdmin ? handleUsers(env, chatId) : new Response("OK");
+    case "/id":
+      return handleId(env, chatId, userId, isAdmin);
     case "/help":
     case "/start":
       return handleHelp(env, chatId, isAdmin);
@@ -190,6 +194,27 @@ async function handleCallbackQuery(env, callbackQuery) {
   if (data === "!all") {
     return showNodeReport(env, chatId, userId, isAdmin, "all", messageId);
   }
+  if (data === "!help") {
+    return handleHelp(env, chatId, isAdmin, messageId);
+  }
+  if (data === "!users") {
+    return isAdmin
+      ? handleUsers(env, chatId, messageId)
+      : handleHelp(env, chatId, false, messageId);
+  }
+  if (data === "!addhelp") {
+    return isAdmin
+      ? handleAdd(env, chatId, "/add", messageId)
+      : handleHelp(env, chatId, false, messageId);
+  }
+  if (data === "!delhelp") {
+    return isAdmin
+      ? handleDel(env, chatId, "/del", messageId)
+      : handleHelp(env, chatId, false, messageId);
+  }
+  if (data === "!id") {
+    return handleId(env, chatId, userId, isAdmin, messageId);
+  }
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(data)) {
     return deliverTelegram(env, chatId, messageId,
       formatNotice("❌", "按钮已失效", ["请返回节点列表后重新选择。"]),
@@ -214,22 +239,20 @@ async function showNodeMenu(env, chatId, userId, isAdmin, messageId = null) {
     const message = isAdmin
       ? formatNotice("📭", "暂无节点", ["当前还没有云端节点数据。"], "请确认 VPS 已开启 Cloudflare 推送。")
       : formatNotice("📭", "暂无授权节点", ["你当前没有可查询的节点。"]);
-    return deliverTelegram(env, chatId, messageId, message);
+    return deliverTelegram(env, chatId, messageId, message, helpKeyboard(isAdmin));
   }
 
   const now = Math.floor(Date.now() / 1000);
   let onlineCount = 0;
   let offlineCount = 0;
-  let message = `📡 *节点中心*\n${TG_DIVIDER}`;
+  let message = `📊 *流量查询*\n${TG_DIVIDER}`;
   for (const node of nodes) {
     const age = now - node.updated_at;
     const isOnline = age < 180;
     if (isOnline) onlineCount++; else offlineCount++;
-    message += `\n${isOnline ? "🟢" : "🔴"} \`${node.node_key}\` · ${escMd(node.node_id)} · ${fmtAge(age)}`;
   }
-  message += `\n${TG_DIVIDER}`;
   message += `\n🟢 在线 ${onlineCount}  ·  🔴 离线 ${offlineCount}`;
-  message += "\n\n👇 请选择要查看的节点";
+  message += `\n${TG_DIVIDER}\n请选择节点：`;
 
   return deliverTelegram(env, chatId, messageId, message, nodeMenuKeyboard(nodes, isAdmin));
 }
@@ -278,55 +301,118 @@ function reportInputFromRow(row, allowedPorts) {
 }
 
 function parseAllowedPorts(value) {
-  try { return JSON.parse(value); } catch { return []; }
+  try {
+    const ports = JSON.parse(value);
+    return Array.isArray(ports) ? ports : [];
+  } catch {
+    return [];
+  }
 }
 
 // ==============================================================
 // 4. /add - 添加/更新用户权限 (仅管理员)
-//    格式: /add <tg_id> <node> <port1,port2,...> [备注]
+//    格式: /add <tg_id> <node> <port1,port2,...> [用户]
 //    示例: /add 987654321 hk 8080,8081 小王
 // ==============================================================
-async function handleAdd(env, chatId, text) {
+async function handleAdd(env, chatId, text, messageId = null) {
   const args = text.split(/\s+/);
   // args[0]=/add, [1]=tg_id, [2]=node, [3]=ports, [4...]=comment
 
   if (args.length < 4) {
-    return tgReply(env, chatId, formatNotice(
-      "🧭", "添加用户权限",
-      ["命令 `/add 用户ID 节点 端口 [备注]`", "示例 `/add 987654321 hk 8080,8081 小王`"],
-      "多个端口使用英文逗号分隔。"
-    ));
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "➕", "添加或更新权限",
+      [
+        "`/add TG-ID 节点Key 端口 [用户名称]`",
+        "",
+        "示例 `/add 987654321 hk 8080,8081 小王`",
+        "",
+        "`TG-ID`  用户发送 /id 获取",
+        "`节点Key` 通过 /ll 查看",
+        "`端口`    多个端口用英文逗号分隔",
+        "`用户名称` 可省略；更新时省略会保留原名称"
+      ],
+      "重复添加会替换该用户在此节点的原端口列表。"
+    ), helpKeyboard(true));
   }
 
   const targetId = args[1];
   const nodeKey  = args[2].toLowerCase();
   const portsStr = args[3];
-  const comment  = args.slice(4).join(" ") || "";
+  const requestedComment = args.slice(4).join(" ").trim();
 
   // 校验用户 ID
-  if (!/^\d+$/.test(targetId)) {
-    return tgReply(env, chatId, formatNotice("❌", "用户 ID 无效", ["用户 ID 必须是纯数字。"]));
+  if (!/^\d{1,20}$/.test(targetId)) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "TG-ID 无效", ["TG-ID 必须是 1–20 位数字。", "用户可发送 /id 获取。"]),
+      helpKeyboard(true));
+  }
+  if (requestedComment.length > 64) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "用户名称过长", ["用户名称最多允许 64 个字符。"]),
+      helpKeyboard(true));
+  }
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(nodeKey)) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "节点 Key 无效", ["请通过 /ll 查看可用节点 Key。"]),
+      helpKeyboard(true));
   }
 
   // 校验节点存在
-  const node = await env.DB.prepare("SELECT node_key FROM nodes WHERE node_key = ?1").bind(nodeKey).first();
+  const node = await env.DB.prepare(
+    "SELECT node_key, config_json FROM nodes WHERE node_key = ?1"
+  ).bind(nodeKey).first();
   if (!node) {
-    return tgReply(env, chatId, formatNotice(
+    return deliverTelegram(env, chatId, messageId, formatNotice(
       "❌", "节点不存在", [`节点 \`${nodeKey}\` 尚未推送数据。`], "发送 /ll 查看可用节点。"
-    ));
+    ), helpKeyboard(true));
   }
 
-  // 解析端口
-  const ports = portsStr.split(",")
-    .map(p => parseInt(p.trim()))
-    .filter(p => p > 0 && p <= 65535);
+  // 严格解析并去重，避免把部分错误输入静默丢弃后仍然授权。
+  const rawPorts = portsStr.split(",").map(port => port.trim());
+  const parsedPorts = rawPorts.map(port => /^\d+$/.test(port) ? Number(port) : NaN);
+  if (parsedPorts.some(port => !Number.isSafeInteger(port) || port < 1 || port > 65535)) {
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "❌", "端口格式错误",
+      ["每个端口必须是 1–65535 的整数。", "多个端口请使用英文逗号分隔。"],
+      "示例 `8080,8081,443`"
+    ), helpKeyboard(true));
+  }
+  const ports = [...new Set(parsedPorts)].sort((a, b) => a - b);
 
-  if (ports.length === 0) {
-    return tgReply(env, chatId, formatNotice(
-      "❌", "端口格式错误", ["端口范围必须是 1–65535。"], "示例 `8080,8081,443`"
-    ));
+  let nodeConfig;
+  try {
+    nodeConfig = JSON.parse(node.config_json);
+  } catch {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "节点数据异常", [`节点 \`${nodeKey}\` 的上报数据无法解析。`]),
+      helpKeyboard(true));
+  }
+  const configuredPorts = Object.keys(
+    nodeConfig?.ports && typeof nodeConfig.ports === "object" && !Array.isArray(nodeConfig.ports)
+      ? nodeConfig.ports
+      : {}
+  ).filter(port => /^\d+$/.test(port)).map(Number)
+    .filter(port => Number.isSafeInteger(port) && port >= 1 && port <= 65535)
+    .sort((a, b) => a - b);
+  const configuredPortSet = new Set(configuredPorts);
+  const missingPorts = ports.filter(port => !configuredPortSet.has(port));
+  if (missingPorts.length) {
+    const shownPorts = configuredPorts.slice(0, 30).join(", ") || "无";
+    const suffix = configuredPorts.length > 30 ? " …" : "";
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "❌", "端口未被监控",
+      [
+        `无效端口  \`${missingPorts.join(", ")}\``,
+        `可用端口  \`${shownPorts}${suffix}\``
+      ],
+      "请先在对应 VPS 的 PM 中添加端口，并等待下一次云端上报。"
+    ), helpKeyboard(true));
   }
 
+  const existing = await env.DB.prepare(
+    "SELECT ports, comment FROM users WHERE user_id = ?1 AND node_key = ?2"
+  ).bind(targetId, nodeKey).first();
+  const comment = requestedComment || existing?.comment || "";
   const portsJson = JSON.stringify(ports);
 
   // 写入 D1 (UPSERT)
@@ -338,64 +424,143 @@ async function handleAdd(env, chatId, text) {
   ).bind(targetId, nodeKey, portsJson, comment).run();
 
   const lines = [
-    `👤 用户  \`${targetId}\``,
-    `🖥 节点  \`${nodeKey}\``,
-    `🔌 端口  \`${ports.join(", ")}\``
+    `👤 TG-ID  \`${targetId}\``,
+    `🖥 节点  \`${nodeKey}\``
   ];
-  if (comment) lines.push(`📝 备注  ${escMd(comment)}`);
-  return tgReply(env, chatId, formatNotice("✅", "权限已保存", lines));
+  if (existing) {
+    const oldPorts = parseAllowedPorts(existing.ports)
+      .map(Number).filter(port => Number.isSafeInteger(port) && port >= 1 && port <= 65535)
+      .sort((a, b) => a - b);
+    lines.push(`↩️ 原端口  \`${oldPorts.join(", ") || "无"}\``);
+    lines.push(`🔌 新端口  \`${ports.join(", ")}\``);
+  } else {
+    lines.push(`🔌 端口  \`${ports.join(", ")}\``);
+  }
+  if (comment) lines.push(`🏷 用户  ${escMd(comment)}`);
+  return deliverTelegram(env, chatId, messageId,
+    formatNotice("✅", existing ? "权限已更新" : "权限已添加", lines),
+    helpKeyboard(true));
 }
 
 // ==============================================================
 // 5. /del - 删除用户权限 (仅管理员)
-//    /del <tg_id>         → 删除该用户全部权限
-//    /del <tg_id> <node>  → 仅删除该用户对指定节点的权限
+//    /del <tg_id> --yes        → 删除该用户全部权限
+//    /del <tg_id> <node> --yes → 仅删除该用户对指定节点的权限
 // ==============================================================
-async function handleDel(env, chatId, text) {
+async function handleDel(env, chatId, text, messageId = null) {
   const args = text.split(/\s+/);
 
   if (args.length < 2) {
-    return tgReply(env, chatId, formatNotice(
-      "🧭", "删除用户权限",
-      ["`/del 987654321`  删除全部权限", "`/del 987654321 hk`  删除指定节点权限"]
-    ));
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "➖", "删除用户权限",
+      [
+        "删除指定节点：",
+        "`/del 987654321 hk`",
+        "",
+        "删除全部节点：",
+        "`/del 987654321`"
+      ],
+      "命令会先显示删除范围，追加 --yes 后才会执行。"
+    ), helpKeyboard(true));
   }
 
   const targetId = args[1];
-  if (!/^\d+$/.test(targetId)) {
-    return tgReply(env, chatId, formatNotice("❌", "用户 ID 无效", ["用户 ID 必须是纯数字。"]));
+  if (!/^\d{1,20}$/.test(targetId)) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "TG-ID 无效", ["TG-ID 必须是 1–20 位数字。"]),
+      helpKeyboard(true));
   }
 
-  if (args.length >= 3) {
-    // 删除指定节点
-    const nodeKey = args[2].toLowerCase();
+  const confirmed = args[args.length - 1]?.toLowerCase() === "--yes";
+  if (confirmed) args.pop();
+  if (args.length > 3) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "删除命令无效", ["请发送 /del 查看正确格式。"]),
+      helpKeyboard(true));
+  }
+
+  const nodeKey = args[2]?.toLowerCase() || "";
+  if (nodeKey && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(nodeKey)) {
+    return deliverTelegram(env, chatId, messageId,
+      formatNotice("❌", "节点 Key 无效", ["请发送 /del 查看正确格式。"]),
+      helpKeyboard(true));
+  }
+
+  if (!confirmed) {
+    if (nodeKey) {
+      const permission = await env.DB.prepare(
+        "SELECT ports FROM users WHERE user_id = ?1 AND node_key = ?2"
+      ).bind(targetId, nodeKey).first();
+      if (!permission) {
+        return deliverTelegram(env, chatId, messageId, formatNotice(
+          "⚠️", "未找到权限", [`用户 \`${targetId}\` 没有节点 \`${nodeKey}\` 的权限。`]
+        ), helpKeyboard(true));
+      }
+      const ports = parseAllowedPorts(permission.ports);
+      return deliverTelegram(env, chatId, messageId, formatNotice(
+        "⚠️", "确认删除权限",
+        [
+          `👤 TG-ID  \`${targetId}\``,
+          `🖥 节点  \`${nodeKey}\``,
+          `🔌 端口  \`${ports.join(", ") || "无"}\``,
+          "",
+          `确认命令 \`/del ${targetId} ${nodeKey} --yes\``
+        ],
+        "当前尚未删除。"
+      ), helpKeyboard(true));
+    }
+
+    const permissions = await env.DB.prepare(
+      "SELECT node_key FROM users WHERE user_id = ?1 ORDER BY node_key"
+    ).bind(targetId).all();
+    const rows = permissions.results || [];
+    if (!rows.length) {
+      return deliverTelegram(env, chatId, messageId,
+        formatNotice("⚠️", "暂无权限", [`用户 \`${targetId}\` 没有权限记录。`]),
+        helpKeyboard(true));
+    }
+    const nodeList = rows.slice(0, 12).map(row => row.node_key).join(", ");
+    const nodeSuffix = rows.length > 12 ? " …" : "";
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "⚠️", "确认清空权限",
+      [
+        `👤 TG-ID  \`${targetId}\``,
+        `🖥 节点  ${rows.length} 个`,
+        `📋 范围  \`${nodeList}${nodeSuffix}\``,
+        "",
+        `确认命令 \`/del ${targetId} --yes\``
+      ],
+      "当前尚未删除。"
+    ), helpKeyboard(true));
+  }
+
+  if (nodeKey) {
     const result = await env.DB.prepare(
       "DELETE FROM users WHERE user_id = ?1 AND node_key = ?2"
     ).bind(targetId, nodeKey).run();
 
-    if (result.meta.changes > 0) {
-      return tgReply(env, chatId, formatNotice(
-        "✅", "权限已删除", [`👤 用户  \`${targetId}\``, `🖥 节点  \`${nodeKey}\``]
-      ));
-    } else {
-      return tgReply(env, chatId, formatNotice(
-        "⚠️", "未找到权限", [`用户 \`${targetId}\` 没有节点 \`${nodeKey}\` 的权限。`]
-      ));
+    if ((result.meta?.changes || 0) > 0) {
+      return deliverTelegram(env, chatId, messageId, formatNotice(
+        "✅", "权限已删除", [`👤 TG-ID  \`${targetId}\``, `🖥 节点  \`${nodeKey}\``]
+      ), helpKeyboard(true));
     }
-  } else {
-    // 删除全部
-    const result = await env.DB.prepare(
-      "DELETE FROM users WHERE user_id = ?1"
-    ).bind(targetId).run();
-
-    if (result.meta.changes > 0) {
-      return tgReply(env, chatId, formatNotice(
-        "✅", "权限已清空", [`👤 用户  \`${targetId}\``, `🗑 删除  ${result.meta.changes} 条权限`]
-      ));
-    } else {
-      return tgReply(env, chatId, formatNotice("⚠️", "暂无权限", [`用户 \`${targetId}\` 没有权限记录。`]));
-    }
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "⚠️", "未找到权限", [`用户 \`${targetId}\` 没有节点 \`${nodeKey}\` 的权限。`]
+    ), helpKeyboard(true));
   }
+
+  const result = await env.DB.prepare(
+    "DELETE FROM users WHERE user_id = ?1"
+  ).bind(targetId).run();
+  const deletedCount = result.meta?.changes || 0;
+  if (deletedCount > 0) {
+    return deliverTelegram(env, chatId, messageId, formatNotice(
+      "✅", "权限已清空", [`👤 TG-ID  \`${targetId}\``, `🗑 删除  ${deletedCount} 条权限`]
+    ), helpKeyboard(true));
+  }
+  return deliverTelegram(env, chatId, messageId,
+    formatNotice("⚠️", "暂无权限", [`用户 \`${targetId}\` 没有权限记录。`]),
+    helpKeyboard(true));
 }
 
 // ==============================================================
@@ -452,25 +617,24 @@ async function handleDelNode(env, chatId, text) {
 // ==============================================================
 // 6. /users - 列出所有用户权限 (仅管理员)
 // ==============================================================
-async function handleUsers(env, chatId) {
+async function handleUsers(env, chatId, messageId = null) {
   const rows = await env.DB.prepare(
     "SELECT user_id, node_key, ports, comment FROM users ORDER BY user_id, node_key"
   ).all();
 
   if (!rows.results?.length) {
-    return tgReply(env, chatId, formatNotice(
+    return deliverTelegram(env, chatId, messageId, formatNotice(
       "📭", "暂无授权用户", ["当前没有普通用户权限记录。"], "使用 /add 添加用户。"
-    ));
+    ), helpKeyboard(true));
   }
 
   // 按 user_id 分组
   const grouped = {};
   for (const r of rows.results) {
     if (!grouped[r.user_id]) grouped[r.user_id] = { comment: r.comment || "", nodes: [] };
-    // 取最新的非空备注
+    // 取最新的非空用户名称
     if (r.comment && !grouped[r.user_id].comment) grouped[r.user_id].comment = r.comment;
-    let ports;
-    try { ports = JSON.parse(r.ports); } catch { ports = []; }
+    const ports = parseAllowedPorts(r.ports);
     grouped[r.user_id].nodes.push({ node: r.node_key, ports });
   }
 
@@ -486,31 +650,34 @@ async function handleUsers(env, chatId) {
   }
   msg += `\n${TG_DIVIDER}\n共 ${Object.keys(grouped).length} 位授权用户`;
 
-  return tgReply(env, chatId, msg);
+  return deliverTelegram(env, chatId, messageId, msg, helpKeyboard(true));
 }
 
 // ==============================================================
-// 7. /help
+// 7. /id 与 /help
 // ==============================================================
-async function handleHelp(env, chatId, isAdmin) {
-  let msg = `🧭 *命令中心*\n${TG_DIVIDER}\n`;
+async function handleId(env, chatId, userId, isAdmin, messageId = null) {
+  return deliverTelegram(env, chatId, messageId, formatNotice(
+    "👤", "你的 Telegram ID",
+    [`\`${userId}\``],
+    "请将此 ID 发送给管理员申请流量查询权限。"
+  ), helpKeyboard(isAdmin));
+}
+
+async function handleHelp(env, chatId, isAdmin, messageId = null) {
+  let msg = `🧭 *命令菜单*\n${TG_DIVIDER}`;
   if (isAdmin) {
-    msg += "\n📊 *流量查询*\n";
-    msg += "├ `/ll`  打开节点选择菜单\n";
-    msg += "├ `/ll hk`  指定节点\n";
-    msg += "└ `/ll all`  全部详情\n\n";
-    msg += "👥 *用户权限*\n";
-    msg += "├ `/users`  权限列表\n";
-    msg += "├ `/add ID 节点 端口 [备注]`\n";
-    msg += "└ `/del ID [节点]`\n\n";
-    msg += "🖥 *节点管理*\n";
-    msg += "├ `/delnode 节点`  删除节点及权限\n";
-    msg += "└ `/delnode 节点 --keep`  保留权限\n";
+    msg += "\n📊 `/ll`  流量查询";
+    msg += "\n👥 `/users`  用户权限";
+    msg += "\n➕ `/add`  添加说明";
+    msg += "\n➖ `/del`  删除说明";
+    msg += "\n🖥 `/delnode`  节点管理";
   } else {
-    msg += "\n📊 `/ll`  打开你的授权节点菜单\n";
+    msg += "\n📊 `/ll`  查询授权流量";
+    msg += "\n👤 `/id`  查看你的 TG-ID";
   }
-  msg += `\n${TG_DIVIDER}\n所有数据均来自 VPS 最近一次推送。`;
-  return tgReply(env, chatId, msg);
+  msg += `\n${TG_DIVIDER}\n请选择功能：`;
+  return deliverTelegram(env, chatId, messageId, msg, helpKeyboard(isAdmin));
 }
 
 // ==============================================================
@@ -554,10 +721,10 @@ function renderReport(input, geoMap) {
   const freshIcon = freshness < 180 ? "🟢" : "🔴";
   const freshStr = fmtAge(freshness);
 
-  let report = `📊 *流量详情*\n${TG_DIVIDER}`;
-  report += `\n🖥 *${escMd(nodeId)}*`;
+  let report = `📊 *${escMd(nodeId)}*`;
   report += `\n├ 节点 \`${nodeKey}\``;
   report += `\n└ 状态 ${freshIcon} ${freshStr}`;
+  report += `\n${TG_DIVIDER}`;
   let hasData = false;
 
   // PM 的分组配额按组内所有端口的合计流量执行，报告必须使用同一口径。
@@ -606,18 +773,19 @@ function renderReport(input, geoMap) {
     else if (pct >= 80)  statusIcon = "⚠️";
 
     const safeComment = comment ? ` · ${escMd(comment)}` : "";
-    const modeText = mode === "out_only" ? "仅出站" : "双向统计";
+    const modeText = mode === "out_only" ? "仅出站" : "双向";
     const policyParts = [modeText];
     if (groupId) policyParts.push(`分组 ${escMd(groupId)}`);
-    if (resetDay > 0) policyParts.push(`每月 ${resetDay} 日重置`);
+    if (resetDay > 0) policyParts.push(`${resetDay} 日重置`);
     if (burstEnabled) policyParts.push("突发保护");
     const expiryText = formatExpiryStatus(expiryDate, now);
-    if (expiryText) policyParts.push(expiryText);
 
-    report += `\n\n${statusIcon} *端口* \`${port}\`${safeComment}`;
-    report += `\n├ 📦 ${fmtBytes(totalUsed)} / ${quotaGb}GB`;
-    report += `\n├ ${formatProgressBar(pct)}  ${pct.toFixed(1)}%`;
+    report += `\n\n${statusIcon} \`${port}\`${safeComment}`;
+    report += `\n├ 📦 ${fmtBytes(totalUsed)} / ${quotaGb} GB · ${formatPercent(pct)}`;
     report += `\n├ ⚙️ ${policyParts.join(" · ")}`;
+    if (expiryText) {
+      report += `\n├ 📅 ${expiryText}`;
+    }
     if (isPunished) {
       report += `\n├ ⚡ 突发限速 ${burstLimitMbps} Mbps`;
     } else if (legacyLimitMbps > 0) {
@@ -626,7 +794,7 @@ function renderReport(input, geoMap) {
 
     const shownIps = onlineIps.slice(0, 8).map(ip => String(ip || "").trim()).filter(Boolean);
     const hasMore = onlineTruncated || onlineCount > shownIps.length;
-    report += `\n└ 👥 在线 *${onlineCount} IP*`;
+    report += `\n└ 👥 在线 ${onlineCount} IP`;
     for (let index = 0; index < shownIps.length; index++) {
       const branch = index === shownIps.length - 1 && !hasMore ? "└" : "├";
       report += `\n   ${branch} ${formatIpWithGeo(shownIps[index], geoMap)}`;
@@ -636,7 +804,7 @@ function renderReport(input, geoMap) {
   }
 
   if (!hasData) {
-    report += `\n${TG_DIVIDER}\n📭 暂无监控端口或无权访问。`;
+    report += `\n📭 暂无监控端口或无权访问。`;
   }
 
   return report;
@@ -685,10 +853,11 @@ function formatNotice(icon, title, lines = [], footer = "") {
   return message;
 }
 
-function formatProgressBar(percent) {
-  const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-  const filled = normalized > 0 ? Math.ceil(normalized / 12.5) : 0;
-  return `\`${"█".repeat(filled)}${"░".repeat(8 - filled)}\``;
+function formatPercent(percent) {
+  const value = Number(percent);
+  if (!Number.isFinite(value) || value <= 0) return "0.0%";
+  if (value < 0.1) return "<0.1%";
+  return `${value.toFixed(1)}%`;
 }
 
 function formatExpiryStatus(expiryDate, nowSeconds = Math.floor(Date.now() / 1000)) {
@@ -807,11 +976,11 @@ function escMd(s) {
 }
 
 function fmtBytes(bytes) {
-  if (bytes <= 0) return "0B";
+  if (bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0, val = bytes;
   while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
-  return val.toFixed(i === 0 ? 0 : 1) + units[i];
+  return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function fmtAge(seconds) {
@@ -823,17 +992,42 @@ function fmtAge(seconds) {
 
 function nodeMenuKeyboard(nodes, isAdmin) {
   const now = Math.floor(Date.now() / 1000);
-  const inlineKeyboard = nodes.map(node => [{
-    text: `${now - node.updated_at < 180 ? "🟢" : "🔴"} ${String(node.node_id || node.node_key).slice(0, 36)}`,
-    callback_data: node.node_key
-  }]);
+  const inlineKeyboard = nodes.map(node => {
+    const nodeKey = String(node.node_key);
+    const nodeName = String(node.node_id || nodeKey);
+    const label = nodeName === nodeKey ? nodeName : `${nodeName} · ${nodeKey}`;
+    return [{
+      text: `${now - node.updated_at < 180 ? "🟢" : "🔴"} ${label.slice(0, 48)}`,
+      callback_data: nodeKey
+    }];
+  });
   if (nodes.length > 1) {
     inlineKeyboard.push([{
       text: isAdmin ? "📚 查看全部节点" : "📚 查看全部授权节点",
       callback_data: "!all"
     }]);
   }
+  inlineKeyboard.push([{ text: "🧭 命令帮助", callback_data: "!help" }]);
   return { inline_keyboard: inlineKeyboard };
+}
+
+function helpKeyboard(isAdmin) {
+  if (!isAdmin) {
+    return { inline_keyboard: [[
+      { text: "📊 流量查询", callback_data: "!list" },
+      { text: "👤 我的 ID", callback_data: "!id" }
+    ]] };
+  }
+  return { inline_keyboard: [
+    [
+      { text: "📊 流量查询", callback_data: "!list" },
+      { text: "👥 用户权限", callback_data: "!users" }
+    ],
+    [
+      { text: "➕ 添加说明", callback_data: "!addhelp" },
+      { text: "➖ 删除说明", callback_data: "!delhelp" }
+    ]
+  ] };
 }
 
 function detailKeyboard(refreshTarget) {
