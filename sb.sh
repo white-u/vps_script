@@ -11,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.1"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -22,6 +22,8 @@ SB_BIN="/usr/local/bin/sing-box"
 SB_CONF_DIR="/usr/local/etc/sing-box"
 SB_CONF_FILE="${SB_CONF_DIR}/config.json"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
+OPENRC_FILE="/etc/init.d/sing-box"
+OPENRC_LOG_FILE="/var/log/sing-box.log"
 WORK_DIR="/var/lib/sing-box"
 
 # ✅ store metadata (pbk etc.) OUTSIDE sing-box config to avoid schema/strict parsing issues
@@ -81,7 +83,7 @@ run_menu_action() {
   local rc=0
   "$@" || rc=$?
   if [[ $rc -ne 0 ]]; then
-    echo -e "${RED}❌ ${label}失败（退出码 ${rc}）。服务日志: journalctl -u sing-box -n 30 --no-pager${PLAIN}" >&2
+    echo -e "${RED}❌ ${label}失败（退出码 ${rc}）。服务日志: $(service_log_hint)${PLAIN}" >&2
   fi
   return 0
 }
@@ -99,7 +101,12 @@ detect_pkg_mgr() {
 }
 
 check_deps() {
+  local pm
+  pm=$(detect_pkg_mgr)
   local deps=("curl" "tar" "jq" "openssl" "qrencode" "ss")
+  if [[ "$pm" == "apk" ]]; then
+    deps+=("bash" "rc-service" "rc-update" "pgrep")
+  fi
   local missing=()
   for d in "${deps[@]}"; do
     command -v "$d" >/dev/null 2>&1 || missing+=("$d")
@@ -108,9 +115,6 @@ check_deps() {
   if [[ ${#missing[@]} -eq 0 ]]; then return; fi
 
   echo -e "${YELLOW}缺少依赖: ${missing[*]}，正在安装...${PLAIN}"
-  local pm
-  pm=$(detect_pkg_mgr)
-
   case "$pm" in
     apt)
       if ! apt-get update -y; then
@@ -125,7 +129,10 @@ check_deps() {
       dnf install -y curl tar jq openssl qrencode iproute
       ;;
     apk)
-      apk add --no-cache curl tar jq openssl libqrencode-tools iproute2
+      apk add --no-cache bash curl tar jq openssl iproute2 openrc || true
+      if ! apk add --no-cache libqrencode-tools; then
+        echo -e "${YELLOW}警告: qrencode 安装失败，节点仍可使用，但不显示二维码。请确认 Alpine community 仓库已启用。${PLAIN}" >&2
+      fi
       ;;
     *)
       echo -e "${RED}无法识别包管理器，请手动安装: curl tar jq openssl qrencode iproute2${PLAIN}"
@@ -133,11 +140,99 @@ check_deps() {
   esac
 
   local hard=("curl" "tar" "jq" "openssl" "ss")
+  if [[ "$pm" == "apk" ]]; then
+    hard+=("bash" "rc-service" "rc-update" "pgrep")
+  fi
   local failed=()
   for d in "${hard[@]}"; do command -v "$d" >/dev/null 2>&1 || failed+=("$d"); done
   if [[ ${#failed[@]} -gt 0 ]]; then
     echo -e "${RED}依赖安装失败: ${failed[*]}，请手动安装后重试。${PLAIN}"
     exit 1
+  fi
+}
+
+detect_service_manager() {
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    echo "systemd"
+  elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    echo "openrc"
+  else
+    echo "unknown"
+  fi
+}
+
+require_service_manager() {
+  local manager
+  manager=$(detect_service_manager)
+  if [[ "$manager" == "unknown" ]]; then
+    echo -e "${RED}未检测到可用的 systemd 或 OpenRC，无法管理 sing-box 服务。${PLAIN}" >&2
+    return 1
+  fi
+}
+
+service_is_active() {
+  case "$(detect_service_manager)" in
+    systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
+    openrc)
+      rc-service sing-box status >/dev/null 2>&1 || return 1
+      # OpenRC 的 started 可能仅表示监督进程存活，核心已退出并等待重启。
+      local supervisor_pid
+      read -r supervisor_pid 2>/dev/null < /run/sing-box.pid || return 1
+      [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+      pgrep -P "$supervisor_pid" -f -x "$SB_BIN run -c $SB_CONF_FILE" >/dev/null 2>&1
+      ;;
+    *)       return 1 ;;
+  esac
+}
+
+service_restart() {
+  case "$(detect_service_manager)" in
+    systemd) systemctl restart sing-box ;;
+    openrc)  rc-service sing-box restart ;;
+    *) return 1 ;;
+  esac
+}
+
+service_stop() {
+  case "$(detect_service_manager)" in
+    systemd)
+      systemctl stop sing-box && return 0
+      # 首次安装失败后可能只有配置；仅容许明确不存在且未运行的服务。
+      local state
+      state=$(systemctl show sing-box -p LoadState -p ActiveState 2>/dev/null) || return 1
+      [[ "$state" == *"LoadState=not-found"* && "$state" == *"ActiveState=inactive"* ]]
+      ;;
+    openrc)
+      [[ ! -e "$OPENRC_FILE" && ! -e /run/sing-box.pid ]] && return 0
+      rc-service sing-box stop
+      ;;
+    *)       return 1 ;;
+  esac
+}
+
+service_disable() {
+  case "$(detect_service_manager)" in
+    systemd) systemctl disable sing-box >/dev/null 2>&1 ;;
+    openrc)  rc-update del sing-box default >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+remove_service_definition() {
+  local manager
+  manager=$(detect_service_manager)
+  service_disable || true
+  rm -f "$SYSTEMD_FILE" "$OPENRC_FILE" /run/sing-box.pid
+  if [[ "$manager" == "systemd" ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+service_log_hint() {
+  if [[ "$(detect_service_manager)" == "openrc" ]]; then
+    echo "tail -n 30 $OPENRC_LOG_FILE"
+  else
+    echo "journalctl -u sing-box -n 30 --no-pager"
   fi
 }
 
@@ -147,6 +242,17 @@ map_arch_sb() {
     aarch64|armv8*) echo "arm64" ;;
     *) echo -e "${RED}不支持的架构: $(uname -m)${PLAIN}"; exit 1 ;;
   esac
+}
+
+is_musl_system() {
+  [[ -f /etc/alpine-release ]] && return 0
+  ldd --version 2>&1 | grep -qi 'musl'
+}
+
+get_release_asset_name() {
+  local version=$1 arch=$2 libc_suffix=""
+  is_musl_system && libc_suffix="-musl"
+  echo "sing-box-${version}-linux-${arch}${libc_suffix}.tar.gz"
 }
 
 open_port() {
@@ -305,7 +411,7 @@ EOF
   fi
 }
 
-write_systemd() {
+write_systemd_service() {
   local tmp_service
   tmp_service=$(mktemp "${SYSTEMD_FILE}.new.XXXXXX") || {
     echo -e "${RED}无法创建 systemd 服务临时文件。${PLAIN}" >&2
@@ -345,27 +451,92 @@ EOF
   fi
 }
 
+write_openrc_service() {
+  local tmp_service
+  tmp_service=$(mktemp "${OPENRC_FILE}.new.XXXXXX") || {
+    echo -e "${RED}无法创建 OpenRC 服务临时文件。${PLAIN}" >&2
+    return 1
+  }
+  _CLEANUP_FILES+=("$tmp_service")
+  cat > "$tmp_service" <<EOF
+#!/sbin/openrc-run
+
+name="sing-box"
+description="sing-box Service"
+supervisor="supervise-daemon"
+command="$SB_BIN"
+command_args="run -c $SB_CONF_FILE"
+directory="$WORK_DIR"
+pidfile="/run/sing-box.pid"
+output_log="$OPENRC_LOG_FILE"
+error_log="$OPENRC_LOG_FILE"
+respawn_delay=10
+respawn_max=0
+retry="TERM/10/KILL/5"
+stopgroup=true
+no_new_privs=true
+umask=027
+
+depend() {
+  need net
+}
+
+start_pre() {
+  checkpath --directory --mode 0755 "$WORK_DIR"
+  ulimit -n 51200
+  "$SB_BIN" check -c "$SB_CONF_FILE"
+}
+EOF
+  chmod 755 "$tmp_service" || return 1
+  mv -f "$tmp_service" "$OPENRC_FILE" || return 1
+  if ! rc-update add sing-box default >/dev/null 2>&1; then
+    echo -e "${RED}sing-box OpenRC 开机启动设置失败。${PLAIN}" >&2
+    return 1
+  fi
+}
+
+write_service() {
+  case "$(detect_service_manager)" in
+    systemd) write_systemd_service ;;
+    openrc)  write_openrc_service ;;
+    *)
+      echo -e "${RED}未检测到可用的 systemd 或 OpenRC。${PLAIN}" >&2
+      return 1
+      ;;
+  esac
+}
+
 atomic_replace_file() {
   local source=$1 destination=$2 mode=$3
   local stage
   stage=$(mktemp "${destination}.new.XXXXXX") || return 1
   _CLEANUP_FILES+=("$stage")
-  install -m "$mode" "$source" "$stage" || return 1
+  cp "$source" "$stage" || return 1
+  chmod "$mode" "$stage" || return 1
   mv -f "$stage" "$destination"
 }
 
 show_service_logs() {
-  journalctl -u sing-box --no-pager -n 30 2>/dev/null | tail -30
+  if [[ "$(detect_service_manager)" == "openrc" ]]; then
+    if [[ -s "$OPENRC_LOG_FILE" ]]; then
+      tail -30 "$OPENRC_LOG_FILE"
+    else
+      rc-service sing-box status 2>&1 || true
+      echo -e "${YELLOW}尚无服务日志: $OPENRC_LOG_FILE${PLAIN}" >&2
+    fi
+  else
+    journalctl -u sing-box --no-pager -n 30 2>/dev/null | tail -30
+  fi
 }
 
 restart_singbox_checked() {
-  if ! systemctl restart sing-box; then
+  if ! service_restart; then
     echo -e "${RED}sing-box 重启命令失败。${PLAIN}" >&2
     show_service_logs
     return 1
   fi
   sleep 1
-  if ! systemctl is-active --quiet sing-box; then
+  if ! service_is_active; then
     echo -e "${RED}sing-box 重启后未处于运行状态。${PLAIN}" >&2
     show_service_logs
     return 1
@@ -393,7 +564,7 @@ migrate_config_if_needed() {
   [[ "$needs_guard" -eq 0 && "$has_removed_exit" -eq 0 ]] && return 0
 
   local tmp stage
-  tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json) || return 1
+  tmp=$(mktemp /tmp/sb_cfg.json.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp")
   cp "$SB_CONF_FILE" "$tmp" || return 1
   if [[ "$has_removed_exit" -eq 1 ]]; then
@@ -414,7 +585,7 @@ migrate_config_if_needed() {
   else
     echo -e "${YELLOW}检测到旧版安全路由，正在补充域名解析和私网保护...${PLAIN}"
   fi
-  if systemctl is-active --quiet sing-box 2>/dev/null; then
+  if service_is_active; then
     if safe_save_config "$tmp"; then
       [[ "$has_removed_exit" -eq 1 ]] && echo -e "${GREEN}旧跨机出口配置已清理，普通节点保持不变。${PLAIN}"
       return 0
@@ -478,7 +649,7 @@ safe_save_config() {
     if atomic_replace_file "$backup" "$SB_CONF_FILE" 640 && restart_singbox_checked; then
       echo -e "${YELLOW}已回滚到上一份有效配置，服务已恢复。${PLAIN}"
     else
-      echo -e "${RED}回滚后仍无法启动，请手动检查: journalctl -u sing-box -n 80${PLAIN}"
+      echo -e "${RED}回滚后仍无法启动，请手动检查: $(service_log_hint)${PLAIN}"
     fi
     rm -f "$backup"
   fi
@@ -565,7 +736,7 @@ install_singbox() {
       echo "$current_check" | tail -20
       return 1
     }
-    write_systemd || return 1
+    write_service || return 1
     restart_singbox_checked || return 1
     migrate_config_if_needed || return 1
     install_shortcut_cmd || return 1
@@ -573,16 +744,29 @@ install_singbox() {
   fi
 
   echo -e "${YELLOW}正在下载 sing-box ${latest_ver} (${arch})...${PLAIN}"
-  local asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
+  local asset_name
+  asset_name=$(get_release_asset_name "$latest_ver" "$arch")
   local url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
   local tmp_tgz tmp_dir
-  tmp_tgz=$(mktemp /tmp/sb_XXXXXX.tgz)
-  tmp_dir=$(mktemp -d /tmp/sb_XXXXXX.dir)
-  _CLEANUP_FILES+=("$tmp_tgz" "$tmp_dir")
+  tmp_tgz=$(mktemp /tmp/sb.tgz.XXXXXX) || return 1
+  _CLEANUP_FILES+=("$tmp_tgz")
+  tmp_dir=$(mktemp -d /tmp/sb.dir.XXXXXX) || return 1
+  _CLEANUP_FILES+=("$tmp_dir")
 
   if ! curl -fL --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
-    echo -e "${RED}下载失败：${url}${PLAIN}"
-    return 1
+    # 旧版 sing-box 尚未单列 musl 资产，当时的通用 Linux 构建为静态链接。
+    if [[ "$asset_name" == *-musl.tar.gz ]]; then
+      asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
+      url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
+      echo -e "${YELLOW}该版本没有独立 musl 文件，尝试旧版通用静态构建...${PLAIN}"
+      if ! curl -fL --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+        echo -e "${RED}下载失败：${url}${PLAIN}"
+        return 1
+      fi
+    else
+      echo -e "${RED}下载失败：${url}${PLAIN}"
+      return 1
+    fi
   fi
 
   local expected_digest actual_digest
@@ -644,7 +828,7 @@ install_singbox() {
     return 1
   fi
 
-  if write_systemd && restart_singbox_checked; then
+  if write_service && restart_singbox_checked; then
     echo -e "${GREEN}sing-box 已更新到 ${latest_ver} 并启动成功。${PLAIN}"
     [[ -n "$old_binary" ]] && rm -f "$old_binary"
     migrate_config_if_needed || return 1
@@ -657,14 +841,15 @@ install_singbox() {
     if atomic_replace_file "$old_binary" "$SB_BIN" 755 && restart_singbox_checked; then
       echo -e "${YELLOW}已恢复 sing-box ${curr_ver}，服务重新运行。${PLAIN}"
     else
-      echo -e "${RED}旧核心恢复失败，请立即检查: journalctl -u sing-box -n 80${PLAIN}" >&2
+      echo -e "${RED}旧核心恢复失败，请立即检查: $(service_log_hint)${PLAIN}" >&2
     fi
   else
+    if ! service_stop; then
+      echo -e "${RED}首次安装失败且服务无法停止，已保留文件，请检查: $(service_log_hint)${PLAIN}" >&2
+      return 1
+    fi
     rm -f "$SB_BIN"
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl disable sing-box >/dev/null 2>&1 || true
-    rm -f "$SYSTEMD_FILE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    remove_service_definition
     echo -e "${RED}首次安装失败，已移除不可用核心。${PLAIN}" >&2
   fi
   return 1
@@ -747,7 +932,7 @@ meta_set_pubkey() {
   local pubk=$2
   init_meta_if_missing || return 1
   local tmp
-  tmp=$(mktemp "${META_FILE}.new.XXXXXX")
+  tmp=$(mktemp "${META_FILE}.new.XXXXXX") || return 1
   _CLEANUP_FILES+=("$tmp")
   if ! jq --arg t "$tag" --arg pk "$pubk" '
     .[$t] = (.[$t] // {}) | .[$t].public_key = $pk
@@ -768,7 +953,7 @@ meta_del_tag() {
   local tag=$1
   [[ -f "$META_FILE" ]] || return
   local tmp
-  tmp=$(mktemp "${META_FILE}.new.XXXXXX")
+  tmp=$(mktemp "${META_FILE}.new.XXXXXX") || return 1
   _CLEANUP_FILES+=("$tmp")
   jq --arg t "$tag" 'del(.[$t])' "$META_FILE" > "$tmp" || return 1
   chmod 600 "$tmp" && mv -f "$tmp" "$META_FILE"
@@ -887,10 +1072,10 @@ add_reality() {
   local sid; sid=$(openssl rand -hex 4)
   local tag="reality_${port}"
 
-  local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
+  local tmp; tmp=$(mktemp /tmp/sb_cfg.json.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp")
   _CLEANUP_FILES+=("${tmp}.1")
-  cp "$SB_CONF_FILE" "$tmp"
+  cp "$SB_CONF_FILE" "$tmp" || return 1
 
   ensure_private_reject_rule "$tmp" || {
     echo -e "${RED}无法生成基础安全路由规则。${PLAIN}" >&2
@@ -951,10 +1136,10 @@ add_ss2022() {
   [[ -n "$key" ]] || { echo -e "${RED}生成 Shadowsocks-2022 密钥失败。${PLAIN}"; return 1; }
   local tag="ss_${port}"
 
-  local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
+  local tmp; tmp=$(mktemp /tmp/sb_cfg.json.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp")
   _CLEANUP_FILES+=("${tmp}.1")
-  cp "$SB_CONF_FILE" "$tmp"
+  cp "$SB_CONF_FILE" "$tmp" || return 1
 
   ensure_private_reject_rule "$tmp" || {
     echo -e "${RED}无法生成基础安全路由规则。${PLAIN}" >&2
@@ -1068,7 +1253,7 @@ delete_node() {
   proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .type' "$SB_CONF_FILE" 2>/dev/null)
   echo -e "${YELLOW}正在删除: ${tag} ...${PLAIN}"
 
-  local tmp; tmp=$(mktemp /tmp/sb_cfg.XXXXXX.json)
+  local tmp; tmp=$(mktemp /tmp/sb_cfg.json.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp")
   if ! jq --arg t "$tag" '
     del(.inbounds[] | select(.tag==$t)) |
@@ -1134,7 +1319,7 @@ uninstall_all() {
   cf=$(strip_cr "$cf")
   [[ "${cf,,}" != "yes" ]] && return
 
-  if systemctl is-active --quiet sing-box 2>/dev/null && ! systemctl stop sing-box; then
+  if ! service_stop; then
     echo -e "${RED}sing-box 停止失败；为避免服务状态与清理结果不一致，已取消卸载。${PLAIN}" >&2
     return 1
   fi
@@ -1151,12 +1336,10 @@ uninstall_all() {
     done < <(jq -r '.inbounds[]? | select(.listen_port != null) | [.listen_port, .type, .tag] | @tsv' "$SB_CONF_FILE" 2>/dev/null)
   fi
 
-  systemctl disable sing-box >/dev/null 2>&1 || true
-  rm -f "$SYSTEMD_FILE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  remove_service_definition
 
   rm -rf "$SB_CONF_DIR" "$WORK_DIR"
-  rm -f "$SB_BIN"
+  rm -f "$SB_BIN" "$OPENRC_LOG_FILE"
   rm -f "$INSTALL_PATH"
 
   echo -e "${GREEN}卸载完成。${PLAIN}"
@@ -1166,6 +1349,7 @@ uninstall_all() {
 main_menu() {
   local choice id t
   check_deps
+  require_service_manager || exit 1
   init_meta_if_missing || exit 1
   if [[ -x "$SB_BIN" ]]; then
     migrate_config_if_needed || {
@@ -1184,7 +1368,7 @@ main_menu() {
     [[ "$ver" != "none" && "$ver" != "unknown" ]] && ver_text=" v${ver}"
     if [[ ! -x "$SB_BIN" ]]; then
       st="${YELLOW}● 未安装${PLAIN}"
-    elif systemctl is-active --quiet sing-box; then
+    elif service_is_active; then
       st="${GREEN}● 运行中${PLAIN}"
     else
       st="${RED}● 已停止${PLAIN}"

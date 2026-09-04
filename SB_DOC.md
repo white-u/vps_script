@@ -1,6 +1,6 @@
 # sing-box 多协议管理脚本（sb.sh）
 
-**脚本版本**：v1.3.1　|　**快捷命令**：`sb`　|　**安装路径**：`/usr/local/bin/sb`
+**脚本版本**：v1.4.1　|　**快捷命令**：`sb`　|　**安装路径**：`/usr/local/bin/sb`
 
 本文档及脚本生成的配置已按 sing-box **1.14.0** 官方配置结构核对（2026-08-31）。脚本只使用稳定版发布，不自动安装预发布版本。
 
@@ -21,9 +21,20 @@ Reality 只开放 TCP 防火墙端口；Shadowsocks 2022 同时开放 TCP 和 UD
 
 ## 2. 安装与菜单
 
+Debian、Ubuntu 等已带 Bash 的系统：
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/sb.sh)
 ```
+
+Alpine Linux 3.21 的最小系统通常未预装 Bash，首次运行使用：
+
+```bash
+apk add --no-cache bash curl
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/sb.sh)"
+```
+
+脚本在 Alpine 上自动安装其余依赖并使用 OpenRC 管理服务；在 systemd 系统上保持原有管理方式。
 
 安装后运行：
 
@@ -55,6 +66,8 @@ sb
 | 主配置 | `/usr/local/etc/sing-box/config.json` |
 | 节点元数据 | `/usr/local/etc/sing-box/nodes_meta.json` |
 | systemd 服务 | `/etc/systemd/system/sing-box.service` |
+| Alpine OpenRC 服务 | `/etc/init.d/sing-box` |
+| Alpine OpenRC 日志 | `/var/log/sing-box.log` |
 | 工作目录 | `/var/lib/sing-box` |
 
 Reality 服务端配置只需要保存私钥；导出 `vless://` 分享链接还需要公钥。因此脚本把公钥按节点标签保存在权限为 `600` 的 `nodes_meta.json` 中，不把非 sing-box 配置字段混入主配置。
@@ -68,7 +81,7 @@ Reality 服务端配置只需要保存私钥；导出 `vless://` 分享链接还
 3. 验证候选核心报告的版本与目标版本一致。
 4. 使用候选核心对现有配置执行 `sing-box check`。
 5. 备份旧核心并原子替换二进制。
-6. 重写并重载 systemd 服务，重启后检查运行状态。
+6. 根据系统重写 systemd 或 OpenRC 服务，设置开机自启，重启后检查运行状态。
 7. 新核心失败时恢复旧核心并再次启动。
 
 配置不兼容时旧核心不会被覆盖；启动失败会打印服务日志并返回失败，不会显示为更新成功。
@@ -98,9 +111,26 @@ v1.3.0 已移除 SS2022 跨机出口中继、节点链式出站和旧 SOCKS5 上
 
 ## 7. 卸载
 
-菜单 7 会停止并禁用服务，按节点协议清理防火墙端口，并删除核心、配置、工作目录和管理脚本。该操作需要输入 `yes` 确认。
+菜单 7 会通过 systemd 或 OpenRC 停止并禁用服务，按节点协议清理防火墙端口，并删除核心、配置、工作目录、OpenRC 日志和管理脚本。该操作需要输入 `yes` 确认。
 
-## 8. 官方参考
+## 8. Alpine 3.21 支持范围
+
+- 支持 `x86_64` 与 `aarch64`；Alpine 自动选择 sing-box 官方 `-musl` 发布文件，避免通用 glibc 构建无法启动。
+- 使用 `apk` 安装 Bash、curl、tar、jq、OpenSSL、qrencode、iproute2 与 OpenRC。
+- OpenRC 服务使用 `supervise-daemon` 保持前台核心运行，异常退出后自动重启，并加入 `default` runlevel。
+- 安装、配置更新、运行状态检查、核心回滚和卸载均通过统一服务接口执行。
+- 菜单运行状态同时检查 OpenRC 和实际核心子进程，避免将“等待重启”误报为运行中；启动失败会打印日志并回滚。检查仅在菜单操作时执行，不新增后台轮询。
+- 临时文件兼容 Alpine 自带 BusyBox，无需额外安装 GNU coreutils。卸载会先停止服务（包括等待重启状态），停止失败则保留文件。
+- 如果系统没有启用 UFW、firewalld 或 iptables，脚本不会自行创建一套新防火墙；云厂商安全组仍需用户自行放行。
+
+OpenRC 环境查看状态与日志：
+
+```bash
+rc-service sing-box status
+tail -n 30 /var/log/sing-box.log
+```
+
+## 9. 官方参考
 
 - [VLESS 入站](https://sing-box.sagernet.org/configuration/inbound/vless/)
 - [TLS / Reality](https://sing-box.sagernet.org/configuration/shared/tls/#reality-fields)
@@ -108,3 +138,5 @@ v1.3.0 已移除 SS2022 跨机出口中继、节点链式出站和旧 SOCKS5 上
 - [路由规则动作](https://sing-box.sagernet.org/configuration/route/rule_action/)
 - [1.14.0 迁移说明](https://sing-box.sagernet.org/migration/#1140)
 - [SIP002 URI Scheme](https://github.com/shadowsocks/shadowsocks-org/wiki/SIP002-URI-Scheme)
+- [Alpine OpenRC](https://wiki.alpinelinux.org/wiki/OpenRC)
+- [OpenRC 服务脚本指南](https://github.com/OpenRC/openrc/blob/master/service-script-guide.md)

@@ -5,7 +5,7 @@
 # 子脚本: snell (Snell代理), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="2.2.0"
+VT_VERSION="2.2.2"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
@@ -25,7 +25,7 @@ strip_cr() { echo "${1//$'\r'/}"; }
 report_child_exit() {
     local name=$1 rc=$2
     if [[ $rc -ne 0 ]]; then
-        echo -e "${RED}❌ ${name} 异常退出（退出码 ${rc}）。请查看上方错误信息和对应 systemd 日志。${PLAIN}" >&2
+        echo -e "${RED}❌ ${name} 异常退出（退出码 ${rc}）。请查看上方错误信息和对应服务日志。${PLAIN}" >&2
     fi
 }
 
@@ -127,7 +127,7 @@ fw_installed()    { [[ -x /usr/local/bin/realm ]]; }
 
 # 获取版本号
 snell_version() { cat /etc/snell/.version 2>/dev/null || echo "?"; }
-sb_version()    { /usr/local/bin/sing-box version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
+sb_version()    { /usr/local/bin/sing-box version 2>/dev/null | sed -nE 's/^sing-box version v?([^[:space:]]+).*/\1/p' | head -1 || echo "?"; }
 pm_version() {
     local version
     version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' /usr/local/bin/pm 2>/dev/null | head -n 1)
@@ -224,22 +224,49 @@ nuke_all() {
     # === sing-box ===
     if sb_installed || [[ -d /usr/local/etc/sing-box ]]; then
         echo -e " ${YELLOW}清理 sing-box...${PLAIN}"
-        # 先读端口再删文件 (顺序不能反)
-        if [[ -f /usr/local/etc/sing-box/config.json ]]; then
-            local p
-            for p in $(jq -r '.inbounds[]?.listen_port // empty' /usr/local/etc/sing-box/config.json 2>/dev/null); do
-                close_port "$p"
-            done
-        fi
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-        rm -f /etc/systemd/system/sing-box.service
-        rm -rf /usr/local/etc/sing-box /var/lib/sing-box
-        rm -f /usr/local/bin/sing-box /usr/local/bin/sb
-        if sb_installed || [[ -d /usr/local/etc/sing-box ]] || systemctl is-active --quiet sing-box 2>/dev/null; then
-            cleanup_warn "sing-box 文件或服务仍然存在"
+        local sb_manager="none" sb_stop_ok=true
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            sb_manager="systemd"
+            if ! systemctl stop sing-box; then
+                local sb_state
+                sb_state=$(systemctl show sing-box -p LoadState -p ActiveState 2>/dev/null) || sb_state=""
+                if [[ "$sb_state" != *"LoadState=not-found"* || "$sb_state" != *"ActiveState=inactive"* ]]; then
+                    sb_stop_ok=false
+                fi
+            fi
+        elif command -v rc-service >/dev/null 2>&1; then
+            sb_manager="openrc"
+            if [[ -e /etc/init.d/sing-box || -e /run/sing-box.pid ]] \
+               && ! rc-service sing-box stop; then
+                sb_stop_ok=false
+            fi
         else
-            echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+            sb_stop_ok=false
+        fi
+
+        if [[ "$sb_stop_ok" != "true" ]]; then
+            cleanup_warn "sing-box 服务停止失败，已保留其文件和防火墙规则"
+        else
+            # 先读端口再删配置，服务未成功停止时不会提前关闭端口。
+            if [[ -f /usr/local/etc/sing-box/config.json ]]; then
+                local p
+                for p in $(jq -r '.inbounds[]?.listen_port // empty' /usr/local/etc/sing-box/config.json 2>/dev/null); do
+                    close_port "$p"
+                done
+            fi
+            if [[ "$sb_manager" == "systemd" ]]; then
+                systemctl disable sing-box >/dev/null 2>&1 || true
+            elif [[ "$sb_manager" == "openrc" ]]; then
+                rc-update del sing-box default >/dev/null 2>&1 || true
+            fi
+            rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box
+            rm -rf /usr/local/etc/sing-box /var/lib/sing-box
+            rm -f /usr/local/bin/sing-box /usr/local/bin/sb /var/log/sing-box.log /run/sing-box.pid
+            if sb_installed || [[ -d /usr/local/etc/sing-box ]]; then
+                cleanup_warn "sing-box 文件仍然存在"
+            else
+                echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+            fi
         fi
     fi
 
@@ -289,7 +316,9 @@ nuke_all() {
         fi
     fi
 
-    systemctl daemon-reload 2>/dev/null || cleanup_warn "systemd daemon-reload 失败"
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload 2>/dev/null || cleanup_warn "systemd daemon-reload 失败"
+    fi
 
     echo ""
     if [[ $CLEANUP_FAILURES -gt 0 ]]; then

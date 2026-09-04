@@ -46,8 +46,9 @@ PM 支持为每个监控端口设置用户到期日期，到期前 3 天通过�
 ## 📦 兼容性
 
 *   **架构:** amd64 (x86_64), arm64 (aarch64)
-*   **系统:** Debian 10+, Ubuntu 20.04+ (推荐)
-    *   *CentOS/Alpine 部分脚本支持，但未经充分测试。*
+*   **系统:** Debian 10+、Ubuntu 20.04+（推荐）
+    *   `sb.sh` 支持 Alpine Linux 3.21（OpenRC）；Alpine 最小系统首次运行前需安装 `bash` 与 `curl`。
+    *   CentOS 及 Alpine 上的其他模块仍属于部分支持范围。
 
 ## ⚠️ 免责声明
 
