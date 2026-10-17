@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.4 (Telegram 模板与菜单整理)
+# 版本: v5.6.6 (流量监控稳定性修复)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.4"
+SCRIPT_VERSION="5.6.6"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -56,6 +56,17 @@ pm_error() {
     fi
 }
 
+pm_info() {
+    local message="$*"
+    local line="$(date '+%Y-%m-%d %H:%M:%S') [INFO] ${message}"
+    if ! printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null; then
+        command -v logger >/dev/null 2>&1 && logger -t port-monitor -- "$line" 2>/dev/null || true
+        printf '成功日志写入失败 (%s): %s\n' "$LOG_FILE" "$line" >&2
+    fi
+    # 日志写入失败不改变已确认的发送结果，避免因此重复推送。
+    return 0
+}
+
 rotate_pm_log() {
     [ -f "$LOG_FILE" ] || return 0
     local size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
@@ -74,19 +85,19 @@ _UNIQUE_CONNECTION_SNAPSHOT_FILE=""
 _CONNECTION_SNAPSHOT_TS=0
 _SENTINEL_GEO_REQUESTS=0
 _TG_SYNC_FAILED=false
+_TG_LAST_FAILURE_SCOPE=""
+_TG_LAST_FAILURE_DETAIL=""
 _MENU_LOCK_HELD=false
 _global_cleanup() {
     for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
         rm -rf "$f" 2>/dev/null
     done
-    # 仅菜单模式才删除编辑锁, cron(--monitor) 模式不能删(锁可能属于菜单进程)
-    if [ "$_IS_MENU_MODE" == "true" ]; then
+    # 只有本进程实际持有编辑锁才释放，避免只读菜单退出时删除别人的信号文件。
+    if [ "$_MENU_LOCK_HELD" == "true" ]; then
         rm -f "$USER_EDIT_LOCK" 2>/dev/null
-        if [ "$_MENU_LOCK_HELD" == "true" ]; then
-            flock -u 8 2>/dev/null || true
-            exec 8>&-
-            _MENU_LOCK_HELD=false
-        fi
+        flock -u 8 2>/dev/null || true
+        exec 8>&-
+        _MENU_LOCK_HELD=false
     fi
 }
 trap _global_cleanup EXIT
@@ -186,7 +197,8 @@ validate_config_candidate() {
         type == "object" and (.ports | type == "object") and
         all(.ports | to_entries[];
             (.key | try tonumber catch null) as $port |
-            $port != null and $port >= 1 and $port <= 65535 and
+            (.key | test("^[0-9]+$")) and
+            $port != null and $port == ($port | floor) and $port >= 1 and $port <= 65535 and
             (.value | type == "object") and
             ((.value.quota_gb | type) == "number") and
             (.value.quota_gb == (.value.quota_gb | floor)) and
@@ -524,7 +536,10 @@ migrate_config() {
         local _mig_ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
         for _mp in $_mig_ports; do
             local _sf="$STATE_DIR/${_mp}.txt"
-            [ -f "$_sf" ] && continue  # 已有则跳过
+            if [ -f "$_sf" ]; then
+                [ -s "$_sf" ] || { pm_error "端口 ${_mp} 的已有迁移状态为空，请检查后重试"; return 1; }
+                continue
+            fi
             IFS=$'\t' read -r _ai _ao _ki _ko _lrt _ql _lat _laips <<< \
                 "$(echo "$tmp_json" | jq -r ".ports[\"$_mp\"] | [
                     ((.stats.acc_in//0)|floor), ((.stats.acc_out//0)|floor),
@@ -534,24 +549,15 @@ migrate_config() {
                     (.ip_limit.last_alert_ts//0),
                     ((.ip_limit.last_alert_ips//[]) | join(\",\"))
                 ] | @tsv")"
-            cat > "$_sf" << MEOF
-s_acc_in=${_ai:-0}
-s_acc_out=${_ao:-0}
-s_last_k_in=${_ki:-0}
-s_last_k_out=${_ko:-0}
-s_last_reset_ts=${_lrt:-0}
-s_state_version=$PORT_STATE_VERSION
-s_high_seconds=0
-s_is_punished=false
-s_punish_end_ts=0
-s_quota_level=${_ql:-0}
-s_punish_notified=false
-s_recover_notified=true
-s_last_alert_ts=${_lat:-0}
-s_last_alert_ips=${_laips:-}
-s_ip_alert_level=0
-s_expiry_notified_date=
-MEOF
+            local _mv
+            for _mv in "$_ai" "$_ao" "$_ki" "$_ko" "$_lrt" "$_ql" "$_lat"; do
+                [[ "$_mv" =~ ^[0-9]+$ ]] || { pm_error "端口 ${_mp} 的旧流量状态无效，迁移已停止"; return 1; }
+            done
+            _init_port_state_defaults
+            s_acc_in=$_ai; s_acc_out=$_ao; s_last_k_in=$_ki; s_last_k_out=$_ko
+            s_last_reset_ts=$_lrt; s_quota_level=$_ql; s_last_alert_ts=$_lat
+            s_last_alert_ips=${_laips:-}
+            _save_port_state "$_mp" || { pm_error "端口 ${_mp} 的状态迁移未完成，配置版本保持不变"; return 1; }
         done
         tmp_json=$(echo "$tmp_json" | jq '.config_version = 3')
         modified=true
@@ -617,49 +623,71 @@ MEOF
 # 2. 网络引擎模块 (Nftables + TC)
 # ==============================================================================
 
+# 仅刷新规则和集合，不销毁 named counter；同一批次由 nft 原子提交。
+_write_nft_base_rules() {
+    cat << RULES
+add table $NFT_TABLE
+add set $NFT_TABLE blocked_ports { type inet_service; }
+add map $NFT_TABLE $TC_CLASS_MAP { type inet_service : classid; }
+add chain $NFT_TABLE input { type filter hook input priority -5; }
+add chain $NFT_TABLE output { type filter hook output priority -5; }
+flush chain $NFT_TABLE input
+flush chain $NFT_TABLE output
+flush set $NFT_TABLE blocked_ports
+flush map $NFT_TABLE $TC_CLASS_MAP
+add rule $NFT_TABLE input tcp dport @blocked_ports drop
+add rule $NFT_TABLE input udp dport @blocked_ports drop
+add rule $NFT_TABLE output tcp sport @blocked_ports drop
+add rule $NFT_TABLE output udp sport @blocked_ports drop
+add rule $NFT_TABLE output meta priority set tcp sport map @$TC_CLASS_MAP
+add rule $NFT_TABLE output meta priority set udp sport map @$TC_CLASS_MAP
+RULES
+}
+
 init_nft_table() {
-    nft list table $NFT_TABLE &>/dev/null
-    if [ $? -ne 0 ]; then
-        nft add table $NFT_TABLE || { echo -e "${RED}[错误] 无法创建 nft 表，请检查 nftables 是否正常。${PLAIN}" >&2; return 1; }
-        nft add set $NFT_TABLE blocked_ports { type inet_service\; } || {
-            pm_error "无法创建 Nftables blocked_ports 集合"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        nft add map $NFT_TABLE "$TC_CLASS_MAP" { type inet_service : classid\; } || {
-            pm_error "无法创建 Nftables ${TC_CLASS_MAP} 映射"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        # 优先级 -5，确保先计数再通过系统防火墙(UFW等通常是0)
-        nft add chain $NFT_TABLE input { type filter hook input priority -5\; } || {
-            pm_error "无法创建 Nftables input 链"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        nft add chain $NFT_TABLE output { type filter hook output priority -5\; } || {
-            pm_error "无法创建 Nftables output 链"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        
-        # 显式拆分 TCP/UDP，修复部分内核兼容性
-        nft add rule $NFT_TABLE input tcp dport @blocked_ports drop || { pm_error "无法创建 TCP 入站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
-        nft add rule $NFT_TABLE input udp dport @blocked_ports drop || { pm_error "无法创建 UDP 入站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
-        nft add rule $NFT_TABLE output tcp sport @blocked_ports drop || { pm_error "无法创建 TCP 出站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
-        nft add rule $NFT_TABLE output udp sport @blocked_ports drop || { pm_error "无法创建 UDP 出站封禁规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1; }
-        # 只有实际限速端口才在 map 中；直接设置 TC classid，不占用 packet mark。
-        nft add rule $NFT_TABLE output meta priority set tcp sport map @"$TC_CLASS_MAP" || {
-            pm_error "无法创建 TCP 限速分类规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        nft add rule $NFT_TABLE output meta priority set udp sport map @"$TC_CLASS_MAP" || {
-            pm_error "无法创建 UDP 限速分类规则"; nft delete table $NFT_TABLE 2>/dev/null; return 1;
-        }
-        return 0
+    local tables
+    tables=$(nft list tables 2>/dev/null) || {
+        pm_error "无法读取 Nftables 表列表，初始化已停止"; return 1;
+    }
+    grep -Fxq "table $NFT_TABLE" <<< "$tables" && return 0
+    if ! _write_nft_base_rules | nft -f -; then
+        pm_error "无法创建 Nftables 规则表，请检查 nftables 是否正常"
+        return 1
     fi
-    return 0
+}
+
+# 返回 counter_name<TAB>bytes；任何读取/格式/缺失错误都不得当作零计数。
+read_kernel_counters() {
+    local snapshot
+    snapshot=$(nft -j list counters table $NFT_TABLE 2>/dev/null) || return 1
+    jq -er --slurpfile config "$CONFIG_FILE" '
+        if (.nftables | type) != "array" then error("Invalid counters") else . end
+        | [.nftables[] | select(has("counter")) | .counter] as $counters
+        | ($counters | reduce .[] as $c ({}; .[$c.name] = $c.bytes)) as $values
+        | if (all($counters[];
+                  (.name | type) == "string" and (.bytes | type) == "number"
+                  and .bytes >= 0 and .bytes == (.bytes | floor)))
+             and (all($config[0].ports | keys[];
+                  $values["cnt_in_" + .] != null and $values["cnt_out_" + .] != null))
+          then $counters | map("\(.name)\t\(.bytes)") | join("\n")
+          else error("Missing or invalid port counters") end
+    ' <<< "$snapshot" 2>/dev/null
 }
 
 nft_table_healthy() {
     nft list set $NFT_TABLE blocked_ports >/dev/null 2>&1 || return 1
-    local input_rules output_rules
+    local input_rules output_rules ports port
     input_rules=$(nft list chain $NFT_TABLE input 2>/dev/null) || return 1
     output_rules=$(nft list chain $NFT_TABLE output 2>/dev/null) || return 1
     [ "$(grep -Fc '@blocked_ports' <<< "$input_rules")" -eq 2 ] 2>/dev/null || return 1
     [ "$(grep -Fc '@blocked_ports' <<< "$output_rules")" -eq 2 ] 2>/dev/null || return 1
     [ "$(grep -Fc "@${TC_CLASS_MAP}" <<< "$output_rules")" -eq 2 ] 2>/dev/null || return 1
+    ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE") || return 1
+    for port in $ports; do
+        [ "$(grep -Fc "counter name \"cnt_in_${port}\"" <<< "$input_rules")" -eq 2 ] || return 1
+        [ "$(grep -Fc "counter name \"cnt_out_${port}\"" <<< "$output_rules")" -eq 2 ] || return 1
+    done
+    read_kernel_counters >/dev/null
 }
 
 init_tc_root() {
@@ -699,29 +727,43 @@ init_tc_root() {
 }
 
 ensure_port_class_map() {
-    local port=$1 port_hex=$2
-    class_map_has_port "$port" && return 0
+    local port=$1 port_hex=$2 query_rc=0
+    class_map_has_port "$port" || query_rc=$?
+    case "$query_rc" in
+        0) return 0 ;;
+        1) ;; # 确认不存在后才添加；读取失败交由下一轮重试。
+        *) return 1 ;;
+    esac
     nft add element $NFT_TABLE "$TC_CLASS_MAP" \{ "$port" : "1:${port_hex}" \} 2>/dev/null && return 0
     pm_error "无法将端口 ${port} 加入 TC 分类映射"
     return 1
 }
 
 class_map_has_port() {
-    local port=$1
-    nft -n list map $NFT_TABLE "$TC_CLASS_MAP" 2>/dev/null \
-        | grep -Eq "(^|[,{[:space:]])${port}[[:space:]]*:"
+    local port=$1 map_output
+    # 先完整读取，避免 grep -q 提前关闭管道使 nft 收到 SIGPIPE。
+    # 返回 0=存在、1=不存在、2=读取失败，调用方不得把读取失败当作缺失。
+    if ! map_output=$(nft -n list map $NFT_TABLE "$TC_CLASS_MAP" 2>&1); then
+        pm_error "无法读取端口 ${port} 的 TC 分类映射: ${map_output}"
+        return 2
+    fi
+    grep -Eq "(^|[,{[:space:]])${port}[[:space:]]*:" <<< "$map_output"
 }
 
 remove_port_class_map() {
-    local port=$1
-    nft list map $NFT_TABLE "$TC_CLASS_MAP" >/dev/null 2>&1 || return 0
-    class_map_has_port "$port" || return 0
+    local port=$1 query_rc=0
+    class_map_has_port "$port" || query_rc=$?
+    case "$query_rc" in
+        0) ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
     nft delete element $NFT_TABLE "$TC_CLASS_MAP" \{ "$port" \} 2>/dev/null && return 0
-    if class_map_has_port "$port"; then
-        pm_error "端口 ${port} 的 TC 分类映射清理失败"
-        return 1
-    fi
-    return 0
+    query_rc=0
+    class_map_has_port "$port" || query_rc=$?
+    [ "$query_rc" -eq 1 ] && return 0
+    [ "$query_rc" -eq 0 ] && pm_error "端口 ${port} 的 TC 分类映射清理失败"
+    return 1
 }
 
 remove_port_tc_rules() {
@@ -771,6 +813,59 @@ reset_owned_tc_root() {
     rm -f "$TC_OWNER_FILE" || { pm_error "无法清理 TC 所有权记录"; return 1; }
 }
 
+# 确认对象缺失后，先保存新计数器的零基线，再创建对象。
+# 即使创建事务失败或进程中断，重试也不会把新计数误当作旧计数的延续。
+_reset_counter_baselines() {
+    local port=$1 missing_in=$2 missing_out=$3 changed=false
+    _load_port_state "$port"
+    if [ "$missing_in" == true ] && [ "$s_last_k_in" -ne 0 ]; then
+        s_last_k_in=0; changed=true
+    fi
+    if [ "$missing_out" == true ] && [ "$s_last_k_out" -ne 0 ]; then
+        s_last_k_out=0; changed=true
+    fi
+    if [ "$changed" == true ] && ! _save_port_state "$port"; then
+        pm_error "端口 ${port} 的新计数基线保存失败，规则创建已停止"
+        return 1
+    fi
+    return 0
+}
+
+_ensure_port_counters() {
+    local port=$1 snapshot missing missing_in missing_out
+    snapshot=$(nft -j list counters table $NFT_TABLE 2>/dev/null) || {
+        pm_error "无法确认端口 ${port} 的计数器是否存在"; return 1;
+    }
+    missing=$(jq -er --arg port "$port" '
+        if (.nftables | type) != "array" then error("Invalid counters") else . end
+        | [.nftables[] | .counter.name // empty] as $names
+        | [($names | index("cnt_in_"+$port)) == null,
+           ($names | index("cnt_out_"+$port)) == null] | @tsv
+    ' <<< "$snapshot") || { pm_error "端口 ${port} 的计数器列表格式无效"; return 1; }
+    IFS=$'\t' read -r missing_in missing_out <<< "$missing"
+    _reset_counter_baselines "$port" "$missing_in" "$missing_out" || return 1
+    if [ "$missing_in" == true ] && ! nft add counter $NFT_TABLE "cnt_in_${port}"; then
+        pm_error "无法创建端口 ${port} 的入站计数器"; return 1
+    fi
+    if [ "$missing_out" == true ] && ! nft add counter $NFT_TABLE "cnt_out_${port}"; then
+        pm_error "无法创建端口 ${port} 的出站计数器"; return 1
+    fi
+}
+
+port_limit_healthy() {
+    local port=$1 iface port_hex qdisc classes
+    iface=$(jq -r '.interface // empty' "$CONFIG_FILE")
+    [ -n "$iface" ] || iface=$(get_iface)
+    [ -n "$iface" ] || return 1
+    [ -f "$TC_OWNER_FILE" ] && [ "$(cat "$TC_OWNER_FILE")" == "$iface" ] || return 1
+    qdisc=$(tc qdisc show dev "$iface" 2>/dev/null) || { pm_error "无法读取 ${iface} 的限速队列"; return 1; }
+    grep -Eq 'qdisc htb 1:.* root' <<< "$qdisc" || return 1
+    classes=$(tc class show dev "$iface" 2>/dev/null) || { pm_error "无法读取 ${iface} 的限速分类"; return 1; }
+    port_hex=$(printf '%x' "$port")
+    grep -Fq "class htb 1:${port_hex} " <<< "$classes" || return 1
+    class_map_has_port "$port"
+}
+
 apply_port_rules() {
     local port=$1
     local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
@@ -794,14 +889,7 @@ apply_port_rules() {
     local port_hex=$(printf '%x' $port)
 
     # 1. NFT: 计数器
-    nft add counter $NFT_TABLE "cnt_in_${port}" 2>/dev/null || \
-        nft list counter $NFT_TABLE "cnt_in_${port}" >/dev/null 2>&1 || {
-            pm_error "无法创建端口 ${port} 的入站计数器"; return 1;
-        }
-    nft add counter $NFT_TABLE "cnt_out_${port}" 2>/dev/null || \
-        nft list counter $NFT_TABLE "cnt_out_${port}" >/dev/null 2>&1 || {
-            pm_error "无法创建端口 ${port} 的出站计数器"; return 1;
-        }
+    _ensure_port_counters "$port" || return 1
 
     # 2. NFT: 统计（限速分类由全局 classid map 独立管理）
     # TCP/UDP 分开判断，防止规则重复堆积
@@ -851,30 +939,75 @@ apply_port_rules() {
 }
 
 reload_all_rules() {
-    local blocked_before=""
-    blocked_before=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '
-        [ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | .[]' 2>/dev/null || true)
-    # 只重建 PM 登记的 TC 根队列，同时清理旧 mark/filter/默认分类。
-    reset_owned_tc_root || return 1
-    # 彻底销毁旧表再重建，防止已删除端口的规则残留。
-    if nft list table $NFT_TABLE >/dev/null 2>&1 && ! nft delete table $NFT_TABLE 2>/dev/null; then
-        pm_error "无法删除旧 Nftables 规则表"
-        return 1
+    local tables snapshot='{"nftables":[]}' ports rules_file blocked_before old_counter old_port reload_port
+    validate_config_candidate "$CONFIG_FILE" || { pm_error "配置无效，规则重载已停止"; return 1; }
+    ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE") || return 1
+    # 区分表不存在和查询失败；读不出旧规则时不继续破坏现有状态。
+    tables=$(nft -j list tables 2>/dev/null) || { pm_error "无法读取 Nftables 表列表"; return 1; }
+    if ! jq -e '.nftables | type == "array"' <<< "$tables" >/dev/null 2>&1; then
+        pm_error "Nftables 表列表格式无效"; return 1
     fi
-    init_nft_table || { pm_error "Nftables 规则表重建失败"; return 1; }
-    local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE")
-    local reload_failed=false reload_port
+    if jq -e --arg family "${NFT_TABLE%% *}" --arg name "${NFT_TABLE#* }" \
+        'any(.nftables[]; .table.family == $family and .table.name == $name)' <<< "$tables" >/dev/null; then
+        snapshot=$(nft -j list table $NFT_TABLE 2>/dev/null) || { pm_error "无法读取待重载的 Nftables 规则"; return 1; }
+    fi
+    if ! jq -e '.nftables | type == "array"' <<< "$snapshot" >/dev/null 2>&1; then
+        pm_error "Nftables 规则格式无效"; return 1
+    fi
+    blocked_before=$(jq -r '.nftables[] | select(.set.name == "blocked_ports") | .set.elem[]? | tostring' <<< "$snapshot") || return 1
+    rules_file=$(mktemp) || { pm_error "无法创建 Nftables 重载文件"; return 1; }
+    _CLEANUP_FILES+=("$rules_file")
+    _write_nft_base_rules > "$rules_file" || return 1
+    local old_counters missing_in missing_out
+    old_counters=$(jq -r '.nftables[] | .counter.name // empty | select(test("^cnt_(in|out)_[0-9]+$"))' <<< "$snapshot") || return 1
+    local -A monitored=()
     for reload_port in $ports; do
-        apply_port_rules "$reload_port" || reload_failed=true
+        missing_in=true; missing_out=true
+        grep -Fxq "cnt_in_${reload_port}" <<< "$old_counters" && missing_in=false
+        grep -Fxq "cnt_out_${reload_port}" <<< "$old_counters" && missing_out=false
+        _reset_counter_baselines "$reload_port" "$missing_in" "$missing_out" || return 1
+        monitored["$reload_port"]=1
+        printf '%s\n' \
+            "add counter $NFT_TABLE cnt_in_${reload_port}" \
+            "add counter $NFT_TABLE cnt_out_${reload_port}" \
+            "add rule $NFT_TABLE input tcp dport $reload_port counter name \"cnt_in_${reload_port}\"" \
+            "add rule $NFT_TABLE input udp dport $reload_port counter name \"cnt_in_${reload_port}\"" \
+            "add rule $NFT_TABLE output tcp sport $reload_port counter name \"cnt_out_${reload_port}\"" \
+            "add rule $NFT_TABLE output udp sport $reload_port counter name \"cnt_out_${reload_port}\"" >> "$rules_file" || return 1
     done
     for reload_port in $blocked_before; do
-        jq -e --arg p "$reload_port" '.ports[$p] != null' "$CONFIG_FILE" >/dev/null 2>&1 || continue
-        nft add element $NFT_TABLE blocked_ports \{ "$reload_port" \} 2>/dev/null || {
-            pm_error "无法恢复端口 ${reload_port} 的封禁状态"
-            reload_failed=true
-        }
+        [[ -n "${monitored[$reload_port]+x}" ]] || continue
+        printf 'add element %s blocked_ports { %s }\n' "$NFT_TABLE" "$reload_port" >> "$rules_file" || return 1
     done
-    [ "$reload_failed" == "false" ]
+    # 先保留退出监控的计数器；后续 TC 失败时配置回滚仍可继续结算。
+    if ! nft -f "$rules_file"; then
+        pm_error "Nftables 规则重载失败，原规则和计数保持不变"
+        return 1
+    fi
+    local reload_failed=false tc_reset_ok=true
+    reset_owned_tc_root || tc_reset_ok=false
+    for reload_port in $ports; do
+        if [ "$tc_reset_ok" != "true" ] || ! apply_port_rules "$reload_port"; then
+            _load_port_state "$reload_port"
+            s_rules_dirty=true
+            _save_port_state "$reload_port" || pm_error "端口 ${reload_port} 的规则重试状态保存失败"
+            reload_failed=true
+        fi
+    done
+    [ "$tc_reset_ok" == "true" ] && [ "$reload_failed" == "false" ] || return 1
+    # 所有规则应用成功后才清理无引用计数器；清理失败也保留对象供回滚。
+    : > "$rules_file" || return 1
+    for old_counter in $old_counters; do
+        old_port=${old_counter#cnt_in_}; old_port=${old_port#cnt_out_}
+        [[ -z "${monitored[$old_port]+x}" ]] || continue
+        printf 'delete counter %s %s\n' "$NFT_TABLE" "$old_counter" >> "$rules_file" || return 1
+    done
+    if [ -s "$rules_file" ] && ! nft -f "$rules_file"; then
+        pm_error "退出监控的计数器清理失败，原计数已保留"
+        return 1
+    fi
+    rm -f "$rules_file"
+    return 0
 }
 
 ensure_runtime_rules() {
@@ -991,6 +1124,66 @@ fmt_bytes_plain() {
     }'
 }
 
+_tg_send_chunk() {
+    local token=$1 chat_id=$2 api_url=$3 chunk_text=$4
+    local output curl_rc=0 status body error_code description description_lc is_message_error=false
+    output=$(curl -sS --max-time 10 --write-out $'\n%{http_code}' \
+        --data-urlencode "chat_id=$chat_id" \
+        --data-urlencode "text=$chunk_text" \
+        --data-urlencode 'parse_mode=Markdown' \
+        "${api_url}/bot${token}/sendMessage" 2>&1) || curl_rc=$?
+    if [ "$curl_rc" -ne 0 ]; then
+        local curl_reason
+        case "$curl_rc" in
+            6) curl_reason="DNS 无法解析" ;;
+            7) curl_reason="无法连接 Telegram API" ;;
+            28) curl_reason="请求超时" ;;
+            35|51|60) curl_reason="TLS 握手或证书校验失败" ;;
+            52|56) curl_reason="连接中断或未收到响应" ;;
+            *) curl_reason="网络请求失败" ;;
+        esac
+        _TG_LAST_FAILURE_SCOPE="service"
+        _TG_LAST_FAILURE_DETAIL="${curl_reason}（curl ${curl_rc}）"
+        return 1
+    fi
+    status=${output##*$'\n'}
+    body=${output%$'\n'*}
+    if ! [[ "$status" =~ ^[0-9]{3}$ ]]; then
+        _TG_LAST_FAILURE_SCOPE="service"
+        _TG_LAST_FAILURE_DETAIL="Telegram 响应缺少有效 HTTP 状态码"
+        return 1
+    fi
+    if [ "$status" -ge 200 ] 2>/dev/null && [ "$status" -le 299 ] 2>/dev/null \
+        && jq -e '.ok == true' <<< "$body" >/dev/null 2>&1; then
+        return 0
+    fi
+    error_code=$(jq -r '.error_code // empty' <<< "$body" 2>/dev/null)
+    description=$(jq -r '.description // empty' <<< "$body" 2>/dev/null)
+    [ -n "$description" ] || description="响应未确认发送成功"
+    description_lc=${description,,}
+    case "$description_lc" in
+        *"can't parse entities"*|*"can't find end of the entity"*|*"message is too long"*|\
+        *"message text is empty"*|*"text is too long"*|*"caption is too long"*)
+            is_message_error=true ;;
+    esac
+    if [ "$status" = "429" ] || [ "$status" = "401" ] || [ "$status" = "403" ] \
+        || { [ "$status" -ge 500 ] 2>/dev/null && [ "$status" -le 599 ] 2>/dev/null; }; then
+        _TG_LAST_FAILURE_SCOPE="service"
+    elif [[ "$error_code" =~ ^[0-9]+$ ]] && [ "$error_code" -eq 429 ]; then
+        _TG_LAST_FAILURE_SCOPE="service"
+    elif [ "$status" = "400" ] || [ "$error_code" = "400" ]; then
+        if [ "$is_message_error" = true ]; then
+            _TG_LAST_FAILURE_SCOPE="message"
+        else
+            _TG_LAST_FAILURE_SCOPE="service"
+        fi
+    else
+        _TG_LAST_FAILURE_SCOPE="service"
+    fi
+    _TG_LAST_FAILURE_DETAIL="HTTP ${status}${error_code:+ / API ${error_code}}: ${description}"
+    return 1
+}
+
 _tg_send_now() {
     local msg="$1"
     [ -z "$msg" ] && return 2
@@ -1003,15 +1196,18 @@ _tg_send_now() {
     [ -z "$token" ] || [ -z "$chat_id" ] && return 2
     local api_url=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
     local send_failed=false chunks_sent=0
+    _TG_LAST_FAILURE_SCOPE=""
+    _TG_LAST_FAILURE_DETAIL=""
     if [ "${#msg}" -le 3900 ]; then
-        curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
-            -d chat_id="$chat_id" -d text="$msg" -d parse_mode="Markdown" >/dev/null 2>&1 || send_failed=true
+        chunks_sent=1
+        if ! _tg_send_chunk "$token" "$chat_id" "$api_url" "$msg"; then
+            send_failed=true
+        fi
     else
         while IFS= read -r -d '' chunk; do
             [ -z "$chunk" ] && continue
             chunks_sent=$((chunks_sent + 1))
-            if ! curl -sf --max-time 10 "${api_url}/bot${token}/sendMessage" \
-                -d chat_id="$chat_id" -d text="$chunk" -d parse_mode="Markdown" >/dev/null 2>&1; then
+            if ! _tg_send_chunk "$token" "$chat_id" "$api_url" "$chunk"; then
                 send_failed=true
                 break
             fi
@@ -1035,7 +1231,8 @@ _tg_send_now() {
         ' 2>/dev/null)
         [ "$chunks_sent" -eq 0 ] && send_failed=true
     fi
-    [ "$send_failed" = "false" ]
+    [ "$send_failed" = "false" ] || return 1
+    pm_info "Telegram 通知发送成功（共 ${chunks_sent} 条消息）"
 }
 
 tg_send() {
@@ -1045,7 +1242,7 @@ tg_send() {
         local send_rc=0
         _tg_send_now "$msg" || send_rc=$?
         if [ "$send_rc" -eq 1 ]; then
-            pm_error "Telegram 通知发送失败，请检查 Bot Token、Chat ID 和网络"
+            pm_error "Telegram 通知发送失败（${_TG_LAST_FAILURE_DETAIL:-原因未明}）"
         fi
     ) &
 }
@@ -1055,8 +1252,12 @@ tg_send_checked() {
     [ "$_TG_SYNC_FAILED" == "false" ] || return 1
     _tg_send_now "$msg" || send_rc=$?
     if [ "$send_rc" -eq 1 ]; then
-        _TG_SYNC_FAILED=true
-        pm_error "Telegram 通知发送失败，请检查 Bot Token、Chat ID 和网络；未送达通知将在下一轮重试"
+        local failure_scope="消息级拒绝"
+        if [ "$_TG_LAST_FAILURE_SCOPE" == "service" ]; then
+            _TG_SYNC_FAILED=true
+            failure_scope="服务级故障，本轮后续 Telegram 发送已抑制"
+        fi
+        pm_error "Telegram 通知发送失败（${_TG_LAST_FAILURE_DETAIL:-原因未明}）；${failure_scope}，未送达通知将在下一轮重试"
     fi
     return "$send_rc"
 }
@@ -1071,7 +1272,7 @@ tg_notify_quota() {
     local icon="⚠️"
     [ "$threshold" -ge 100 ] && icon="🔴"
     
-    tg_send "${icon} *流量预警*
+    tg_send_checked "${icon} *流量预警*
 ${TG_DIVIDER}
 🖥 *${label}*
 ├ 🔌 端口  \`${port}\`
@@ -1093,7 +1294,7 @@ tg_notify_blocked() {
         title="组流量已耗尽"
     fi
 
-    tg_send "🚫 *${title}*
+    tg_send_checked "🚫 *${title}*
 ${TG_DIVIDER}
 🖥 *${label}*
 ├ 🔌 端口  \`${port}\`
@@ -1106,11 +1307,11 @@ ${TG_DIVIDER}
 tg_notify_punish() {
     local port=$1 comment=$2 avg_mbps=$3 group_id=$4
     local label=$(get_host_label "$comment" "$group_id")
-    tg_send "⚡ *突发限速触发*
+    tg_send_checked "⚡ *突发限速触发*
 ${TG_DIVIDER}
 🖥 *${label}*
 ├ 🔌 端口  \`${port}\`
-├ 📈 速率  ${avg_mbps} Mbps
+├ 📈 当前速率  ${avg_mbps} Mbps
 ├ 🎯 阈值  ${BURST_TRIGGER_MBPS} Mbps / ${BURST_TRIGGER_MINUTES} 分钟
 ├ 📉 限速  *${BURST_LIMIT_MBPS} Mbps*
 └ ⏱ 时长  ${BURST_DURATION_MINUTES} 分钟
@@ -1121,7 +1322,7 @@ ${TG_DIVIDER}
 tg_notify_recover() {
     local port=$1 comment=$2 group_id=$3
     local label=$(get_host_label "$comment" "$group_id")
-    tg_send "✅ *限速已恢复*
+    tg_send_checked "✅ *限速已恢复*
 ${TG_DIVIDER}
 🖥 *${label}*
 ├ 🔌 端口  \`${port}\`
@@ -1168,14 +1369,30 @@ _notify_user_expiry_if_due() {
 
 push_to_worker() {
     local push_values enabled worker_url secret node_key
-    push_values=$(jq -r '[.push.enable // false, .push.worker_url // "", .push.secret // "", .push.node_key // ""] | @tsv' "$CONFIG_FILE" 2>/dev/null)
-    [ -z "$push_values" ] && return
-    IFS=$'\t' read -r enabled worker_url secret node_key <<< "$push_values"
-    [ "$enabled" != "true" ] && return
-    [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ] && return
+    if ! push_values=$(jq -r '[.push.enable // false, .push.worker_url // "", .push.secret // "", .push.node_key // ""]
+        | map(tostring) | join("\u001f")' "$CONFIG_FILE" 2>/dev/null); then
+        pm_error "无法读取 Worker 推送配置"
+        return 1
+    fi
+    IFS=$'\x1f' read -r enabled worker_url secret node_key <<< "$push_values"
+    [ "$enabled" != "true" ] && [ "${1:-}" != "--test" ] && return 0
+    if [ -z "$worker_url" ] || [ -z "$secret" ] || [ -z "$node_key" ]; then
+        pm_error "Worker 推送配置不完整，请配置 Worker URL、Secret 和 Node Key"
+        return 1
+    fi
+    if [[ ! "$worker_url" =~ ^https?://[^/?#]+/api/push([?#].*)?$ ]]; then
+        pm_error "Worker URL 必须指向 /api/push 接口，例如 https://你的域名/api/push"
+        return 1
+    fi
+    if [ "${1:-}" == "--test" ]; then
+        # 菜单进程可连续测试，每次重新采样，避免复用上一次的在线 IP。
+        _CONNECTION_SNAPSHOT_FILE=""
+        _UNIQUE_CONNECTION_SNAPSHOT_FILE=""
+        _CONNECTION_SNAPSHOT_TS=0
+    fi
     local payload
     payload=$(jq '{node_id, interface, ports}' "$CONFIG_FILE" 2>/dev/null)
-    [ -z "$payload" ] && return
+    [ -n "$payload" ] || { pm_error "Worker 上报数据生成失败"; return 1; }
 
     local push_ports_json push_ports scan_ts online_json runtime_json
     push_ports_json=$(jq -c '.ports | keys' <<< "$payload")
@@ -1237,7 +1454,7 @@ push_to_worker() {
                   })
         '
     )
-    [ -z "$runtime_json" ] && return
+    [ -n "$runtime_json" ] || { pm_error "Worker 端口状态汇总失败"; return 1; }
     payload=$(jq -c --argjson runtime "$runtime_json" '
         reduce ($runtime | to_entries[]) as $entry (.;
             .ports[$entry.key].stats.acc_in = $entry.value.acc_in
@@ -1250,7 +1467,7 @@ push_to_worker() {
             | .ports[$entry.key].notify_state.quota_level = $entry.value.quota_level
             | .ports[$entry.key].online = $entry.value.online)
     ' <<< "$payload")
-    [ -z "$payload" ] && return
+    [ -n "$payload" ] || { pm_error "Worker 上报数据合并失败"; return 1; }
     local timestamp signature
     timestamp=$(date +%s)
     signature=$(printf '%s\n%s\n%s' "$node_key" "$timestamp" "$payload" | openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print $NF}')
@@ -1268,11 +1485,26 @@ push_to_worker() {
         pm_error "Worker 推送请求失败，请检查 URL、DNS 和网络"
         return 1
     fi
-    case "$http_code" in
-        2??) return 0 ;;
+    local response_hint=$(head -c 200 "$response_file" 2>/dev/null | tr '\r\n' ' ')
+    case "$http_code:$response_hint" in
+        200:OK)
+            local push_kind="自动上报"
+            [ "${1:-}" == "--test" ] && push_kind="手动测试"
+            pm_info "Worker 推送成功（${push_kind}，节点 ${node_key}，HTTP 200）"
+            if [ "${1:-}" == "--test" ]; then
+                echo -e "${GREEN}推送成功：Worker 已接收节点 ${node_key} 的数据（HTTP 200）。${PLAIN}"
+            fi
+            return 0 ;;
+        2??:*)
+            pm_error "Worker 返回异常响应（HTTP ${http_code}），请检查 URL 和 Worker 部署${response_hint:+: ${response_hint}}"
+            return 1 ;;
         *)
-            local response_hint=$(head -c 200 "$response_file" 2>/dev/null | tr '\r\n' ' ')
             pm_error "Worker 推送被拒绝（HTTP ${http_code}）${response_hint:+: ${response_hint}}"
+            case "$http_code:$response_hint" in
+                '403:Timestamp expired') pm_error "VPS 系统时间与云端相差超过 120 秒，请检查 timedatectl status 并启用时间同步" ;;
+                '403:Forbidden') pm_error "推送签名校验失败，请核对本机 Secret 与 Worker 的 SHARED_SECRET" ;;
+                5??:*) pm_error "Worker 服务异常，请检查云端日志、SHARED_SECRET 配置和 D1 数据库绑定" ;;
+            esac
             return 1
             ;;
     esac
@@ -1329,6 +1561,94 @@ _sentinel_alert_due() {
         || [ $((current_ts - last_alert_ts)) -ge $((cooldown_min * 60)) ]
 }
 
+# 将 IPv4/IPv6 转成稳定的比较键。IPv6 保留完整 8 组；IPv4 映射地址
+# 统一成同一个 IPv4 键，兼容 ss 输出和白名单中的两种写法。
+_normalize_ip_address() {
+    local address=${1,,} octet normalized_v4 prefix suffix word value hex1 hex2
+    local -a octets=() left=() right=() groups=() normalized_groups=()
+    while [[ "$address" == [[:space:]]* ]]; do address=${address#?}; done
+    while [[ "$address" == *[[:space:]] ]]; do address=${address%?}; done
+    [ -n "$address" ] || return 1
+    # 整体限制字符集，避免 read -a 丢弃尾部分隔符或忽略后续行。
+    # 不支持带接口名的 zone ID（例如 fe80::1%eth0），白名单会明确拒绝。
+    [[ "$address" =~ ^[0-9a-f:.]+$ ]] || return 1
+
+    if [[ "$address" != *:* ]]; then
+        [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        IFS=. read -r -a octets <<< "$address"
+        [ "${#octets[@]}" -eq 4 ] || return 1
+        normalized_v4=""
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+            value=$((10#$octet))
+            [ "$value" -le 255 ] || return 1
+            normalized_v4+="${normalized_v4:+.}${value}"
+        done
+        printf 'v4:%s\n' "$normalized_v4"
+        return 0
+    fi
+
+    [[ "$address" != *:::* && "$address" != *::*::* ]] || return 1
+    if [[ "$address" == *.* ]]; then
+        suffix=${address##*:}
+        [[ "$suffix" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        IFS=. read -r -a octets <<< "$suffix"
+        [ "${#octets[@]}" -eq 4 ] || return 1
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+            value=$((10#$octet))
+            [ "$value" -le 255 ] || return 1
+            normalized_v4+="${normalized_v4:+.}${value}"
+        done
+        value=$((10#${octets[0]} * 256 + 10#${octets[1]}))
+        printf -v hex1 '%x' "$value"
+        value=$((10#${octets[2]} * 256 + 10#${octets[3]}))
+        printf -v hex2 '%x' "$value"
+        # Replace the dotted tail with its equivalent two hexadecimal groups.
+        prefix=${address%:*}
+        address="${prefix}:${hex1}:${hex2}"
+    fi
+
+    if [[ "$address" == *::* ]]; then
+        prefix=${address%%::*}
+        suffix=${address#*::}
+        if [ -n "$prefix" ]; then
+            [[ "$prefix" != :* && "$prefix" != *: ]] || return 1
+            IFS=: read -r -a left <<< "$prefix"
+        fi
+        if [ -n "$suffix" ]; then
+            [[ "$suffix" != :* && "$suffix" != *: ]] || return 1
+            IFS=: read -r -a right <<< "$suffix"
+        fi
+        [ "$((${#left[@]} + ${#right[@]}))" -lt 8 ] || return 1
+        groups=("${left[@]}")
+        while [ "$((${#groups[@]} + ${#right[@]}))" -lt 8 ]; do groups+=(0); done
+        groups+=("${right[@]}")
+    else
+        [[ "$address" != :* && "$address" != *: ]] || return 1
+        IFS=: read -r -a groups <<< "$address"
+        [ "${#groups[@]}" -eq 8 ] || return 1
+    fi
+    [ "${#groups[@]}" -eq 8 ] || return 1
+    for word in "${groups[@]}"; do
+        [[ "$word" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+        value=$((16#$word))
+        printf -v word '%x' "$value"
+        normalized_groups+=("$word")
+    done
+    if [ "${normalized_groups[0]}" = 0 ] && [ "${normalized_groups[1]}" = 0 ] \
+        && [ "${normalized_groups[2]}" = 0 ] && [ "${normalized_groups[3]}" = 0 ] \
+        && [ "${normalized_groups[4]}" = 0 ] && [ "${normalized_groups[5]}" = ffff ]; then
+        value=$((16#${normalized_groups[6]})); local first=$((value / 256)) second=$((value % 256))
+        value=$((16#${normalized_groups[7]})); local third=$((value / 256)) fourth=$((value % 256))
+        printf 'v4:%s.%s.%s.%s\n' "$first" "$second" "$third" "$fourth"
+        return 0
+    fi
+    local joined=""
+    for word in "${normalized_groups[@]}"; do joined+="${joined:+:}${word}"; done
+    printf 'v6:%s\n' "$joined"
+}
+
 # 阶段四入口: 遍历启用了 ip_limit 的端口执行检测
 check_ip_sentinel() {
     local current_ts=$1
@@ -1369,12 +1689,25 @@ check_ip_sentinel() {
         local -a whitelist_items=()
         IFS=',' read -ra whitelist_items <<< "$whitelist_csv"
         for w in "${whitelist_items[@]}"; do
-            [ -n "$w" ] && whitelist_set["$w"]=1
+            [ -n "$w" ] || continue
+            local normalized_w
+            if ! normalized_w=$(_normalize_ip_address "$w"); then
+                pm_error "端口 ${port} 的 IP 白名单包含无效地址，已跳过本端口检测"
+                sentinel_failed=true
+                continue 2
+            fi
+            whitelist_set["$normalized_w"]=1
         done
         local -a filtered_ips=()
         while IFS= read -r ip; do
             [ -z "$ip" ] && continue
-            [[ -z "${whitelist_set[$ip]+x}" ]] && filtered_ips+=("$ip")
+            local normalized_ip
+            if ! normalized_ip=$(_normalize_ip_address "$ip"); then
+                pm_error "端口 ${port} 的连接快照包含无效 IP 地址，已跳过本端口检测"
+                sentinel_failed=true
+                continue 2
+            fi
+            [[ -z "${whitelist_set[$normalized_ip]+x}" ]] && filtered_ips+=("$ip")
         done <<< "$raw_ips"
         local ip_count=${#filtered_ips[@]}
         _load_port_state "$port"
@@ -1444,10 +1777,19 @@ check_ip_sentinel() {
             local kept=0
             while read -r cnt kip; do
                 [ -z "$kip" ] && continue
-                [[ -n "${whitelist_set[$kip]+x}" ]] && continue
+                local normalized_kip
+                if ! normalized_kip=$(_normalize_ip_address "$kip"); then
+                    pm_error "端口 ${port} 的自动阻断列表包含无效 IP 地址，已跳过该地址"
+                    sentinel_failed=true
+                    continue
+                fi
+                [[ -n "${whitelist_set[$normalized_kip]+x}" ]] && continue
                 kept=$((kept + 1))
                 if [ "$kept" -gt "$max_ips" ]; then
-                    if ss -K dst "$kip" sport = ":$port" >/dev/null 2>&1; then
+                    # ss 用冒号区分地址与端口，IPv6 必须加方括号避免歧义。
+                    local disconnect_target=$kip
+                    [[ "$kip" == *:* ]] && disconnect_target="[$kip]"
+                    if ss -K dst "$disconnect_target" sport = ":$port" >/dev/null 2>&1; then
                         snapshot_changed=true
                     else
                         pm_error "端口 ${port} 无法自动断开 IP ${kip}，请检查内核是否支持 ss -K"
@@ -1486,6 +1828,8 @@ _reset_ip_alert_state() {
 configure_ip_sentinel() {
     local port=$1
     while true; do
+        # 浏览配置时释放编辑锁；Cron 无须因用户停留在只读菜单而暂停。
+        stop_edit_lock
         local conf=$(jq ".ports[\"$port\"].ip_limit // {}" "$CONFIG_FILE")
         local ip_en=$(echo "$conf" | jq -r '.enable // false')
         local ip_max=$(echo "$conf" | jq -r '.max_ips // 3')
@@ -1516,6 +1860,9 @@ configure_ip_sentinel() {
         echo -e " 0. 返回"
         echo -e "$UI_DIVIDER"
         read -r -p "请选择: " sc; sc=$(strip_cr "$sc")
+        if [[ "$sc" =~ ^[1-5]$ ]]; then
+            start_edit_lock || return 1
+        fi
         local tmp=$(mktemp)
 
         case $sc in
@@ -1567,7 +1914,10 @@ configure_ip_sentinel() {
                 if [ "$wc" = "1" ]; then
                     read -r -p "输入 IP 地址（支持 IPv4/IPv6，留空取消）: " wip; wip=$(strip_cr "$wip")
                     if [ -n "$wip" ]; then
-                        if jq --arg ip "$wip" --arg p "$port" '.ports[$p].ip_limit.whitelist += [$ip] | .ports[$p].ip_limit.whitelist |= unique' \
+                        if ! _normalize_ip_address "$wip" >/dev/null; then
+                            echo -e "${RED}无效 IP 地址，白名单未修改。${PLAIN}"
+                            sleep 1
+                        elif jq --arg ip "$wip" --arg p "$port" '.ports[$p].ip_limit.whitelist += [$ip] | .ports[$p].ip_limit.whitelist |= unique' \
                             "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已添加。" "白名单写入失败"; then
                             _reset_ip_alert_state "$port" || pm_error "端口 ${port} 的接入告警状态重置失败"
                             sleep 0.5
@@ -1580,9 +1930,10 @@ configure_ip_sentinel() {
                         sleep 0.5
                     else sleep 1; fi
                 fi ;;
-            0)  rm -f "$tmp"; break ;;
+            0)  rm -f "$tmp"; stop_edit_lock; break ;;
         esac
         rm -f "$tmp"
+        stop_edit_lock
     done
 }
 
@@ -1613,6 +1964,23 @@ _update_burst_state() {
     fi
 }
 
+_send_pending_qos_notice() {
+    local port=$1 comment=$2 current_mbps=$3 group_id=$4
+    [ "$s_rules_dirty" == false ] && [ -n "$s_pending_qos_notice" ] || return 0
+    telegram_notifications_ready || return 0
+    case "$s_pending_qos_notice" in
+        punish)
+            tg_notify_punish "$port" "$comment" "$current_mbps" "$group_id" || return 1
+            s_punish_notified=true; s_recover_notified=false ;;
+        recover)
+            tg_notify_recover "$port" "$comment" "$group_id" || return 1
+            s_recover_notified=true; s_punish_notified=false ;;
+        *) pm_error "端口 ${port} 的限速通知状态无效"; return 1 ;;
+    esac
+    s_pending_qos_notice=""
+    _save_port_state "$port"
+}
+
 cron_task() {
     exec 9>"$CRON_LOCK_FILE"
     flock -n 9 || exit 0
@@ -1634,11 +2002,15 @@ cron_task() {
 
     # --- 阶段一：采集数据 + 固定突发限速 (Port Level) ---
     # [PERF] 一次性读取全部 nft 计数器 (零循环内 nft 调用)
+    local counter_values
+    if ! counter_values=$(read_kernel_counters); then
+        pm_error "无法读取完整端口计数，本轮已停止；原累计和计数基线保持不变"
+        return 1
+    fi
     declare -A _ctr_cache
     while IFS=$'\t' read -r _cn _cb; do
         [ -n "$_cn" ] && _ctr_cache["$_cn"]=$_cb
-    done <<< "$(nft -j list counters table $NFT_TABLE 2>/dev/null | jq -r '
-        [.nftables[] | select(.counter) | .counter] | .[] | "\(.name)\t\(.bytes)"')"
+    done <<< "$counter_values"
 
     # [PERF] 一次性读取已接入突发保护的端口，不在循环内重复启动 jq。
     local _burst_cfg_data=$(echo "$tmp_json" | jq -r '
@@ -1684,28 +2056,19 @@ cron_task() {
         if [ -n "${_burst_enabled[$port]+x}" ]; then
             current_mbps=$(echo "scale=2; $delta_out * 8 / $sample_seconds / 1000000" | bc)
             _update_burst_state "$current_mbps" "$sample_seconds" "$current_ts" "$sample_contiguous"
+            if [ "$s_is_punished" == true ] && ! port_limit_healthy "$port"; then
+                s_rules_dirty=true
+            fi
         fi
 
         # 规则提交失败时保留 dirty 标记，下一轮继续恢复不限速或临时限速。
         if [ "$s_rules_dirty" == "true" ]; then
-            _save_port_state "$port" || cron_failed=true
+            if ! _save_port_state "$port"; then
+                cron_failed=true
+                continue
+            fi
             if apply_port_rules "$port"; then
-                case "$s_pending_qos_notice" in
-                    punish)
-                        if [ "$s_punish_notified" != "true" ]; then
-                            tg_notify_punish "$port" "${_burst_comment[$port]}" "$current_mbps" "${_burst_gid[$port]}"
-                        fi
-                        s_punish_notified=true; s_recover_notified=false
-                        ;;
-                    recover)
-                        if [ "$s_recover_notified" != "true" ]; then
-                            tg_notify_recover "$port" "${_burst_comment[$port]}" "${_burst_gid[$port]}"
-                        fi
-                        s_recover_notified=true; s_punish_notified=false
-                        ;;
-                esac
                 s_rules_dirty=false
-                s_pending_qos_notice=""
             else
                 pm_error "端口 ${port} 的限速规则应用失败，将在下一轮重试"
                 cron_failed=true
@@ -1713,7 +2076,49 @@ cron_task() {
         fi
 
         _save_port_state "$port" || cron_failed=true
+        _send_pending_qos_notice "$port" "${_burst_comment[$port]:-}" "$current_mbps" "${_burst_gid[$port]:-}" || cron_failed=true
     done
+
+    # 月度清账先于组聚合：累计、基线和周期标记一次提交。
+    # 配额封禁在阶段三按新用量恢复；TC 保护状态独立，不因清账重建。
+    local reset_cfg current_year_month="" days_in_month="" reset_port reset_day reset_gid
+    local reset_ts effective_day reset_date
+    declare -A reset_ts_cache reset_failed_ports reset_failed_groups
+    reset_cfg=$(jq -r '
+        .ports | to_entries[] | select((.value.reset_day // 0) > 0) |
+        [.key, .value.reset_day, (.value.group_id // "")]
+        | map(tostring) | join("\u001f")' <<< "$tmp_json")
+    while IFS=$'\x1f' read -r reset_port reset_day reset_gid; do
+        [ -z "$reset_port" ] && continue
+        if [ -z "$current_year_month" ]; then
+            if ! current_year_month=$(date -d "@$current_ts" '+%Y-%m') \
+                || ! days_in_month=$(date -d "${current_year_month}-01 +1 month -1 day" +%-d); then
+                pm_error "无法确定月度重置日期，本轮清账已停止"
+                return 1
+            fi
+        fi
+        effective_day=$reset_day
+        [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
+        reset_ts=${reset_ts_cache[$effective_day]:-}
+        if [ -z "$reset_ts" ]; then
+            printf -v reset_date '%s-%02d 00:00:00' "$current_year_month" "$effective_day"
+            reset_ts=$(date -d "$reset_date" +%s) || { pm_error "无法解析月度重置日期"; return 1; }
+            reset_ts_cache["$effective_day"]=$reset_ts
+        fi
+        _load_port_state "$reset_port"
+        if [ "$current_ts" -ge "$reset_ts" ] && [ "$s_last_reset_ts" -lt "$reset_ts" ]; then
+            s_acc_in=0; s_acc_out=0
+            s_last_k_in=${_ctr_cache["cnt_in_${reset_port}"]}
+            s_last_k_out=${_ctr_cache["cnt_out_${reset_port}"]}
+            s_last_reset_ts=$current_ts; s_quota_level=0
+            if ! _save_port_state "$reset_port"; then
+                pm_error "端口 ${reset_port} 月度清账保存失败，原周期和累计已保留"
+                reset_failed_ports["$reset_port"]=1
+                [ -n "$reset_gid" ] && reset_failed_groups["$reset_gid"]=1
+                cron_failed=true
+            fi
+        fi
+    done <<< "$reset_cfg"
 
     # --- 阶段二：计算组流量 (Aggregation) ---
     # [PERF] 一次性读取 group_id + quota_mode (静态配置)
@@ -1736,9 +2141,7 @@ cron_task() {
     local blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
     local thresholds
     thresholds=$(jq -r '((.telegram.thresholds // [50,80,100]) + [100]) | unique | .[]' <<< "$tmp_json" | sort -rn)
-    local current_year_month="" days_in_month=""
     local current_utc_day=$((current_ts / 86400))
-    declare -A reset_ts_cache
     # [PERF] 一次性读取所有端口的静态配置
     local _p3_cfg=$(echo "$tmp_json" | jq -r '
         .ports | to_entries[] |
@@ -1752,6 +2155,11 @@ cron_task() {
 
     while IFS=$'\x1f' read -r port quota_gb mode gid reset_day p3_comment expiry_date expiry_day; do
         [ -z "$port" ] && continue
+        # 清账失败时保留该端口/共享组现有封禁，避免依据半完成周期解除封禁。
+        if [[ -n "${reset_failed_ports[$port]+x}" ]] \
+            || { [ -n "$gid" ] && [[ -n "${reset_failed_groups[$gid]+x}" ]]; }; then
+            continue
+        fi
         _load_port_state "$port"
 
         # 用户到期提醒由本机 Telegram 发送；3 天窗口内每个端口/日期只提醒一次。
@@ -1764,57 +2172,6 @@ cron_task() {
             check_usage=${group_usage["$gid"]:-0}
         else
             if [ "$mode" == "out_only" ]; then check_usage=$s_acc_out; else check_usage=$((s_acc_in + s_acc_out)); fi
-        fi
-
-        # 自动重置判断
-        if [ "$reset_day" -gt 0 ] 2>/dev/null && [ "$reset_day" -le 31 ] 2>/dev/null; then
-            if [ -z "$current_year_month" ]; then
-                current_year_month=$(date +%Y-%m)
-                days_in_month=$(date -d "${current_year_month}-01 +1 month -1 day" +%-d 2>/dev/null)
-                [ -z "$days_in_month" ] && days_in_month=28
-            fi
-            local effective_day=$reset_day
-            [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
-            local reset_ts=${reset_ts_cache[$effective_day]:-}
-            if [ -z "$reset_ts" ]; then
-                local reset_date
-                reset_date=$(printf "%s-%02d 00:00:00" "$current_year_month" "$effective_day")
-                reset_ts=$(date -d "$reset_date" +%s 2>/dev/null || echo 0)
-                reset_ts_cache["$effective_day"]=$reset_ts
-            fi
-
-            if [ "$current_ts" -ge "$reset_ts" ] && [ "$s_last_reset_ts" -lt "$reset_ts" ]; then
-                # 重置: 清零流量, 记录当前内核计数器作为新基准
-                s_acc_in=0; s_acc_out=0
-                s_last_k_in=${_ctr_cache["cnt_in_${port}"]:-0}
-                s_last_k_out=${_ctr_cache["cnt_out_${port}"]:-0}
-                # 配额周期与突发保护相互独立；月度清零不提前结束 5 分钟保护期。
-                s_quota_level=0
-                _save_port_state "$port" || cron_failed=true
-
-                local reset_rules_ok=true
-                if [[ "$blocked_ports_str" == *" $port "* ]] \
-                    && ! nft delete element $NFT_TABLE blocked_ports \{ $port \} 2>/dev/null; then
-                    pm_error "自动重置时无法解除端口 ${port} 的封禁"
-                    cron_failed=true
-                    reset_rules_ok=false
-                fi
-                if apply_port_rules "$port"; then
-                    s_rules_dirty=false
-                else
-                    cron_failed=true
-                    reset_rules_ok=false
-                fi
-                if [ "$reset_rules_ok" == "true" ]; then
-                    s_last_reset_ts=$current_ts
-                    _save_port_state "$port" || cron_failed=true
-                else
-                    pm_error "端口 ${port} 流量已清零，但规则恢复未完成，将在下一轮重试"
-                fi
-
-                check_usage=0
-                blocked_ports_str=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
-            fi
         fi
 
         # 配额封禁检查
@@ -1860,15 +2217,22 @@ cron_task() {
             done
 
             if (( new_level > s_quota_level )); then
+                telegram_notifications_ready || continue
                 # 只有封禁规则真正存在后，才发送“已封禁”并记录 100% 状态。
                 if (( new_level >= 100 )) && [ "$is_blocked_nft" != "true" ]; then
                     continue
                 fi
                 local used_fmt=$(fmt_bytes_plain "$check_usage")
-                tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"
-                if (( new_level >= 100 )); then
-                    tg_notify_blocked "$port" "$p3_comment" "$quota_gb" "$reset_day" "$gid"
+                if ! tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"; then
+                    cron_failed=true
+                    continue
                 fi
+                if (( new_level >= 100 )) \
+                    && ! tg_notify_blocked "$port" "$p3_comment" "$quota_gb" "$reset_day" "$gid"; then
+                    cron_failed=true
+                    continue
+                fi
+                # 本档所有通知确认成功后才推进状态，失败时保留下一轮补发机会。
                 s_quota_level=$new_level
                 _save_port_state "$port" || cron_failed=true
             fi
@@ -1897,7 +2261,7 @@ setup_cron() {
         pm_error "Cron 任务安装失败，请检查 crontab 服务"
         return 1
     fi
-    echo -e "${GREEN}后台错误日志: $LOG_FILE${PLAIN}"
+    echo -e "${GREEN}后台运行日志: $LOG_FILE${PLAIN}"
 }
 
 # ==============================================================================
@@ -1917,12 +2281,20 @@ start_edit_lock() {
     _MENU_LOCK_HELD=true
 }
 stop_edit_lock() {
-    rm -f "$USER_EDIT_LOCK"
     if [ "$_MENU_LOCK_HELD" == "true" ]; then
+        rm -f "$USER_EDIT_LOCK"
         flock -u 8 2>/dev/null || true
         exec 8>&-
         _MENU_LOCK_HELD=false
     fi
+}
+
+_run_edit_action() {
+    start_edit_lock || return 1
+    local action_rc=0
+    "$@" || action_rc=$?
+    stop_edit_lock
+    return "$action_rc"
 }
 
 scan_active_services() {
@@ -2078,16 +2450,17 @@ show_main_menu() {
     echo -e " 6. ${RED}卸载 脚本${PLAIN}"
     echo -e " 0. 退出"
     echo -e "$UI_DIVIDER"
+    stop_edit_lock
     read -r -p "请选择: " choice
     choice=$(strip_cr "$choice")
     
     case $choice in
-        1) add_port_flow ;;
-        2) config_port_menu "${port_list[@]}" ;;
-        3) delete_port_flow "${port_list[@]}" ;;
+        1) _run_edit_action add_port_flow ;;
+        2) _run_edit_action config_port_menu "${port_list[@]}" ;;
+        3) _run_edit_action delete_port_flow "${port_list[@]}" ;;
         4) configure_notifications ;;
-        5) update_script ;;
-        6) uninstall_script ;;
+        5) _run_edit_action update_script ;;
+        6) _run_edit_action uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
         *) ;; 
     esac
@@ -2129,9 +2502,6 @@ add_port_flow() {
     if [ "$sel" == "0" ]; then return; fi
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ -n "${map_ports[$sel]}" ]; then
         target_port=${map_ports[$sel]}
-        if jq -e ".ports[\"$target_port\"]" "$CONFIG_FILE" >/dev/null; then
-            echo -e "${RED}该端口已在监控列表中!${PLAIN}"; sleep 2; return
-        fi
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
         read -r -p "请输入端口号: " target_port
         target_port=$(strip_cr "$target_port")
@@ -2140,6 +2510,12 @@ add_port_flow() {
     fi
     if [[ ! "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
         echo -e "${RED}无效端口${PLAIN}"; sleep 1; return
+    fi
+    target_port=$((10#$target_port))
+    if jq -e --argjson port "$target_port" '.ports | keys | any(tonumber == $port)' "$CONFIG_FILE" >/dev/null; then
+        echo -e "${RED}该端口已在监控列表中，原配置和用量保持不变。${PLAIN}"
+        sleep 1
+        return 1
     fi
     echo -e "\n>> 正在配置端口: $target_port"
     
@@ -2224,6 +2600,7 @@ add_port_flow() {
 
 config_port_menu() {
     local arr=("$@")
+    stop_edit_lock
     echo
     read -r -p "请输入要配置的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
@@ -2235,6 +2612,11 @@ config_port_menu() {
     if [ -z "$port" ]; then echo -e "${RED}无效 ID。${PLAIN}"; sleep 1; return; fi
     
     while true; do
+        stop_edit_lock
+        if ! jq -e --arg port "$port" '.ports[$port] != null' "$CONFIG_FILE" >/dev/null; then
+            echo -e "${RED}该端口已不在监控列表，请返回刷新。${PLAIN}"
+            return 1
+        fi
         local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
         local comment=$(echo "$conf" | jq -r '.comment // ""')
         local quota=$(echo "$conf" | jq -r '.quota_gb')
@@ -2276,6 +2658,16 @@ config_port_menu() {
         echo -e "$UI_DIVIDER"
         read -r -p "请选择: " sub_choice
         sub_choice=$(strip_cr "$sub_choice")
+        case "$sub_choice" in
+            [1-9])
+                start_edit_lock || return 1
+                if ! jq -e --arg port "$port" '.ports[$port] != null' "$CONFIG_FILE" >/dev/null; then
+                    stop_edit_lock
+                    echo -e "${RED}该端口已不在监控列表，请返回刷新。${PLAIN}"
+                    return 1
+                fi
+                gid=$(jq -r --arg port "$port" '.ports[$port].group_id // empty' "$CONFIG_FILE") ;;
+        esac
         
         local tmp=$(mktemp)
         local success=false
@@ -2326,14 +2718,30 @@ config_port_menu() {
                        reset_ports=$(jq -r --arg g "$gid" '.ports | to_entries[] | select(.value.group_id == $g) | .key' "$CONFIG_FILE")
                    fi
                    local reset_failed=false reset_port reset_now=$(date +%s)
-                   local reset_blocked=" $(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r '[ .nftables[] | select(.set) | .set.elem[]? ] | map(tostring) | join(" ")') "
+                   local reset_snapshot reset_blocked_json reset_blocked
+                   if ! reset_snapshot=$(read_kernel_counters) \
+                       || ! reset_blocked_json=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null) \
+                       || ! reset_blocked=$(jq -er '
+                           if (.nftables | type) != "array" then error("Invalid blocked set") else . end
+                           | [.nftables[] | select(.set) | .set.elem[]?] | map(tostring) | join(" ")
+                       ' <<< "$reset_blocked_json"); then
+                       pm_error "无法读取完整计数或封禁状态，手动清零已停止"
+                       echo -e "${RED}读取失败，原统计数据保持不变。${PLAIN}"
+                       rm -f "$tmp"; sleep 1; continue
+                   fi
+                   reset_blocked=" $reset_blocked "
+                   local -A reset_counters=()
+                   local counter_name counter_bytes
+                   while IFS=$'\t' read -r counter_name counter_bytes; do
+                       [ -n "$counter_name" ] && reset_counters["$counter_name"]=$counter_bytes
+                   done <<< "$reset_snapshot"
                    for reset_port in $reset_ports; do
-                       local k_in=$(nft -j list counter $NFT_TABLE "cnt_in_${reset_port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
-                       local k_out=$(nft -j list counter $NFT_TABLE "cnt_out_${reset_port}" 2>/dev/null | jq -r '[ .nftables[] | select(.counter) | .counter.bytes ] | .[0] // 0')
                        _load_port_state "$reset_port"
-                       s_acc_in=0; s_acc_out=0; s_last_k_in=$k_in; s_last_k_out=$k_out
+                       s_acc_in=0; s_acc_out=0
+                       s_last_k_in=${reset_counters["cnt_in_${reset_port}"]}
+                       s_last_k_out=${reset_counters["cnt_out_${reset_port}"]}
                        s_last_reset_ts=$reset_now; s_quota_level=0
-                       _save_port_state "$reset_port" || reset_failed=true
+                       if ! _save_port_state "$reset_port"; then reset_failed=true; continue; fi
                        if [[ "$reset_blocked" == *" $reset_port "* ]] \
                            && ! nft delete element $NFT_TABLE blocked_ports \{ $reset_port \} 2>/dev/null; then
                            pm_error "手动重置时无法解除端口 ${reset_port} 的封禁"
@@ -2436,6 +2844,7 @@ config_port_menu() {
             0) rm -f "$tmp"; break ;;
         esac
         
+        stop_edit_lock
         if [ "$success" == "true" ]; then echo -e "${GREEN}配置已更新。${PLAIN}"; sleep 0.5; fi
         rm -f "$tmp"
     done
@@ -2447,6 +2856,7 @@ config_port_menu() {
 
 configure_user_expiry() {
     local port=$1 value tmp
+    stop_edit_lock
     echo -e "\n用户到期前 3 天将通过本机 Telegram 通知提醒一次。"
     read -r -p "到期日期（YYYY-MM-DD，0 为关闭，留空取消）: " value
     value=$(strip_cr "$value")
@@ -2458,6 +2868,7 @@ configure_user_expiry() {
         return 1
     fi
 
+    start_edit_lock || return 1
     tmp=$(mktemp) || { pm_error "无法创建到期配置临时文件"; return 1; }
     if jq --arg p "$port" --arg value "$value" '.ports[$p].expiry_date = $value' "$CONFIG_FILE" > "$tmp" \
         && safe_write_config_from_file "$tmp"; then
@@ -2487,6 +2898,7 @@ configure_user_expiry() {
 
 configure_burst_limit() {
     local port=$1 conf enabled action target tmp old_config
+    stop_edit_lock
     conf=$(jq ".ports[\"$port\"].dyn_limit // {\"enable\":false}" "$CONFIG_FILE")
     enabled=$(echo "$conf" | jq -r '.enable // false')
     _load_port_state "$port"
@@ -2509,6 +2921,11 @@ configure_burst_limit() {
     echo -e "$UI_DIVIDER"
     read -r -p "请选择 [0-1，默认 0]: " choice; choice=$(strip_cr "$choice")
     [ "$choice" != "1" ] && return 0
+
+    start_edit_lock || return 1
+    enabled=$(jq -r --arg port "$port" '.ports[$port].dyn_limit.enable // false' "$CONFIG_FILE")
+    if [ "$enabled" == true ]; then action="关闭"; target=false; else action="开启"; target=true; fi
+    _load_port_state "$port"
 
     old_config=$(cat "$CONFIG_FILE") || { pm_error "无法备份当前配置"; return 1; }
     tmp=$(mktemp) || { pm_error "无法创建突发限速配置临时文件"; return 1; }
@@ -2571,8 +2988,45 @@ configure_notifications() {
     done
 }
 
+show_notification_logs() {
+    local kind=$1 title pattern log_lines reply
+    case "$kind" in
+        telegram) title="Telegram 通知"; pattern='Telegram' ;;
+        cloudflare) title="Cloudflare 云端推送"; pattern='Worker|Cloudflare|云端|推送签名校验失败|^curl:' ;;
+        *) return 1 ;;
+    esac
+    clear
+    echo -e "$UI_DIVIDER"
+    echo -e "   ${title} · 最近日志"
+    echo -e "$UI_DIVIDER"
+    printf ' 日志文件：%s\n' "$LOG_FILE"
+    echo " 最近最多 50 条相关记录，按记录顺序显示（最新在下方）。"
+    echo -e "$UI_SEPARATOR"
+    if [ ! -e "$LOG_FILE" ]; then
+        echo " 暂无相关日志，日志文件尚未生成。"
+    elif [ ! -f "$LOG_FILE" ] || [ ! -r "$LOG_FILE" ]; then
+        echo -e "${RED}无法读取日志文件，请检查文件类型和读取权限。${PLAIN}"
+    elif ! log_lines=$(awk -v pattern="$pattern" '
+        $0 ~ pattern { lines[count % 50] = $0; count++ }
+        END {
+            start = count > 50 ? count - 50 : 0
+            for (i = start; i < count; i++) print lines[i % 50]
+        }
+    ' "$LOG_FILE"); then
+        echo -e "${RED}日志读取失败，请检查上方错误信息。${PLAIN}"
+    elif [ -n "$log_lines" ]; then
+        printf '%s\n' "$log_lines"
+    else
+        echo " 暂无相关日志。"
+    fi
+    echo -e "$UI_SEPARATOR"
+    echo " 提示：成功和失败都会记录，请结合记录时间判断最近一次结果，或返回菜单执行测试。"
+    read -r -p "按回车返回..." reply
+}
+
 configure_telegram() {
     while true; do
+        stop_edit_lock
         local tg=$(jq '.telegram' "$CONFIG_FILE")
         local t_enable=$(echo "$tg" | jq -r '.enable // false')
         local t_token=$(echo "$tg" | jq -r '.bot_token // ""')
@@ -2600,10 +3054,12 @@ configure_telegram() {
         echo -e " 3. 设置 流量提醒阈值"
         echo -e " 4. 设置 API 地址"
         echo -e " 5. 发送测试消息"
+        echo -e " 6. 查看最近日志"
         echo -e " 0. 返回通知与推送"
         echo -e "$UI_DIVIDER"
         read -r -p "请选择: " c
         c=$(strip_cr "$c")
+        case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
         local tmp=$(mktemp)
 
         case $c in
@@ -2664,24 +3120,29 @@ ${TG_DIVIDER}
 └ 📡 状态  Bot 通信正常
 ${TG_DIVIDER}
 ℹ️ PM 通知配置已生效"
-                    local result=$(curl -s --max-time 10 "${t_api}/bot${t_token}/sendMessage" \
-                        -d chat_id="$t_chatid" -d text="$test_msg" -d parse_mode="Markdown")
-                    if echo "$result" | jq -e '.ok == true' >/dev/null 2>&1; then
+                    _TG_LAST_FAILURE_SCOPE=""
+                    _TG_LAST_FAILURE_DETAIL=""
+                    if _tg_send_chunk "$t_token" "$t_chatid" "$t_api" "$test_msg"; then
+                        pm_info "Telegram 测试消息发送成功"
                         echo -e "${GREEN}发送成功!${PLAIN}"
                     else
-                        local err=$(echo "$result" | jq -r '.description // "未知错误"' 2>/dev/null)
+                        pm_error "Telegram 测试消息发送失败（${_TG_LAST_FAILURE_DETAIL:-原因未明}）"
+                        local err=${_TG_LAST_FAILURE_DETAIL:-未知错误}
                         echo -e "${RED}发送失败: ${err}${PLAIN}"
                     fi
                     sleep 2
                 fi ;;
+            6) show_notification_logs telegram ;;
             0) rm -f "$tmp"; break ;;
         esac
+        stop_edit_lock
         rm -f "$tmp"
     done
 }
 
 configure_push() {
     while true; do
+        stop_edit_lock
         local pc=$(jq '.push // {}' "$CONFIG_FILE")
         local p_enable=$(echo "$pc" | jq -r '.enable // false')
         local p_url=$(echo "$pc" | jq -r '.worker_url // ""')
@@ -2709,10 +3170,14 @@ configure_push() {
         echo -e " 2. 配置 Worker URL"
         echo -e " 3. 配置 Secret"
         echo -e " 4. 配置 Node Key"
+        echo -e " 5. 立即测试推送"
+        echo -e " 6. 查看最近日志"
         echo -e " 0. 返回通知与推送"
+        echo -e " 提示：已开启仅表示配置状态；测试会实际上报一次，不改变开关。"
         echo -e "$UI_DIVIDER"
         read -r -p "请选择: " c
         c=$(strip_cr "$c")
+        case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
         local tmp=$(mktemp)
 
         case $c in
@@ -2747,14 +3212,24 @@ configure_push() {
                 else
                     echo -e "${RED}Node Key 必须为 1-64 位小写字母、数字、下划线或连字符，且以字母或数字开头。${PLAIN}"; sleep 1
                 fi ;;
+            5)
+                echo -e "${YELLOW}正在测试推送...${PLAIN}"
+                if ! push_to_worker --test; then
+                    echo -e "${RED}推送失败，详细原因见上方提示及 ${LOG_FILE}。${PLAIN}"
+                fi
+                stop_edit_lock
+                read -r -p "按回车返回..." val ;;
+            6) show_notification_logs cloudflare ;;
             0) rm -f "$tmp"; break ;;
         esac
+        stop_edit_lock
         rm -f "$tmp"
     done
 }
 
 delete_port_flow() {
     local arr=("$@")
+    stop_edit_lock
     read -r -p "请输入要删除的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
     [ "$id" = "0" ] && return
@@ -2766,6 +3241,16 @@ delete_port_flow() {
 
     confirm_yes "确认删除端口 ${port}？" || return
 
+    _run_edit_action _delete_port_config "$port"
+}
+
+_delete_port_config() {
+    local port=$1
+    if ! jq -e --arg port "$port" '.ports[$port] != null' "$CONFIG_FILE" >/dev/null; then
+        echo -e "${RED}该端口已不在监控列表，请返回刷新。${PLAIN}"
+        return 1
+    fi
+
     # 配置、Nftables 与 TC 作为一个操作处理；失败时恢复原配置。
     local backup
     backup=$(mktemp) || { pm_error "无法创建删除回滚文件"; return 1; }
@@ -2773,7 +3258,8 @@ delete_port_flow() {
     local tmp=$(mktemp)
     if jq "del(.ports[\"$port\"])" "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then
         rm -f "$tmp"
-        if remove_port_tc_rules "$port" && reload_all_rules; then
+        # 重载提交后会清理 TC；提交前不提前拆除原端口的限速规则。
+        if reload_all_rules; then
             rm -f "$STATE_DIR/${port}.txt" "$backup"
             echo -e "${GREEN}端口 ${port} 已删除。${PLAIN}"; sleep 1
         else
@@ -2839,6 +3325,8 @@ uninstall_script() {
     read -r -p "确认卸载？输入 yes 确认，直接回车取消: " c
     c=$(strip_cr "$c")
     [ "$c" != "yes" ] && return
+
+    start_edit_lock || return 1
 
     echo -e "${YELLOW}正在清理...${PLAIN}"
 

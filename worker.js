@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v3.2
+ * Cloudflare Worker - 端口流量查询中控 v3.4
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -13,6 +13,8 @@
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
+ * v3.4 变更: 长查询按页显示，Telegram 限流按 retry_after 有界重试
+ * v3.3 变更: 管理员写操作按 Telegram update_id 幂等提交，节点及权限删除原子化
  * v3.2 变更: 增加 TG-ID 查询、权限操作引导、真实端口校验与删除确认
  * v3.1 变更: 精简流量卡片并补全 Telegram 按钮菜单
  * v3.0 变更: 用户到期提醒改由 PM 本机 Telegram 发送，Worker 仅展示到期状态
@@ -146,16 +148,33 @@ async function handleTelegram(request, env) {
 
   // 指令路由
   const cmd = text.split(/\s+/)[0].toLowerCase().replace(/@\w+$/, ""); // 去掉 @botname
+  const args = text.split(/\s+/);
+  const updateId = payload.update_id;
+  const requiresUpdateId = isAdmin && (
+    (cmd === "/add" && args.length >= 4) ||
+    (cmd === "/del" && args.at(-1)?.toLowerCase() === "--yes") ||
+    (cmd === "/delnode" && args.length >= 2)
+  );
+  if (requiresUpdateId && (!Number.isSafeInteger(updateId) || updateId < 0)) {
+    console.error("拒绝处理缺少有效 update_id 的管理员写操作");
+    return new Response("Invalid Telegram update", { status: 400 });
+  }
+  if (requiresUpdateId) {
+    const processed = await env.DB.prepare(
+      "SELECT 1 AS processed FROM telegram_updates WHERE update_id = ?1"
+    ).bind(updateId).first();
+    if (processed) return new Response("OK");
+  }
 
   switch (cmd) {
     case "/ll":
       return handleQuery(env, chatId, userId, text, isAdmin);
     case "/add":
-      return isAdmin ? handleAdd(env, chatId, text) : new Response("OK");
+      return isAdmin ? handleAdd(env, chatId, text, null, requiresUpdateId ? updateId : null) : new Response("OK");
     case "/del":
-      return isAdmin ? handleDel(env, chatId, text) : new Response("OK");
+      return isAdmin ? handleDel(env, chatId, text, null, requiresUpdateId ? updateId : null) : new Response("OK");
     case "/delnode":
-      return isAdmin ? handleDelNode(env, chatId, text) : new Response("OK");
+      return isAdmin ? handleDelNode(env, chatId, text, requiresUpdateId ? updateId : null) : new Response("OK");
     case "/users":
       return isAdmin ? handleUsers(env, chatId) : new Response("OK");
     case "/id":
@@ -168,15 +187,42 @@ async function handleTelegram(request, env) {
   }
 }
 
+// 将去重标记与本次业务修改放在同一个 D1 batch 中。
+// D1 batch 任一语句失败会整体回滚；重复 update_id 时只在确认标记已存在后按已处理返回。
+async function commitTelegramUpdate(env, updateId, statements) {
+  const batch = [
+    env.DB.prepare(
+      "INSERT INTO telegram_updates (update_id, processed_at) VALUES (?1, ?2)"
+    ).bind(updateId, Math.floor(Date.now() / 1000)),
+    ...statements
+  ];
+  try {
+    return { committed: true, results: await env.DB.batch(batch) };
+  } catch (error) {
+    let seen;
+    try {
+      seen = await env.DB.prepare(
+        "SELECT 1 AS processed FROM telegram_updates WHERE update_id = ?1"
+      ).bind(updateId).first();
+    } catch {
+      throw error;
+    }
+    if (seen) return { committed: false, results: [] };
+    throw error;
+  }
+}
+
 // ==============================================================
 // 3. /ll - 流量查询
 // ==============================================================
 async function handleQuery(env, chatId, userId, text, isAdmin) {
   const args = text.split(/\s+/);
   const target = args[1]?.toLowerCase();
+  const requestedPage = /^\d+$/.test(args[2] || "") ? Number(args[2]) : 1;
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage - 1 : 0;
 
   if (!target) return showNodeMenu(env, chatId, userId, isAdmin);
-  return showNodeReport(env, chatId, userId, isAdmin, target);
+  return showNodeReport(env, chatId, userId, isAdmin, target, null, page);
 }
 
 async function handleCallbackQuery(env, callbackQuery) {
@@ -201,6 +247,18 @@ async function handleCallbackQuery(env, callbackQuery) {
     return isAdmin
       ? handleUsers(env, chatId, messageId)
       : handleHelp(env, chatId, false, messageId);
+  }
+  const usersPageMatch = data.match(/^!users:(\d+)$/);
+  if (usersPageMatch) {
+    return isAdmin
+      ? handleUsers(env, chatId, messageId, Number(usersPageMatch[1]))
+      : handleHelp(env, chatId, false, messageId);
+  }
+  const reportPageMatch = data.match(/^!r:(\d+):([a-z0-9][a-z0-9_-]{0,63})$/);
+  if (reportPageMatch) {
+    const page = Number(reportPageMatch[1]);
+    const target = reportPageMatch[2];
+    if (Number.isSafeInteger(page)) return showNodeReport(env, chatId, userId, isAdmin, target, messageId, page);
   }
   if (data === "!addhelp") {
     return isAdmin
@@ -257,7 +315,7 @@ async function showNodeMenu(env, chatId, userId, isAdmin, messageId = null) {
   return deliverTelegram(env, chatId, messageId, message, nodeMenuKeyboard(nodes, isAdmin));
 }
 
-async function showNodeReport(env, chatId, userId, isAdmin, target, messageId = null) {
+async function showNodeReport(env, chatId, userId, isAdmin, target, messageId = null, pageIndex = 0) {
   let reportInputs = [];
   if (isAdmin) {
     if (target === "all") {
@@ -286,8 +344,18 @@ async function showNodeReport(env, chatId, userId, isAdmin, target, messageId = 
       backKeyboard());
   }
   const reports = await generateReports(reportInputs);
-  const refreshTarget = target === "all" ? "!all" : target;
-  return deliverTelegram(env, chatId, messageId, reports.join("\n\n").trim(), detailKeyboard(refreshTarget));
+  const pages = paginateReportSections(reports, 3500);
+  const currentPage = Math.min(Math.max(0, pageIndex), pages.length - 1);
+  let message = `${pages[currentPage]}\n\n${TG_DIVIDER}\n第 ${currentPage + 1} / ${pages.length} 页`;
+  let commandPage = null;
+  if (pages.length > 1 && target !== "all") {
+    if (currentPage + 1 < pages.length && !reportPageCallback(target, currentPage + 1)) commandPage = currentPage + 1;
+    else if (currentPage > 0 && !reportPageCallback(target, currentPage - 1)) commandPage = currentPage - 1;
+  }
+  if (commandPage !== null) {
+    message += `\n长节点 Key 翻页：\`/ll ${target} ${commandPage + 1}\``;
+  }
+  return deliverTelegram(env, chatId, messageId, message, reportKeyboard(target, currentPage, pages.length));
 }
 
 function reportInputFromRow(row, allowedPorts) {
@@ -314,7 +382,7 @@ function parseAllowedPorts(value) {
 //    格式: /add <tg_id> <node> <port1,port2,...> [用户]
 //    示例: /add 987654321 hk 8080,8081 小王
 // ==============================================================
-async function handleAdd(env, chatId, text, messageId = null) {
+async function handleAdd(env, chatId, text, messageId = null, updateId = null) {
   const args = text.split(/\s+/);
   // args[0]=/add, [1]=tg_id, [2]=node, [3]=ports, [4...]=comment
 
@@ -416,12 +484,13 @@ async function handleAdd(env, chatId, text, messageId = null) {
   const portsJson = JSON.stringify(ports);
 
   // 写入 D1 (UPSERT)
-  await env.DB.prepare(
+  const commit = await commitTelegramUpdate(env, updateId, [env.DB.prepare(
     `INSERT INTO users (user_id, node_key, ports, comment)
      VALUES (?1, ?2, ?3, ?4)
      ON CONFLICT(user_id, node_key) DO UPDATE SET
        ports = ?3, comment = ?4`
-  ).bind(targetId, nodeKey, portsJson, comment).run();
+  ).bind(targetId, nodeKey, portsJson, comment)]);
+  if (!commit.committed) return new Response("OK");
 
   const lines = [
     `👤 TG-ID  \`${targetId}\``,
@@ -436,7 +505,7 @@ async function handleAdd(env, chatId, text, messageId = null) {
   } else {
     lines.push(`🔌 端口  \`${ports.join(", ")}\``);
   }
-  if (comment) lines.push(`🏷 用户  ${escMd(comment)}`);
+  if (comment) lines.push(`🏷 用户  ${escMd(displayLabel(comment))}`);
   return deliverTelegram(env, chatId, messageId,
     formatNotice("✅", existing ? "权限已更新" : "权限已添加", lines),
     helpKeyboard(true));
@@ -447,7 +516,7 @@ async function handleAdd(env, chatId, text, messageId = null) {
 //    /del <tg_id> --yes        → 删除该用户全部权限
 //    /del <tg_id> <node> --yes → 仅删除该用户对指定节点的权限
 // ==============================================================
-async function handleDel(env, chatId, text, messageId = null) {
+async function handleDel(env, chatId, text, messageId = null, updateId = null) {
   const args = text.split(/\s+/);
 
   if (args.length < 2) {
@@ -535,9 +604,11 @@ async function handleDel(env, chatId, text, messageId = null) {
   }
 
   if (nodeKey) {
-    const result = await env.DB.prepare(
+    const commit = await commitTelegramUpdate(env, updateId, [env.DB.prepare(
       "DELETE FROM users WHERE user_id = ?1 AND node_key = ?2"
-    ).bind(targetId, nodeKey).run();
+    ).bind(targetId, nodeKey)]);
+    if (!commit.committed) return new Response("OK");
+    const result = commit.results[1];
 
     if ((result.meta?.changes || 0) > 0) {
       return deliverTelegram(env, chatId, messageId, formatNotice(
@@ -549,9 +620,11 @@ async function handleDel(env, chatId, text, messageId = null) {
     ), helpKeyboard(true));
   }
 
-  const result = await env.DB.prepare(
+  const commit = await commitTelegramUpdate(env, updateId, [env.DB.prepare(
     "DELETE FROM users WHERE user_id = ?1"
-  ).bind(targetId).run();
+  ).bind(targetId)]);
+  if (!commit.committed) return new Response("OK");
+  const result = commit.results[1];
   const deletedCount = result.meta?.changes || 0;
   if (deletedCount > 0) {
     return deliverTelegram(env, chatId, messageId, formatNotice(
@@ -568,7 +641,7 @@ async function handleDel(env, chatId, text, messageId = null) {
 //    /delnode <node>          → 删除节点 + 关联的用户权限
 //    /delnode <node> --keep   → 仅删除节点数据，保留用户权限
 // ==============================================================
-async function handleDelNode(env, chatId, text) {
+async function handleDelNode(env, chatId, text, updateId = null) {
   const args = text.split(/\s+/);
 
   if (args.length < 2) {
@@ -581,31 +654,39 @@ async function handleDelNode(env, chatId, text) {
   const nodeKey = args[1].toLowerCase();
   const keepUsers = args[2]?.toLowerCase() === "--keep";
 
-  // 检查节点是否存在
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(nodeKey)) {
+    return tgReply(env, chatId, formatNotice("❌", "节点 Key 无效", ["节点 Key 格式错误。"]));
+  }
+
+  // 读取名称用于回执；节点不存在时仍继续清理孤立权限。
   const node = await env.DB.prepare(
     "SELECT node_key, node_id FROM nodes WHERE node_key = ?1"
   ).bind(nodeKey).first();
 
-  if (!node) {
-    return tgReply(env, chatId, formatNotice("⚠️", "节点不存在", [`未找到节点 \`${nodeKey}\`。`]));
+  const statements = [];
+  if (!keepUsers) {
+    statements.push(env.DB.prepare(
+      "DELETE FROM users WHERE node_key = ?1"
+    ).bind(nodeKey));
   }
+  statements.push(env.DB.prepare("DELETE FROM nodes WHERE node_key = ?1").bind(nodeKey));
+  const commit = await commitTelegramUpdate(env, updateId, statements);
+  if (!commit.committed) return new Response("OK");
 
-  // 删除节点数据。
-  await env.DB.prepare("DELETE FROM nodes WHERE node_key = ?1").bind(nodeKey).run();
-
-  const lines = [`🖥 节点  \`${nodeKey}\``, `🏷 名称  ${escMd(node.node_id)}`];
+  if (!node && keepUsers) {
+    return tgReply(env, chatId, formatNotice("⚠️", "节点不存在", [`未找到节点 \`${nodeKey}\`。`, "权限记录已保留。"]));
+  }
+  const lines = [`🖥 节点  \`${nodeKey}\``];
+  if (node) lines.push(`🏷 名称  ${escMd(displayLabel(node.node_id))}`);
+  else lines.push("ℹ️ 节点记录已不存在");
 
   if (!keepUsers) {
-    // 同时删除关联的用户权限
-    const userResult = await env.DB.prepare(
-      "DELETE FROM users WHERE node_key = ?1"
-    ).bind(nodeKey).run();
-
-    const userCount = userResult.meta.changes || 0;
+    const userResult = commit.results[1];
+    const userCount = userResult.meta?.changes || 0;
     if (userCount > 0) {
       lines.push(`🗑 权限  已清理 ${userCount} 条`);
     } else {
-      lines.push("🗑 权限  无关联记录");
+      lines.push("🗑 权限  无残留记录");
     }
   } else {
     lines.push("📌 权限  已保留");
@@ -617,7 +698,7 @@ async function handleDelNode(env, chatId, text) {
 // ==============================================================
 // 6. /users - 列出所有用户权限 (仅管理员)
 // ==============================================================
-async function handleUsers(env, chatId, messageId = null) {
+async function handleUsers(env, chatId, messageId = null, pageIndex = 0) {
   const rows = await env.DB.prepare(
     "SELECT user_id, node_key, ports, comment FROM users ORDER BY user_id, node_key"
   ).all();
@@ -628,29 +709,76 @@ async function handleUsers(env, chatId, messageId = null) {
     ), helpKeyboard(true));
   }
 
-  // 按 user_id 分组
+  // 按 user_id 汇总显示名，再按权限记录分页，端口只在完整值之间换行。
   const grouped = {};
   for (const r of rows.results) {
-    if (!grouped[r.user_id]) grouped[r.user_id] = { comment: r.comment || "", nodes: [] };
-    // 取最新的非空用户名称
+    if (!grouped[r.user_id]) grouped[r.user_id] = { comment: r.comment || "", entries: [] };
     if (r.comment && !grouped[r.user_id].comment) grouped[r.user_id].comment = r.comment;
     const ports = parseAllowedPorts(r.ports);
-    grouped[r.user_id].nodes.push({ node: r.node_key, ports });
+    grouped[r.user_id].entries.push({ node: r.node_key, ports });
   }
 
-  let msg = `👥 *用户权限*\n${TG_DIVIDER}`;
+  const heading = `👥 *用户权限*\n${TG_DIVIDER}`;
+  const cards = [];
   for (const [uid, info] of Object.entries(grouped)) {
-    const label = info.comment ? ` · ${escMd(info.comment)}` : "";
-    msg += `\n\n👤 *用户* \`${uid}\`${label}`;
-    for (let index = 0; index < info.nodes.length; index++) {
-      const n = info.nodes[index];
-      const branch = index === info.nodes.length - 1 ? "└" : "├";
-      msg += `\n${branch} \`${n.node}\`  ·  \`${n.ports.join(", ")}\``;
+    const label = info.comment ? ` · ${escMd(displayLabel(info.comment))}` : "";
+    for (const entry of info.entries) {
+      const cardHeader = `👤 *用户* \`${uid}\`${label}\n└ 节点 \`${entry.node}\``;
+      const portLines = packPortValues(entry.ports, 2400);
+      for (let index = 0; index < portLines.length; index++) {
+        cards.push(`${cardHeader}\n🔌 端口${index ? "（续）" : ""}  \`${portLines[index]}\``);
+      }
     }
   }
-  msg += `\n${TG_DIVIDER}\n共 ${Object.keys(grouped).length} 位授权用户`;
 
-  return deliverTelegram(env, chatId, messageId, msg, helpKeyboard(true));
+  const pages = paginateTextCards(heading, cards, 3500);
+  const currentPage = Math.min(Math.max(0, pageIndex), pages.length - 1);
+  const message = `${pages[currentPage]}\n\n${TG_DIVIDER}\n共 ${Object.keys(grouped).length} 位授权用户 · 第 ${currentPage + 1} / ${pages.length} 页`;
+  return deliverTelegram(env, chatId, messageId, message, usersKeyboard(currentPage, pages.length));
+}
+
+function packPortValues(ports, maxLength) {
+  if (!ports.length) return ["无"];
+  const chunks = [];
+  let current = "";
+  for (const value of ports) {
+    const token = String(value);
+    const next = current ? `${current}, ${token}` : token;
+    if (current && next.length > maxLength) {
+      chunks.push(current);
+      current = token;
+    } else {
+      current = next;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function paginateTextCards(heading, cards, maxLength) {
+  const pages = [];
+  let current = heading;
+  for (const card of cards) {
+    const addition = `\n\n${card}`;
+    if (current.length + addition.length <= maxLength) {
+      current += addition;
+    } else {
+      pages.push(current);
+      current = `${heading}\n\n${card}`;
+    }
+  }
+  if (current) pages.push(current);
+  return pages.length ? pages : [heading];
+}
+
+function usersKeyboard(pageIndex, pageCount) {
+  const rows = [];
+  const navigation = [];
+  if (pageIndex > 0) navigation.push({ text: "⬅️ 上一页", callback_data: `!users:${pageIndex - 1}` });
+  if (pageIndex + 1 < pageCount) navigation.push({ text: "下一页 ➡️", callback_data: `!users:${pageIndex + 1}` });
+  if (navigation.length) rows.push(navigation);
+  rows.push(...helpKeyboard(true).inline_keyboard);
+  return { inline_keyboard: rows };
 }
 
 // ==============================================================
@@ -710,7 +838,103 @@ async function generateReports(inputs) {
   }
   const geoMap = await lookupIpGeos(visibleIps);
 
-  return prepared.map(item => item.error || renderReport(item, geoMap));
+  return prepared.map(item => item.error
+    ? { header: "", blocks: [item.error] }
+    : renderReport(item, geoMap));
+}
+
+function paginateReportSections(sections, maxLength) {
+  const pages = [];
+  let current = "";
+  const flush = () => {
+    if (current) pages.push(current);
+    current = "";
+  };
+
+  for (const section of sections) {
+    const header = section.header || "";
+    if (header) {
+      if (!current) current = header;
+      else if (current.length + 2 + header.length > maxLength) {
+        flush();
+        current = header;
+      } else {
+        current += `\n\n${header}`;
+      }
+    }
+    for (const block of section.blocks) {
+      const pieces = splitLongReportBlock(block, Math.max(500, maxLength - header.length - 2));
+      for (const piece of pieces) {
+        const separator = current ? "\n\n" : "";
+        if (current.length + separator.length + piece.length <= maxLength) {
+          current += separator + piece;
+          continue;
+        }
+        flush();
+        current = header ? `${header}\n\n${piece}` : piece;
+      }
+    }
+  }
+  flush();
+  return pages.length ? pages : ["📭 暂无报告数据。"];
+}
+
+function splitLongReportBlock(block, maxLength) {
+  if (block.length <= maxLength) return [block];
+  const lines = block.split("\n");
+  const pieces = [];
+  const title = lines.shift() || "📄 端口详情";
+  let current = title;
+  for (const line of lines) {
+    const next = `${current}\n${line}`;
+    if (next.length <= maxLength) {
+      current = next;
+      continue;
+    }
+    pieces.push(current);
+    current = `${title}（续）`;
+    let remaining = line;
+    const room = Math.max(1, maxLength - current.length - 1);
+    while (remaining.length > room) {
+      pieces.push(`${current}\n${remaining.slice(0, room)}`);
+      remaining = remaining.slice(room);
+      current = `${title}（续）`;
+    }
+    current += `\n${remaining}`;
+  }
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+function reportKeyboard(target, pageIndex, pageCount) {
+  const rows = [];
+  const navigation = [];
+  const callbackFor = page => {
+    return reportPageCallback(target, page);
+  };
+  if (pageIndex > 0) {
+    const data = callbackFor(pageIndex - 1);
+    if (data) navigation.push({ text: "⬅️ 上一页", callback_data: data });
+  }
+  if (pageIndex + 1 < pageCount) {
+    const data = callbackFor(pageIndex + 1);
+    if (data) navigation.push({ text: "下一页 ➡️", callback_data: data });
+  }
+  if (navigation.length) rows.push(navigation);
+
+  const refreshTarget = pageIndex > 0
+    ? reportPageCallback(target, pageIndex) || (target === "all" ? "!all" : target)
+    : (target === "all" ? "!all" : target);
+  rows.push([
+    { text: "⬅️ 返回节点列表", callback_data: "!list" },
+    { text: "🔄 刷新", callback_data: refreshTarget }
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function reportPageCallback(target, pageIndex) {
+  const data = `!r:${pageIndex}:${target}`;
+  return new TextEncoder().encode(data).length <= 64 ? data : null;
 }
 
 function renderReport(input, geoMap) {
@@ -721,10 +945,13 @@ function renderReport(input, geoMap) {
   const freshIcon = freshness < 180 ? "🟢" : "🔴";
   const freshStr = fmtAge(freshness);
 
-  let report = `📊 *${escMd(nodeId)}*`;
+  // Legacy Markdown cannot escape special characters inside a bold entity.
+  let report = `📊 ${escMd(displayLabel(nodeId))}`;
   report += `\n├ 节点 \`${nodeKey}\``;
   report += `\n└ 状态 ${freshIcon} ${freshStr}`;
   report += `\n${TG_DIVIDER}`;
+  const header = report;
+  const blocks = [];
   let hasData = false;
 
   // PM 的分组配额按组内所有端口的合计流量执行，报告必须使用同一口径。
@@ -772,42 +999,43 @@ function renderReport(input, geoMap) {
     else if (isPunished) statusIcon = "⚡";
     else if (pct >= 80)  statusIcon = "⚠️";
 
-    const safeComment = comment ? ` · ${escMd(comment)}` : "";
+    const safeComment = comment ? ` · ${escMd(displayLabel(comment))}` : "";
     const modeText = mode === "out_only" ? "仅出站" : "双向";
     const policyParts = [modeText];
-    if (groupId) policyParts.push(`分组 ${escMd(groupId)}`);
+    if (groupId) policyParts.push(`分组 ${escMd(displayLabel(groupId))}`);
     if (resetDay > 0) policyParts.push(`${resetDay} 日重置`);
     if (burstEnabled) policyParts.push("突发保护");
     const expiryText = formatExpiryStatus(expiryDate, now);
 
-    report += `\n\n${statusIcon} \`${port}\`${safeComment}`;
-    report += `\n├ 📦 ${fmtBytes(totalUsed)} / ${quotaGb} GB · ${formatPercent(pct)}`;
-    report += `\n├ ⚙️ ${policyParts.join(" · ")}`;
+    let block = `${statusIcon} \`${port}\`${safeComment}`;
+    block += `\n├ 📦 ${fmtBytes(totalUsed)} / ${quotaGb} GB · ${formatPercent(pct)}`;
+    block += `\n├ ⚙️ ${policyParts.join(" · ")}`;
     if (expiryText) {
-      report += `\n├ 📅 ${expiryText}`;
+      block += `\n├ 📅 ${expiryText}`;
     }
     if (isPunished) {
-      report += `\n├ ⚡ 突发限速 ${burstLimitMbps} Mbps`;
+      block += `\n├ ⚡ 突发限速 ${burstLimitMbps} Mbps`;
     } else if (legacyLimitMbps > 0) {
-      report += `\n├ 🔒 旧版出站限速 ${legacyLimitMbps} Mbps`;
+      block += `\n├ 🔒 旧版出站限速 ${legacyLimitMbps} Mbps`;
     }
 
     const shownIps = onlineIps.slice(0, 8).map(ip => String(ip || "").trim()).filter(Boolean);
     const hasMore = onlineTruncated || onlineCount > shownIps.length;
-    report += `\n└ 👥 在线 ${onlineCount} IP`;
+    block += `\n└ 👥 在线 ${onlineCount} IP`;
     for (let index = 0; index < shownIps.length; index++) {
       const branch = index === shownIps.length - 1 && !hasMore ? "└" : "├";
-      report += `\n   ${branch} ${formatIpWithGeo(shownIps[index], geoMap)}`;
+      block += `\n   ${branch} ${formatIpWithGeo(shownIps[index], geoMap)}`;
     }
-    if (hasMore) report += "\n   └ 其余 IP 已折叠";
+    if (hasMore) block += "\n   └ 其余 IP 已折叠";
+    blocks.push(block);
     hasData = true;
   }
 
   if (!hasData) {
-    report += `\n📭 暂无监控端口或无权访问。`;
+    blocks.push("📭 暂无监控端口或无权访问。");
   }
 
-  return report;
+  return { header, blocks };
 }
 
 // ==============================================================
@@ -941,10 +1169,10 @@ async function lookupIpGeos(ips) {
 }
 
 function formatIpWithGeo(ip, geoMap) {
-  const safeIp = escMd(ip);
+  const safeIp = escMd(displayLabel(ip, 64));
   const geo = geoMap[ip];
   if (!geo) return `\`${safeIp}\``;
-  return `\`${safeIp}\` · ${escMd(geo)}`;
+  return `\`${safeIp}\` · ${escMd(displayLabel(geo, 160))}`;
 }
 
 function isLikelyPublicIp(ip) {
@@ -968,6 +1196,13 @@ function secureEqual(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+// Only shorten display labels; stored identifiers, permissions and statistics stay intact.
+// Truncate before Markdown escaping so an escape pair is never split by pagination.
+function displayLabel(value, maxLength = 120) {
+  const chars = Array.from(String(value ?? "").replace(/[\r\n]+/g, " "));
+  return chars.length > maxLength ? `${chars.slice(0, maxLength - 1).join("")}…` : chars.join("");
 }
 
 function escMd(s) {
@@ -1030,15 +1265,6 @@ function helpKeyboard(isAdmin) {
   ] };
 }
 
-function detailKeyboard(refreshTarget) {
-  return {
-    inline_keyboard: [[
-      { text: "⬅️ 返回节点列表", callback_data: "!list" },
-      { text: "🔄 刷新", callback_data: refreshTarget }
-    ]]
-  };
-}
-
 function backKeyboard() {
   return { inline_keyboard: [[{ text: "⬅️ 返回节点列表", callback_data: "!list" }]] };
 }
@@ -1048,6 +1274,7 @@ async function deliverTelegram(env, chatId, messageId, text, replyMarkup = null)
     try {
       return await tgEdit(env, chatId, messageId, text, replyMarkup);
     } catch (error) {
+      if (error?.telegramStatus === 429) throw error;
       console.error("Telegram edit failed; falling back to sendMessage", error?.message || error);
     }
   }
@@ -1071,23 +1298,19 @@ async function tgAnswerCallback(env, callbackQueryId) {
 async function tgEdit(env, chatId, messageId, text, replyMarkup = null) {
   const token = env.BOT_TOKEN;
   if (!token) return new Response("BOT_TOKEN not set", { status: 500 });
-  const response = await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+  try {
+    await fetchTelegramApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: messageId,
       text,
       parse_mode: "Markdown",
       reply_markup: replyMarkup || { inline_keyboard: [] }
-    })
-  });
-  if (!response.ok) {
-    const errorBody = (await response.text()).slice(0, 300);
-    if (response.status === 400 && errorBody.includes("message is not modified")) {
+    });
+  } catch (error) {
+    if (error?.telegramStatus === 400 && error.message.includes("message is not modified")) {
       return new Response("OK");
     }
-    throw new Error(`Telegram edit failed with HTTP ${response.status}: ${errorBody}`);
+    throw error;
   }
   return new Response("OK");
 }
@@ -1095,34 +1318,42 @@ async function tgEdit(env, chatId, messageId, text, replyMarkup = null) {
 async function tgReply(env, chatId, text, replyMarkup = null) {
   const token = env.BOT_TOKEN;
   if (!token) return new Response("BOT_TOKEN not set", { status: 500 });
+  if (text.length > 4096) throw new Error("Telegram message exceeds 4096 characters; split it into paginated messages before sending");
+  const payload = { chat_id: chatId, text, parse_mode: "Markdown" };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  await fetchTelegramApi(token, "sendMessage", payload);
+  return new Response("OK");
+}
 
-  const chunks = [];
-  if (text.length <= 4096) {
-    chunks.push(text);
-  } else {
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= 4096) { chunks.push(remaining); break; }
-      let cut = remaining.lastIndexOf("\n", 4096);
-      if (cut <= 0) cut = 4096;
-      chunks.push(remaining.substring(0, cut));
-      remaining = remaining.substring(cut);
-    }
-  }
-
-  for (let index = 0; index < chunks.length; index++) {
-    const payload = { chat_id: chatId, text: chunks[index], parse_mode: "Markdown" };
-    if (replyMarkup && index === chunks.length - 1) payload.reply_markup = replyMarkup;
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+async function fetchTelegramApi(token, method, payload) {
+  const url = `https://api.telegram.org/bot${token}/${method}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!response.ok) {
-      const errorBody = (await response.text()).slice(0, 200);
-      throw new Error(`Telegram API failed with HTTP ${response.status}: ${errorBody}`);
-    }
-  }
+    if (response.ok) return response;
 
-  return new Response("OK");
+    const errorBody = (await response.text()).slice(0, 300);
+    if (response.status === 429) {
+      let retryAfter = NaN;
+      try {
+        const value = JSON.parse(errorBody).parameters?.retry_after;
+        if (typeof value === "number" && Number.isFinite(value)) retryAfter = value;
+      } catch {}
+      const retryBoundSeconds = 2;
+      if (attempt === 0 && Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= retryBoundSeconds) {
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        continue;
+      }
+      const error = new Error(`Telegram API rate limited (HTTP 429, retry_after=${Number.isFinite(retryAfter) ? retryAfter : "unknown"}s): ${errorBody}`);
+      error.telegramStatus = 429;
+      throw error;
+    }
+    const error = new Error(`Telegram API failed with HTTP ${response.status}: ${errorBody}`);
+    error.telegramStatus = response.status;
+    throw error;
+  }
+  throw new Error("Telegram API retry loop ended unexpectedly");
 }

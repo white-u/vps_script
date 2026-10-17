@@ -30,6 +30,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 | **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 独立脚本，不再由 `vt` 调度或统一卸载。 |
 | **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | 支持 Reality、SS2022 节点及核心更新回滚。 |
 | **[fw.sh](FW_DOC.md)** | **端口转发** | `fw` | 基于 **Realm** 的轻量端口转发，支持 TCP/UDP，不自动修改防火墙。 |
+| **[init.sh](init.sh)** | **系统初始化** | — | Debian/Ubuntu 系统更新、网络自动校时、主机名、常用工具、BBR 和 SSH 配置。 |
+
+`init.sh` 优先复用已有的 chrony/NTP 校时服务；未检测到时安装 `systemd-timesyncd`，启用服务并设为开机启动。最多等待 30 秒检查同步结果，尚未同步会显示警告及排查方法。脚本第一步的系统更新仍要求 APT 源可用；失败时先修复软件源再继续初始化。
 
 ---
 

@@ -16,6 +16,57 @@ warn() {
     echo -e "${YELLOW}⚠️ 警告: $1${NC}" >&2
 }
 
+configure_network_time() {
+    local service="" candidate load_state sync_status attempt
+    local -a candidates=(chrony.service chronyd.service ntpsec.service ntp.service openntpd.service systemd-timesyncd.service)
+    command -v timedatectl >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 \
+        || fail "网络校时需要 systemd、systemctl 和 timedatectl"
+    systemctl show --property=Version --value >/dev/null \
+        || fail "无法连接 systemd，网络校时配置已停止"
+
+    # 优先复用正在运行的服务，避免替换已有 chrony/NTP 配置。
+    for candidate in "${candidates[@]}"; do
+        if systemctl is-active --quiet "$candidate"; then
+            service=$candidate
+            break
+        fi
+    done
+    if [ -z "$service" ]; then
+        for candidate in "${candidates[@]}"; do
+            load_state=$(systemctl show --property=LoadState --value "$candidate" 2>/dev/null)
+            if [[ "$load_state" == "loaded" || "$load_state" == "masked" ]]; then
+                service=$candidate
+                break
+            fi
+        done
+    fi
+    if [ -z "$service" ]; then
+        echo -e "${YELLOW}未检测到校时服务，正在安装 systemd-timesyncd...${NC}"
+        apt install -y systemd-timesyncd || fail "校时服务安装失败，请检查 APT 源和网络"
+        service=systemd-timesyncd.service
+    fi
+    systemctl enable --now "$service" \
+        || fail "无法启用校时服务 ${service}，请检查服务是否被屏蔽及 journalctl 日志"
+    systemctl is-active --quiet "$service" || fail "校时服务 ${service} 未正常运行"
+
+    TIME_SYNC_STATUS="已启用（等待同步）"
+    echo -e "${YELLOW}校时服务 ${service} 已启用并设为开机启动，最多等待 30 秒确认同步...${NC}"
+    for ((attempt=0; attempt<=6; attempt++)); do
+        if ! sync_status=$(timedatectl show --property=NTPSynchronized --value 2>&1); then
+            warn "无法读取时间同步状态: ${sync_status}"
+            break
+        fi
+        if [ "$sync_status" == "yes" ]; then
+            TIME_SYNC_STATUS="已同步（${service}，开机自动校时）"
+            echo -e "${GREEN}网络时间同步成功。${NC}"
+            return 0
+        fi
+        if [ "$attempt" -lt 6 ]; then sleep 5; fi
+    done
+    systemctl is-active --quiet "$service" || fail "校时服务 ${service} 已停止，请检查服务日志"
+    warn "自动校时已启用，但尚未确认同步。请检查 timedatectl status 和 journalctl -u ${service} -n 30 --no-pager；确认 DNS、NTP 服务器及 UDP 123 网络可达。"
+}
+
 # ==============================
 # 0. 环境预检
 # ==============================
@@ -42,16 +93,22 @@ echo -e "${BLUE}=================================================${NC}"
 # ==============================
 # 1. 系统更新与清理
 # ==============================
-echo -e "${YELLOW}[1/6] 正在更新系统并清理旧依赖...${NC}"
+echo -e "${YELLOW}[1/7] 正在更新系统并清理旧依赖...${NC}"
 apt update -y && apt upgrade -y || fail "系统软件包更新失败，请检查 APT 源和网络"
 apt autoremove -y || warn "apt autoremove 执行失败，可稍后手动运行"
 apt clean || warn "apt clean 执行失败"
 echo -e "${GREEN}系统更新完成。${NC}"
 
 # ==============================
-# 2. 修改主机名
+# 2. 网络时间同步
 # ==============================
-echo -e "${YELLOW}[2/6] 主机名设置${NC}"
+echo -e "${YELLOW}[2/7] 配置网络自动校时...${NC}"
+configure_network_time
+
+# ==============================
+# 3. 修改主机名
+# ==============================
+echo -e "${YELLOW}[3/7] 主机名设置${NC}"
 CURRENT_HOSTNAME=$(hostname)
 echo -e "当前主机名: ${BLUE}${CURRENT_HOSTNAME}${NC}"
 read -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
@@ -69,9 +126,9 @@ else
 fi
 
 # ==============================
-# 3. 安装必备工具 (无 ufw/net-tools)
+# 4. 安装必备工具 (无 ufw/net-tools)
 # ==============================
-echo -e "${YELLOW}[3/6] 正在安装必备工具 (curl, wget, vim, unzip, nano, iperf3)...${NC}"
+echo -e "${YELLOW}[4/7] 正在安装必备工具 (curl, wget, vim, unzip, nano, iperf3)...${NC}"
 apt install -y curl wget unzip nano vim iperf3 || fail "基础工具安装失败"
 
 echo -e "${YELLOW}正在安装 nexttrace...${NC}"
@@ -84,9 +141,9 @@ fi
 echo -e "${GREEN}工具安装完成。${NC}"
 
 # ==============================
-# 4. 内核 BBR 加速
+# 5. 内核 BBR 加速
 # ==============================
-echo -e "${YELLOW}[4/6] 检查并开启 BBR 加速...${NC}"
+echo -e "${YELLOW}[5/7] 检查并开启 BBR 加速...${NC}"
 if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
     if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
@@ -99,9 +156,9 @@ else
 fi
 
 # ==============================
-# 5. SSH 安全加固 (交互式)
+# 6. SSH 安全加固 (交互式)
 # ==============================
-echo -e "${YELLOW}[5/6] SSH 安全配置${NC}"
+echo -e "${YELLOW}[6/7] SSH 安全配置${NC}"
 
 # 备份配置
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%F_%T)"
@@ -201,9 +258,9 @@ sshd_set "PermitRootLogin" "yes"
 sshd_set "PubkeyAuthentication" "yes"
 
 # ==============================
-# 6. 重启服务与提示
+# 7. 重启服务与提示
 # ==============================
-echo -e "${YELLOW}[6/6] 正在验证 SSH 配置并重启服务...${NC}"
+echo -e "${YELLOW}[7/7] 正在验证 SSH 配置并重启服务...${NC}"
 
 # 验证配置语法 (防止重启失败导致失联)
 if ! sshd -t; then
@@ -244,6 +301,8 @@ if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
 else
     echo -e "5. 登录方式: ${YELLOW}密码 + 密钥${NC}"
 fi
+
+echo -e "6. 网络校时: ${BLUE}${TIME_SYNC_STATUS}${NC}"
 
 echo -e "${RED}!!! 特别注意 !!!${NC}"
 echo -e "请先从一个新的终端测试端口 ${RED}$SSH_PORT${NC} 登录成功，再关闭当前会话。"
