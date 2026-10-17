@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.6 (流量监控稳定性修复)
+# 版本: v5.6.7 (Telegram 特殊字符通知修复)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.6"
+SCRIPT_VERSION="5.6.7"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -1274,7 +1274,7 @@ tg_notify_quota() {
     
     tg_send_checked "${icon} *流量预警*
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 ├ 📦 流量  ${used_fmt} / ${quota_gb} GB
 ├ 📋 统计  ${mode_str}
@@ -1296,7 +1296,7 @@ tg_notify_blocked() {
 
     tg_send_checked "🚫 *${title}*
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 ├ 📦 配额  ${quota_gb} GB
 └ 🔄 重置  ${reset_str}
@@ -1309,7 +1309,7 @@ tg_notify_punish() {
     local label=$(get_host_label "$comment" "$group_id")
     tg_send_checked "⚡ *突发限速触发*
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 ├ 📈 当前速率  ${avg_mbps} Mbps
 ├ 🎯 阈值  ${BURST_TRIGGER_MBPS} Mbps / ${BURST_TRIGGER_MINUTES} 分钟
@@ -1324,7 +1324,7 @@ tg_notify_recover() {
     local label=$(get_host_label "$comment" "$group_id")
     tg_send_checked "✅ *限速已恢复*
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 └ 📈 状态  已恢复不限速
 ${TG_DIVIDER}
@@ -1346,7 +1346,7 @@ tg_notify_expiry() {
     [ "$days_remaining" -eq 0 ] && remaining="*今天到期*"
     tg_send_checked "⏰ *用户到期提醒*
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 ├ 📅 到期  ${expiry_date}
 └ ⏳ ${remaining}
@@ -1525,7 +1525,7 @@ tg_notify_ip_alert() {
     fi
     tg_send_checked "${title}
 ${TG_DIVIDER}
-🖥 *${label}*
+🖥 ${label}
 ├ 🔌 端口  \`${port}\`
 ├ 👥 在线  *${ip_count} IP*
 ├ 🎯 阈值  ${max_ips} IP
@@ -3116,7 +3116,7 @@ configure_telegram() {
                     local safe_nid=$(echo "$nid" | sed 's/[_*`\[]/\\&/g')
                     local test_msg="✅ *Telegram 通知测试*
 ${TG_DIVIDER}
-🖥 节点  *${safe_nid}*
+🖥 节点  ${safe_nid}
 └ 📡 状态  Bot 通信正常
 ${TG_DIVIDER}
 ℹ️ PM 通知配置已生效"
