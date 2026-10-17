@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v3.4
+ * Cloudflare Worker - 端口流量查询中控 v3.5
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB
@@ -13,6 +13,7 @@
  *
  * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
  *
+ * v3.5 变更: 特殊分组名安全聚合，大批量授权回执与删除预览使用有界摘要
  * v3.4 变更: 长查询按页显示，Telegram 限流按 retry_after 有界重试
  * v3.3 变更: 管理员写操作按 Telegram update_id 幂等提交，节点及权限删除原子化
  * v3.2 变更: 增加 TG-ID 查询、权限操作引导、真实端口校验与删除确认
@@ -377,6 +378,13 @@ function parseAllowedPorts(value) {
   }
 }
 
+function formatPortSummary(ports, maxShown = 12) {
+  if (!ports.length) return "无";
+  const shown = ports.slice(0, maxShown).join(", ");
+  const suffix = ports.length > maxShown ? ", …" : "";
+  return `共 ${ports.length} 个：\`${shown}${suffix}\``;
+}
+
 // ==============================================================
 // 4. /add - 添加/更新用户权限 (仅管理员)
 //    格式: /add <tg_id> <node> <port1,port2,...> [用户]
@@ -500,14 +508,15 @@ async function handleAdd(env, chatId, text, messageId = null, updateId = null) {
     const oldPorts = parseAllowedPorts(existing.ports)
       .map(Number).filter(port => Number.isSafeInteger(port) && port >= 1 && port <= 65535)
       .sort((a, b) => a - b);
-    lines.push(`↩️ 原端口  \`${oldPorts.join(", ") || "无"}\``);
-    lines.push(`🔌 新端口  \`${ports.join(", ")}\``);
+    lines.push(`↩️ 原端口  ${formatPortSummary(oldPorts)}`);
+    lines.push(`🔌 新端口  ${formatPortSummary(ports)}`);
   } else {
-    lines.push(`🔌 端口  \`${ports.join(", ")}\``);
+    lines.push(`🔌 端口  ${formatPortSummary(ports)}`);
   }
   if (comment) lines.push(`🏷 用户  ${escMd(displayLabel(comment))}`);
   return deliverTelegram(env, chatId, messageId,
-    formatNotice("✅", existing ? "权限已更新" : "权限已添加", lines),
+    formatNotice("✅", existing ? "权限已更新" : "权限已添加", lines,
+      "端口较多时仅显示部分示例；完整授权列表请发送 /users。"),
     helpKeyboard(true));
 }
 
@@ -571,11 +580,11 @@ async function handleDel(env, chatId, text, messageId = null, updateId = null) {
         [
           `👤 TG-ID  \`${targetId}\``,
           `🖥 节点  \`${nodeKey}\``,
-          `🔌 端口  \`${ports.join(", ") || "无"}\``,
+          `🔌 端口  ${formatPortSummary(ports)}`,
           "",
           `确认命令 \`/del ${targetId} ${nodeKey} --yes\``
         ],
-        "当前尚未删除。"
+        "当前尚未删除。端口较多时仅显示部分示例；发送 /users 查看完整授权列表。"
       ), helpKeyboard(true));
     }
 
@@ -955,14 +964,14 @@ function renderReport(input, geoMap) {
   let hasData = false;
 
   // PM 的分组配额按组内所有端口的合计流量执行，报告必须使用同一口径。
-  const groupUsage = {};
+  const groupUsage = new Map();
   for (const p of Object.values(ports)) {
     const groupId = p?.group_id || "";
     if (!groupId) continue;
     const accIn = Math.floor(p.stats?.acc_in || 0);
     const accOut = Math.floor(p.stats?.acc_out || 0);
     const used = (p.quota_mode || "in_out") === "out_only" ? accOut : accIn + accOut;
-    groupUsage[groupId] = (groupUsage[groupId] || 0) + used;
+    groupUsage.set(groupId, (groupUsage.get(groupId) || 0) + used);
   }
 
   for (const port of sortedPorts) {
@@ -989,7 +998,7 @@ function renderReport(input, geoMap) {
     const onlineTruncated = online.truncated === true;
 
     const ownUsed = mode === "out_only" ? accOut : (accIn + accOut);
-    const totalUsed = groupId ? (groupUsage[groupId] || 0) : ownUsed;
+    const totalUsed = groupId ? (groupUsage.get(groupId) || 0) : ownUsed;
     const quotaBytes = quotaGb * 1024 * 1024 * 1024;
     const pct = quotaBytes > 0 ? (totalUsed * 100 / quotaBytes) : 0;
     const isBlocked = quotaBytes > 0 && totalUsed > quotaBytes;

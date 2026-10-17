@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.7 (Telegram 特殊字符通知修复)
+# 版本: v5.6.8 (异常状态保护与离线周期恢复)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.7"
+SCRIPT_VERSION="5.6.8"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -241,6 +241,7 @@ version_is_older() {
 # --- 端口运行状态 读/写 (零 fork, bash 内置) ---
 # 所有运行时变量使用 s_ 前缀, 避免与其他变量冲突
 _init_port_state_defaults() {
+    _PORT_STATE_VALID=true
     s_state_version=0
     s_acc_in=0; s_acc_out=0; s_last_k_in=0; s_last_k_out=0
     s_last_reset_ts=0; s_high_seconds=0; s_is_punished=false; s_punish_end_ts=0
@@ -252,30 +253,43 @@ _init_port_state_defaults() {
 
 _load_port_state() {
     _init_port_state_defaults
+    _PORT_STATE_VALID=false
     local sf="$STATE_DIR/${1}.txt"
-    [ -f "$sf" ] || return 0
+    if [ ! -f "$sf" ] || [ ! -s "$sf" ] || [ ! -r "$sf" ]; then
+        pm_error "端口 ${1} 状态文件缺失、为空或不可读，已停止依赖该状态的操作，请从备份恢复: ${sf}"
+        return 1
+    fi
 
-    # 状态文件是数据而不是脚本；仅接收已知字段，损坏内容不会被执行。
-    local key value
-    while IFS='=' read -r key value; do
+    # 状态文件是数据而不是脚本。旧版可缺少新增字段，累计和基线必须完整有效。
+    local key value invalid=false
+    local -A seen=()
+    if ! while IFS='=' read -r key value || [ -n "$key" ]; do
         case "$key" in
             s_state_version|s_acc_in|s_acc_out|s_last_k_in|s_last_k_out|s_last_reset_ts|s_high_seconds|s_punish_end_ts|s_quota_level|s_last_alert_ts|s_ip_alert_level|s_last_sample_ts)
-                [[ "$value" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$value"
-                ;;
+                if [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] && { [ "${#value}" -lt 19 ] || { [ "${#value}" -eq 19 ] && [[ "$value" < 9223372036854775808 ]]; }; }; then
+                    printf -v "$key" '%s' "$value"
+                    seen["$key"]=1
+                else
+                    invalid=true
+                fi ;;
             s_is_punished|s_punish_notified|s_recover_notified|s_rules_dirty)
-                [[ "$value" == "true" || "$value" == "false" ]] && printf -v "$key" '%s' "$value"
-                ;;
-            s_last_alert_ips)
-                printf -v "$key" '%s' "$value"
-                ;;
+                if [[ "$value" == "true" || "$value" == "false" ]]; then printf -v "$key" '%s' "$value"; else invalid=true; fi ;;
+            s_last_alert_ips) printf -v "$key" '%s' "$value" ;;
             s_expiry_notified_date)
-                [[ -z "$value" || "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && printf -v "$key" '%s' "$value"
-                ;;
+                if [[ -z "$value" || "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then printf -v "$key" '%s' "$value"; else invalid=true; fi ;;
             s_pending_qos_notice)
-                [[ -z "$value" || "$value" == "punish" || "$value" == "recover" ]] && printf -v "$key" '%s' "$value"
-                ;;
+                if [[ -z "$value" || "$value" == "punish" || "$value" == "recover" ]]; then printf -v "$key" '%s' "$value"; else invalid=true; fi ;;
         esac
-    done < "$sf"
+    done < "$sf"; then
+        invalid=true
+    fi
+    for key in s_acc_in s_acc_out s_last_k_in s_last_k_out s_last_reset_ts; do
+        [[ -n "${seen[$key]+x}" ]] || invalid=true
+    done
+    if [ "$invalid" == true ]; then
+        pm_error "端口 ${1} 状态文件损坏，原文件已保留，已停止依赖该状态的操作: ${sf}"
+        return 1
+    fi
 
     # v1 状态可能包含旧的自定义 QoS 惩罚；升级后统一从固定策略的未触发状态开始。
     if [ "$s_state_version" -lt "$PORT_STATE_VERSION" ]; then
@@ -284,10 +298,12 @@ _load_port_state() {
         s_punish_notified=false; s_recover_notified=true
         s_rules_dirty=false; s_pending_qos_notice=""
     fi
+    _PORT_STATE_VALID=true
 }
 
 _save_port_state() {
     local port=$1 tmp
+    [ "${_PORT_STATE_VALID:-false}" == true ] || { pm_error "拒绝覆盖端口 ${port} 的无效状态"; return 1; }
     [[ "$port" =~ ^[0-9]+$ ]] || { pm_error "拒绝写入无效端口状态: ${port}"; return 1; }
     tmp=$(mktemp "$STATE_DIR/.${port}.tmp.XXXXXX") || { pm_error "无法创建端口 ${port} 的状态临时文件"; return 1; }
     if ! cat > "$tmp" << STATEEOF
@@ -817,7 +833,7 @@ reset_owned_tc_root() {
 # 即使创建事务失败或进程中断，重试也不会把新计数误当作旧计数的延续。
 _reset_counter_baselines() {
     local port=$1 missing_in=$2 missing_out=$3 changed=false
-    _load_port_state "$port"
+    _load_port_state "$port" || return 1
     if [ "$missing_in" == true ] && [ "$s_last_k_in" -ne 0 ]; then
         s_last_k_in=0; changed=true
     fi
@@ -875,7 +891,7 @@ apply_port_rules() {
     [ -z "$iface" ] && iface=$(get_iface)
     
     # 正常状态始终不限速；只有已接入端口处于保护期时才临时创建 50 Mbps class。
-    _load_port_state "$port"
+    _load_port_state "$port" || return 1
     if [ "$burst_enabled" == "true" ] && [ "$s_is_punished" == "true" ]; then
         effective_limit_mbps=$BURST_LIMIT_MBPS
     fi
@@ -988,9 +1004,10 @@ reload_all_rules() {
     reset_owned_tc_root || tc_reset_ok=false
     for reload_port in $ports; do
         if [ "$tc_reset_ok" != "true" ] || ! apply_port_rules "$reload_port"; then
-            _load_port_state "$reload_port"
-            s_rules_dirty=true
-            _save_port_state "$reload_port" || pm_error "端口 ${reload_port} 的规则重试状态保存失败"
+            if _load_port_state "$reload_port"; then
+                s_rules_dirty=true
+                _save_port_state "$reload_port" || pm_error "端口 ${reload_port} 的规则重试状态保存失败"
+            fi
             reload_failed=true
         fi
     done
@@ -1426,9 +1443,10 @@ push_to_worker() {
     [ -z "$online_json" ] && online_json='{}'
 
     # 运行状态先汇总成对象，再一次性合并到 payload，端口数增加时不再线性启动 jq。
-    runtime_json=$(
+    if ! runtime_json=$(
+        set -o pipefail
         for _pp in $push_ports; do
-            _load_port_state "$_pp"
+            _load_port_state "$_pp" || exit 1
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$_pp" "$s_acc_in" "$s_acc_out" "$s_last_k_in" "$s_last_k_out" \
                 "$s_is_punished" "$s_high_seconds" "$s_punish_end_ts" "$s_quota_level"
@@ -1453,7 +1471,10 @@ push_to_worker() {
                     })
                   })
         '
-    )
+    ); then
+        pm_error "Worker 端口状态汇总失败，已停止上报以免覆盖云端历史数据"
+        return 1
+    fi
     [ -n "$runtime_json" ] || { pm_error "Worker 端口状态汇总失败"; return 1; }
     payload=$(jq -c --argjson runtime "$runtime_json" '
         reduce ($runtime | to_entries[]) as $entry (.;
@@ -1710,7 +1731,7 @@ check_ip_sentinel() {
             [[ -z "${whitelist_set[$normalized_ip]+x}" ]] && filtered_ips+=("$ip")
         done <<< "$raw_ips"
         local ip_count=${#filtered_ips[@]}
-        _load_port_state "$port"
+        if ! _load_port_state "$port"; then sentinel_failed=true; continue; fi
 
         # 回到安全范围即结束本轮事件；下次再次超限会重新发送一级告警。
         if [ "$ip_count" -le "$max_ips" ]; then
@@ -1820,7 +1841,7 @@ check_ip_sentinel() {
 
 _reset_ip_alert_state() {
     local port=$1
-    _load_port_state "$port"
+    _load_port_state "$port" || return 1
     s_last_alert_ts=0; s_last_alert_ips=""; s_ip_alert_level=0
     _save_port_state "$port"
 }
@@ -1981,6 +2002,22 @@ _send_pending_qos_notice() {
     _save_port_state "$port"
 }
 
+# 返回最近一次已经到期的月度边界；停机跨月也只清账一次。
+_latest_monthly_reset() {
+    local now=$1 day=$2 month days effective boundary
+    month=$(date -d "@$now" '+%Y-%m') || return 1
+    days=$(date -d "${month}-01 +1 month -1 day" +%-d) || return 1
+    effective=$day; [ "$effective" -le "$days" ] || effective=$days
+    boundary=$(date -d "${month}-${effective} 00:00:00" +%s) || return 1
+    if [ "$boundary" -gt "$now" ]; then
+        month=$(date -d "${month}-01 -1 month" '+%Y-%m') || return 1
+        days=$(date -d "${month}-01 +1 month -1 day" +%-d) || return 1
+        effective=$day; [ "$effective" -le "$days" ] || effective=$days
+        boundary=$(date -d "${month}-${effective} 00:00:00" +%s) || return 1
+    fi
+    printf '%s\n' "$boundary"
+}
+
 cron_task() {
     exec 9>"$CRON_LOCK_FILE"
     flock -n 9 || exit 0
@@ -1999,6 +2036,7 @@ cron_task() {
     local ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
     local current_ts=$(date +%s)
     local cron_failed=false
+    local -A invalid_state_ports=() invalid_state_groups=()
 
     # --- 阶段一：采集数据 + 固定突发限速 (Port Level) ---
     # [PERF] 一次性读取全部 nft 计数器 (零循环内 nft 调用)
@@ -2026,7 +2064,11 @@ cron_task() {
     done <<< "$_burst_cfg_data"
 
     for port in $ports; do
-        _load_port_state "$port"
+        if ! _load_port_state "$port"; then
+            invalid_state_ports["$port"]=1
+            cron_failed=true
+            continue
+        fi
 
         local sample_seconds=60
         local sample_contiguous=true
@@ -2081,8 +2123,7 @@ cron_task() {
 
     # 月度清账先于组聚合：累计、基线和周期标记一次提交。
     # 配额封禁在阶段三按新用量恢复；TC 保护状态独立，不因清账重建。
-    local reset_cfg current_year_month="" days_in_month="" reset_port reset_day reset_gid
-    local reset_ts effective_day reset_date
+    local reset_cfg reset_port reset_day reset_gid reset_ts
     declare -A reset_ts_cache reset_failed_ports reset_failed_groups
     reset_cfg=$(jq -r '
         .ports | to_entries[] | select((.value.reset_day // 0) > 0) |
@@ -2090,22 +2131,15 @@ cron_task() {
         | map(tostring) | join("\u001f")' <<< "$tmp_json")
     while IFS=$'\x1f' read -r reset_port reset_day reset_gid; do
         [ -z "$reset_port" ] && continue
-        if [ -z "$current_year_month" ]; then
-            if ! current_year_month=$(date -d "@$current_ts" '+%Y-%m') \
-                || ! days_in_month=$(date -d "${current_year_month}-01 +1 month -1 day" +%-d); then
-                pm_error "无法确定月度重置日期，本轮清账已停止"
-                return 1
-            fi
-        fi
-        effective_day=$reset_day
-        [ "$effective_day" -gt "$days_in_month" ] && effective_day=$days_in_month
-        reset_ts=${reset_ts_cache[$effective_day]:-}
+        reset_ts=${reset_ts_cache[$reset_day]:-}
         if [ -z "$reset_ts" ]; then
-            printf -v reset_date '%s-%02d 00:00:00' "$current_year_month" "$effective_day"
-            reset_ts=$(date -d "$reset_date" +%s) || { pm_error "无法解析月度重置日期"; return 1; }
-            reset_ts_cache["$effective_day"]=$reset_ts
+            reset_ts=$(_latest_monthly_reset "$current_ts" "$reset_day") || {
+                pm_error "无法确定月度重置日期，本轮清账已停止"; return 1;
+            }
+            reset_ts_cache["$reset_day"]=$reset_ts
         fi
-        _load_port_state "$reset_port"
+        [[ -z "${invalid_state_ports[$reset_port]+x}" ]] || continue
+        _load_port_state "$reset_port" || { cron_failed=true; continue; }
         if [ "$current_ts" -ge "$reset_ts" ] && [ "$s_last_reset_ts" -lt "$reset_ts" ]; then
             s_acc_in=0; s_acc_out=0
             s_last_k_in=${_ctr_cache["cnt_in_${reset_port}"]}
@@ -2130,7 +2164,11 @@ cron_task() {
 
     while IFS=$'\t' read -r _gp _gid _gmode; do
         [ -z "$_gp" ] && continue
-        _load_port_state "$_gp"
+        if [[ -n "${invalid_state_ports[$_gp]+x}" ]] || ! _load_port_state "$_gp"; then
+            invalid_state_groups["$_gid"]=1
+            cron_failed=true
+            continue
+        fi
         local _gu=0
         if [ "$_gmode" == "out_only" ]; then _gu=$s_acc_out; else _gu=$((s_acc_in + s_acc_out)); fi
         group_usage["$_gid"]=$(( ${group_usage["$_gid"]:-0} + _gu ))
@@ -2156,11 +2194,13 @@ cron_task() {
     while IFS=$'\x1f' read -r port quota_gb mode gid reset_day p3_comment expiry_date expiry_day; do
         [ -z "$port" ] && continue
         # 清账失败时保留该端口/共享组现有封禁，避免依据半完成周期解除封禁。
-        if [[ -n "${reset_failed_ports[$port]+x}" ]] \
+        if [[ -n "${invalid_state_ports[$port]+x}" ]] \
+            || { [ -n "$gid" ] && [[ -n "${invalid_state_groups[$gid]+x}" ]]; } \
+            || [[ -n "${reset_failed_ports[$port]+x}" ]] \
             || { [ -n "$gid" ] && [[ -n "${reset_failed_groups[$gid]+x}" ]]; }; then
             continue
         fi
-        _load_port_state "$port"
+        _load_port_state "$port" || { cron_failed=true; continue; }
 
         # 用户到期提醒由本机 Telegram 发送；3 天窗口内每个端口/日期只提醒一次。
         _notify_user_expiry_if_due "$port" "$p3_comment" "$expiry_date" "$expiry_day" \
@@ -2246,21 +2286,48 @@ cron_task() {
     [ "$cron_failed" == "false" ]
 }
 
-setup_cron() {
-    local old_line="* * * * * $INSTALL_PATH --monitor"
+# 先完整读取再写入，禁止把读取错误当作空 Cron 覆盖其他业务任务。
+_update_monitor_cron() {
+    local action=$1 old_line="* * * * * $INSTALL_PATH --monitor"
     local cron_line="${old_line} >> $LOG_FILE 2>&1"
-    crontab -l 2>/dev/null | grep -Fqx -- "$cron_line" && return 0
-
-    local tmp_cron
-    tmp_cron=$(mktemp) || { pm_error "无法创建 Cron 临时文件"; return 1; }
-    _CLEANUP_FILES+=("$tmp_cron")
-    crontab -l 2>/dev/null | awk -v old="$old_line" -v current="$cron_line" \
-        '$0 != old && $0 != current' > "$tmp_cron"
-    echo "$cron_line" >> "$tmp_cron"
-    if ! crontab "$tmp_cron"; then
-        pm_error "Cron 任务安装失败，请检查 crontab 服务"
+    local current next err rc username error_text
+    current=$(mktemp) || { pm_error "无法创建 Cron 临时文件"; return 1; }
+    _CLEANUP_FILES+=("$current")
+    next=$(mktemp) || { pm_error "无法创建 Cron 临时文件"; return 1; }
+    _CLEANUP_FILES+=("$next")
+    err=$(mktemp) || { pm_error "无法创建 Cron 临时文件"; return 1; }
+    _CLEANUP_FILES+=("$err")
+    if LC_ALL=C crontab -l > "$current" 2> "$err"; then
+        # 有的实现即使报读取错误也返回 0；此时同样不能覆盖现有任务表。
+        if [ -s "$err" ]; then
+            pm_error "读取 Cron 返回异常诊断，任务表保持不变"
+            return 1
+        fi
+    else
+        rc=$?
+        username=$(id -un) || return 1
+        error_text=$(cat "$err") || return 1
+        # 仅接受明确的“尚无任务表”；权限、I/O、部分输出等错误均停止。
+        if [ "$rc" -ne 1 ] || [ -s "$current" ] \
+            || { [ "$error_text" != "no crontab for $username" ] \
+                && [ "$error_text" != "crontab: no crontab for $username" ]; }; then
+            pm_error "无法读取现有 Cron（退出码 ${rc}），任务表保持不变"
+            return 1
+        fi
+    fi
+    awk -v old="$old_line" -v current="$cron_line" '$0 != old && $0 != current' "$current" > "$next" || return 1
+    if [ "$action" == install ]; then
+        printf '%s\n' "$cron_line" >> "$next" || return 1
+    fi
+    cmp -s "$current" "$next" && return 0
+    if ! crontab "$next"; then
+        pm_error "Cron 任务写入失败，请检查 crontab 服务"
         return 1
     fi
+}
+
+setup_cron() {
+    _update_monitor_cron install || return 1
     echo -e "${GREEN}后台运行日志: $LOG_FILE${PLAIN}"
 }
 
@@ -2355,7 +2422,7 @@ show_main_menu() {
     local port_list=()
     local i=1
     local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n)
-    local -A menu_group_usage=()
+    local -A menu_group_usage=() menu_invalid_groups=()
 
     # 与配额执行逻辑保持一致：分组端口显示组内合计用量。
     local group_port group_conf group_mode group_gid group_used
@@ -2364,7 +2431,7 @@ show_main_menu() {
         group_gid=$(echo "$group_conf" | jq -r '.group_id // empty')
         [ -z "$group_gid" ] && continue
         group_mode=$(echo "$group_conf" | jq -r '.quota_mode // "in_out"')
-        _load_port_state "$group_port"
+        if ! _load_port_state "$group_port"; then menu_invalid_groups["$group_gid"]=1; continue; fi
         if [ "$group_mode" == "out_only" ]; then
             group_used=$s_acc_out
         else
@@ -2382,7 +2449,8 @@ show_main_menu() {
         local gid=$(echo "$conf" | jq -r '.group_id // empty')
         
         # 从 state 文件读取运行数据
-        _load_port_state "$port"
+        local state_ok=true
+        _load_port_state "$port" || state_ok=false
         
         local mode_str="双向"
         local total_used=0
@@ -2404,6 +2472,10 @@ show_main_menu() {
             status_clean="$(fmt_bytes $total_used)"
         fi
         
+        if [ "$state_ok" != true ] || { [ -n "$gid" ] && [[ -n "${menu_invalid_groups[$gid]+x}" ]]; }; then
+            status_clean="[状态异常，查看日志]"
+        fi
+
         local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
         local quota_str="${status_clean} / ${quota} GB"
         local reset_str=""
@@ -2735,19 +2807,31 @@ config_port_menu() {
                    while IFS=$'\t' read -r counter_name counter_bytes; do
                        [ -n "$counter_name" ] && reset_counters["$counter_name"]=$counter_bytes
                    done <<< "$reset_snapshot"
+                   # 先确认全组状态完整，再清账；全部保存成功后才允许解封。
                    for reset_port in $reset_ports; do
-                       _load_port_state "$reset_port"
+                       _load_port_state "$reset_port" || reset_failed=true
+                   done
+                   if [ "$reset_failed" == true ]; then
+                       echo -e "${RED}状态读取失败，原统计数据和封禁保持不变，请查看 ${LOG_FILE}。${PLAIN}"
+                       rm -f "$tmp"; sleep 1; continue
+                   fi
+                   for reset_port in $reset_ports; do
+                       if ! _load_port_state "$reset_port"; then reset_failed=true; continue; fi
                        s_acc_in=0; s_acc_out=0
                        s_last_k_in=${reset_counters["cnt_in_${reset_port}"]}
                        s_last_k_out=${reset_counters["cnt_out_${reset_port}"]}
                        s_last_reset_ts=$reset_now; s_quota_level=0
-                       if ! _save_port_state "$reset_port"; then reset_failed=true; continue; fi
-                       if [[ "$reset_blocked" == *" $reset_port "* ]] \
-                           && ! nft delete element $NFT_TABLE blocked_ports \{ $reset_port \} 2>/dev/null; then
-                           pm_error "手动重置时无法解除端口 ${reset_port} 的封禁"
-                           reset_failed=true
-                       fi
+                       _save_port_state "$reset_port" || reset_failed=true
                    done
+                   if [ "$reset_failed" == false ]; then
+                       for reset_port in $reset_ports; do
+                           if [[ "$reset_blocked" == *" $reset_port "* ]] \
+                               && ! nft delete element $NFT_TABLE blocked_ports \{ $reset_port \} 2>/dev/null; then
+                               pm_error "手动重置时无法解除端口 ${reset_port} 的封禁"
+                               reset_failed=true
+                           fi
+                       done
+                   fi
                    if [ "$reset_failed" == "false" ]; then
                        echo -e "${GREEN}$([ -n "$gid" ] && echo "组 [${gid}]" || echo "端口 ${port}") 已重置。${PLAIN}"
                    else
@@ -2869,10 +2953,10 @@ configure_user_expiry() {
     fi
 
     start_edit_lock || return 1
+    _load_port_state "$port" || return 1
     tmp=$(mktemp) || { pm_error "无法创建到期配置临时文件"; return 1; }
     if jq --arg p "$port" --arg value "$value" '.ports[$p].expiry_date = $value' "$CONFIG_FILE" > "$tmp" \
         && safe_write_config_from_file "$tmp"; then
-        _load_port_state "$port"
         s_expiry_notified_date=""
         if ! _save_port_state "$port"; then
             rm -f "$tmp"
@@ -2901,7 +2985,7 @@ configure_burst_limit() {
     stop_edit_lock
     conf=$(jq ".ports[\"$port\"].dyn_limit // {\"enable\":false}" "$CONFIG_FILE")
     enabled=$(echo "$conf" | jq -r '.enable // false')
-    _load_port_state "$port"
+    _load_port_state "$port" || return 1
 
     echo -e "\n$UI_DIVIDER"
     echo -e " 突发限速 - 端口 $port"
@@ -2925,7 +3009,7 @@ configure_burst_limit() {
     start_edit_lock || return 1
     enabled=$(jq -r --arg port "$port" '.ports[$port].dyn_limit.enable // false' "$CONFIG_FILE")
     if [ "$enabled" == true ]; then action="关闭"; target=false; else action="开启"; target=true; fi
-    _load_port_state "$port"
+    _load_port_state "$port" || return 1
 
     old_config=$(cat "$CONFIG_FILE") || { pm_error "无法备份当前配置"; return 1; }
     tmp=$(mktemp) || { pm_error "无法创建突发限速配置临时文件"; return 1; }
@@ -3331,10 +3415,7 @@ uninstall_script() {
     echo -e "${YELLOW}正在清理...${PLAIN}"
 
     # 1. 先停止后台入口；失败时不继续破坏运行状态。
-    local old_line="* * * * * $INSTALL_PATH --monitor"
-    local cron_line="${old_line} >> $LOG_FILE 2>&1"
-    if ! crontab -l 2>/dev/null | awk -v old="$old_line" -v current="$cron_line" \
-        '$0 != old && $0 != current' | crontab -; then
+    if ! _update_monitor_cron remove; then
         pm_error "Cron 任务清理失败，卸载已停止"
         echo -e "${RED}卸载失败: 无法清理 Cron，配置和规则均已保留。${PLAIN}"
         return 1
@@ -3343,24 +3424,42 @@ uninstall_script() {
 
     local cleanup_failed=false
 
-    # 2. 清除 nftables 规则
-    if nft list table $NFT_TABLE >/dev/null 2>&1 && ! nft delete table $NFT_TABLE 2>/dev/null; then
-        pm_error "Nftables 规则清理失败"
+    # 2. 先成功读取表列表；只有确认不存在才跳过删除。
+    local tables
+    if ! tables=$(nft -j list tables 2>/dev/null) \
+        || ! jq -e '.nftables | type == "array"' <<< "$tables" >/dev/null 2>&1; then
+        pm_error "无法读取 Nftables 表列表，无法确认规则已清理"
         cleanup_failed=true
+    elif jq -e --arg family "${NFT_TABLE%% *}" --arg name "${NFT_TABLE#* }" \
+        'any(.nftables[]; .table.family == $family and .table.name == $name)' <<< "$tables" >/dev/null; then
+        if nft delete table $NFT_TABLE 2>/dev/null; then
+            echo -e "  nftables 规则已清除"
+        else
+            pm_error "Nftables 规则清理失败"
+            cleanup_failed=true
+        fi
     else
-        echo -e "  nftables 规则已清除"
+        echo -e "  nftables 规则不存在，无需清理"
     fi
 
-    # 3. 仅清除由本脚本创建并登记的 TC 根队列
-    local iface=$(jq -r '.interface // empty' "$CONFIG_FILE" 2>/dev/null)
-    [ -z "$iface" ] && iface=$(get_iface)
-    if [ -n "$iface" ] && [ -f "$TC_OWNER_FILE" ] && [ "$(cat "$TC_OWNER_FILE" 2>/dev/null)" = "$iface" ] && \
-       tc qdisc show dev "$iface" 2>/dev/null | grep -Eq 'qdisc htb 1:.* root'; then
-        if tc qdisc del dev "$iface" root 2>/dev/null; then
-            echo -e "  TC 限速规则已清除"
-        else
-            pm_error "TC 根队列清理失败"
+    # 3. 仅查询并清理由本脚本登记的 TC 根队列，查询错误时保留所有权供重试。
+    local owner_iface qdisc_state
+    if [ -e "$TC_OWNER_FILE" ]; then
+        if ! owner_iface=$(cat "$TC_OWNER_FILE" 2>/dev/null) || [ -z "$owner_iface" ]; then
+            pm_error "无法读取 TC 所有权记录"
             cleanup_failed=true
+        elif ! qdisc_state=$(tc qdisc show dev "$owner_iface" 2>/dev/null); then
+            pm_error "无法读取 ${owner_iface} 的 TC 队列，无法确认限速规则已清理"
+            cleanup_failed=true
+        elif grep -Eq 'qdisc htb 1:.* root' <<< "$qdisc_state"; then
+            if tc qdisc del dev "$owner_iface" root 2>/dev/null; then
+                echo -e "  TC 限速规则已清除"
+            else
+                pm_error "TC 根队列清理失败"
+                cleanup_failed=true
+            fi
+        else
+            echo -e "  PM 的 TC 根队列不存在，其他队列已保留"
         fi
     else
         echo -e "  TC 根队列非本脚本所有，已保留"
