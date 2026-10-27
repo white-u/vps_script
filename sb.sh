@@ -11,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -892,32 +892,96 @@ is_port_available() {
   return 0
 }
 
-pick_sni() {
-  echo -e "${YELLOW}测试 SNI 连通性 (仅用于挑选域名)...${PLAIN}" >&2
-  local valid=()
-  for sni in "${SNI_LIST[@]}"; do
-    if curl -m 3 -sI "https://${sni}" >/dev/null 2>&1; then
-      valid+=("$sni")
-      echo -e " ${#valid[@]}. ${sni}  ${GREEN}[OK]${PLAIN}" >&2
-    else
-      echo -e "    ${sni}  ${RED}[FAIL]${PLAIN}" >&2
+validate_reality_target() {
+  local target=$1 label
+  local LC_ALL=C
+  target=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')
+  # Accept DNS names only, never URLs, ports, IP literals or curl URL syntax.
+  if [[ ${#target} -gt 253 || "$target" != *.* || "$target" == *[!a-zA-Z0-9.-]* ||
+        "${target##*.}" != *[a-zA-Z]* ]]; then
+    echo "请输入完整域名，不要包含协议、端口或路径（国际化域名请使用 Punycode）。" >&2
+    return 1
+  fi
+  local -a labels
+  IFS=. read -ra labels <<< "$target"
+  for label in "${labels[@]}"; do
+    if [[ -z "$label" || ${#label} -gt 63 || "$label" == -* || "$label" == *- ]]; then
+      echo "域名标签不能为空、超过 63 字符或以连字符开头/结尾。" >&2
+      return 1
     fi
   done
-  local manual=$(( ${#valid[@]} + 1 ))
+  # read drops a trailing delimiter, so check the final dot separately.
+  [[ "$target" != *. ]] || { echo "域名末尾请勿带点。" >&2; return 1; }
+
+  local probe http_version http_code redirect_url redirect_host
+  local request_url="https://${target}/" deadline=$((SECONDS + 8)) remaining redirects=0
+  # Disable curlrc and environment proxies: REALITY dials the target directly.
+  # --http2 can fall back to HTTP/1.1, so inspect the negotiated version below.
+  while true; do
+    remaining=$((deadline - SECONDS))
+    if [[ "$remaining" -le 0 ]]; then
+      printf '目标 %s 的验证超过 8 秒总时限。\n' "$target" >&2
+      return 1
+    fi
+    if ! probe=$(curl -q --globoff --proxy '' --noproxy '*' --proto '=https' \
+        --tlsv1.3 --tls-max 1.3 --http2 --head \
+        --connect-timeout 3 --max-time "$remaining" --silent --show-error --output /dev/null \
+        --write-out '%{http_version}\n%{http_code}\n%{redirect_url}' \
+        "$request_url" 2>&1); then
+      printf '目标 %s 的 TLS 1.3 / HTTP/2 检查失败；请检查网络、证书及 curl 的 TLS 1.3 / HTTP/2 支持：\n%s\n' "$target" "$probe" >&2
+      return 1
+    fi
+    { IFS= read -r http_version; IFS= read -r http_code; IFS= read -r redirect_url || true; } <<< "$probe"
+    if [[ "$http_version" != "2" || ! "$http_code" =~ ^[1-5][0-9][0-9]$ ]]; then
+      printf '目标 %s 未实际使用 HTTP/2（HTTP 版本: %s，状态码: %s）。\n' "$target" "$http_version" "$http_code" >&2
+      return 1
+    fi
+    [[ "$http_code" == 3?? && -n "$redirect_url" ]] || return 0
+    # Follow only same-host HTTPS paths; a later hop must not escape validation.
+    redirect_host=${redirect_url#https://}
+    redirect_host=${redirect_host%%[/?#]*}
+    redirect_host=$(printf '%s' "$redirect_host" | tr '[:upper:]' '[:lower:]')
+    if [[ "$redirect_url" != https://* ||
+          ( "$redirect_host" != "$target" && "$redirect_host" != "${target}:443" ) ]]; then
+      printf '目标 %s 重定向到 %s；请改用最终的 HTTPS 域名并重新验证。\n' "$target" "$redirect_url" >&2
+      return 1
+    fi
+    if [[ "$redirects" -ge 3 ]]; then
+      printf '目标 %s 的同域跳转超过 3 次，可能存在重定向循环。\n' "$target" >&2
+      return 1
+    fi
+    redirects=$((redirects + 1))
+    request_url=$redirect_url
+  done
+}
+
+pick_sni() {
+  echo -e "${YELLOW}选择 Reality 目标（选定后验证）:${PLAIN}" >&2
+  local sni idx target i=0
+  for sni in "${SNI_LIST[@]}"; do
+    i=$((i + 1))
+    printf ' %d. %s\n' "$i" "$sni" >&2
+  done
+  local manual=$(( ${#SNI_LIST[@]} + 1 ))
   echo -e " ${manual}. 手动输入" >&2
 
   read -p "请选择 [1]: " idx
   idx=$(strip_cr "$idx")
   [[ -z "$idx" ]] && idx=1
 
-  local target=""
-  if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#valid[@]}" ]; then
-    target="${valid[$((idx-1))]}"
-  else
+  target=""
+  if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#SNI_LIST[@]}" ]; then
+    target="${SNI_LIST[$((idx-1))]}"
+  elif [[ "$idx" == "$manual" ]]; then
     read -p "请输入域名 (如 www.apple.com): " target
     target=$(strip_cr "$target")
+  else
+    echo -e "${RED}选项无效。${PLAIN}" >&2
+    return 1
   fi
   [[ -z "$target" ]] && return 1
+  printf '正在验证 Reality 目标: %s ...\n' "$target" >&2
+  validate_reality_target "$target" || return 1
   echo "$target"
 }
 
@@ -1058,7 +1122,7 @@ add_reality() {
   [[ -z "$port" ]] && port=443
   is_port_available "$port" || return
 
-  local sni; sni=$(pick_sni) || { echo -e "${RED}未选择有效域名。${PLAIN}"; return; }
+  local sni; sni=$(pick_sni) || { echo -e "${RED}未选择通过验证的 Reality 目标，节点未创建。${PLAIN}"; return 1; }
   local uuid; uuid=$(gen_uuid)
 
   local keypair; keypair=$(gen_reality_keypair)

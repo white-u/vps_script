@@ -1,6 +1,6 @@
 # sing-box 多协议管理脚本（sb.sh）
 
-**脚本版本**：v1.4.1　|　**快捷命令**：`sb`　|　**安装路径**：`/usr/local/bin/sb`
+**脚本版本**：v1.4.2　|　**快捷命令**：`sb`　|　**安装路径**：`/usr/local/bin/sb`
 
 本文档及脚本生成的配置已按 sing-box **1.14.0** 官方配置结构核对（2026-08-31）。脚本只使用稳定版发布，不自动安装预发布版本。
 
@@ -18,6 +18,10 @@
   - 不设置 `network`，按官方定义同时启用 TCP 和 UDP。
 
 Reality 只开放 TCP 防火墙端口；Shadowsocks 2022 同时开放 TCP 和 UDP。
+
+Reality 创建时先直接列出候选域名，不预先探测；选定候选或手动输入后，只从本机直连验证最终选中的域名。验证强制 TLS 1.3 并确认实际使用 HTTP/2，校验证书，拒绝跳转到其他域名、非 HTTPS 或非 443 端口的目标。同域名 HTTPS 路径跳转最多继续验证 3 次，每一步都需通过相同检查。候选域名和手动输入使用相同验证；失败不会创建节点，也不会跟随跨域跳转或降级协议。探测忽略 curl 配置文件及环境代理，连接超时 3 秒、所选目标（含跳转）共用 8 秒总时限。
+
+验证需要 curl 支持 TLS 1.3 和 HTTP/2；缺少能力时会保留 curl 的报错并拒绝该目标。通过检查代表当前 VPS 的探测结果，不保证其他网络或后续时间一直可用，也不能代替真实客户端的 Reality 握手测试。
 
 ## 2. 安装与菜单
 
@@ -134,6 +138,7 @@ tail -n 30 /var/log/sing-box.log
 
 - [VLESS 入站](https://sing-box.sagernet.org/configuration/inbound/vless/)
 - [TLS / Reality](https://sing-box.sagernet.org/configuration/shared/tls/#reality-fields)
+- [REALITY 上游目标网站要求](https://github.com/XTLS/REALITY#readme)
 - [Shadowsocks 入站](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/)
 - [路由规则动作](https://sing-box.sagernet.org/configuration/route/rule_action/)
 - [1.14.0 迁移说明](https://sing-box.sagernet.org/migration/#1140)
