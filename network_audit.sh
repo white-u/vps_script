@@ -69,18 +69,72 @@ ping_check() {
     ping -c 1 -W 3000 "$1" &>/dev/null
 }
 
+valid_ipv4() {
+    local ip=$1 octet
+    local -a octets
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        # 拒绝前导零，避免不同工具按八进制解释同一地址。
+        [[ "$octet" == 0 || "$octet" != 0* ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+valid_ip() {
+    local ip=$1 tail rest group count=0
+    [[ "$ip" == *:* ]] || { valid_ipv4 "$ip"; return; }
+    if [[ "$ip" == *.* ]]; then
+        tail=${ip##*:}
+        valid_ipv4 "$tail" || return 1
+        ip="${ip%:*}:0:0"
+    fi
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" != *:::* ]] || return 1
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
+    rest=${ip/::/}
+    [[ "$rest" != *::* ]] || return 1
+    for group in ${ip//:/ }; do
+        [[ ${#group} -le 4 ]] || return 1
+        count=$((count + 1))
+    done
+    if [[ "$ip" == *::* ]]; then
+        ((count < 8))
+    else
+        ((count == 8))
+    fi
+}
+
+get_public_ip() {
+    local endpoint ip
+    for endpoint in https://ipconfig.io https://ifconfig.me; do
+        if ip=$(curl -q -fsSL --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 10 "$endpoint" 2>/dev/null) && valid_ip "$ip"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+print_return_command() {
+    valid_ip "$1" || return 1
+    # 在落地机上同样先下载、检查，再执行；下载失败不会被管道掩盖。
+    printf '%s' '(installer=$(mktemp) || exit; trap '\''rm -f "$installer"'\'' EXIT; curl -q -fsSL --proto "=https" --proto-redir "=https" --connect-timeout 10 --max-time 30 -o "$installer" https://nxtrace.org/nt && test -s "$installer" && bash -n "$installer" && bash "$installer") && nexttrace -g cn '
+    printf '%q\n' "$1"
+}
+
 clear
 echo -e "${BLUE}====================================================${PLAIN}"
 echo -e "${BLUE}       中转链路全能审计 (Relay <-> Exit)            ${PLAIN}"
 echo -e "${BLUE}====================================================${PLAIN}"
 
 # 自动获取本机公网 IP
-LOCAL_IP=$(curl -s --connect-timeout 5 ipconfig.io 2>/dev/null || curl -s --connect-timeout 5 ifconfig.me 2>/dev/null)
-if [ -z "$LOCAL_IP" ]; then
+if ! LOCAL_IP=$(get_public_ip); then
     echo -e "${YELLOW}警告: 无法自动获取本机公网 IP${PLAIN}"
-    read -p "请手动输入本机公网 IP (用于回程检测指令生成): " LOCAL_IP
-    if [ -z "$LOCAL_IP" ]; then
-        echo -e "${RED}错误: 本机 IP 不能为空${PLAIN}"
+    read -p "请手动输入本机公网 IPv4 或 IPv6 (用于回程检测指令生成): " LOCAL_IP
+    if ! valid_ip "$LOCAL_IP"; then
+        echo -e "${RED}错误: 本机 IP 格式无效${PLAIN}"
         exit 1
     fi
 fi
@@ -166,7 +220,7 @@ echo -e "\n${BLUE}====================================================${PLAIN}"
 echo -e "${YELLOW}[3/4] 关键：回程路径检测 (Exit -> Relay)${PLAIN}"
 echo -e "请【登录落地机】执行以下一键检测指令以确认路由对称性："
 echo -e "----------------------------------------------------"
-echo -e "${GREEN}curl -Ls https://raw.githubusercontent.com/sjlleo/nexttrace/main/nt_install.sh | bash && nexttrace -g cn ${LOCAL_IP}${PLAIN}"
+print_return_command "$LOCAL_IP" || exit 1
 echo -e "----------------------------------------------------"
 
 # --- 4. 吞吐量压测 (iperf3) ---
