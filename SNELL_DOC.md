@@ -1,12 +1,16 @@
 # Snell 多实例管理
 
-`snell.sh` 用一个 systemd 模板服务管理多个 Snell v5 实例，每个端口拥有独立配置和 PSK。
+`snell.sh` 用一个 systemd 模板服务管理多个 Snell v6 实例，每个端口拥有独立配置和 PSK。
 
-**脚本版本**：v1.0.0　|　**稳定核心**：v5.0.1　|　**快捷命令**：`snell`
+**脚本版本**：v1.0.0　|　**核心基线**：v6（动态检测官方最新下载版本）　|　**快捷命令**：`snell`
 
 ## 版本策略
 
-脚本固定使用 Surge 官方稳定版 Snell v5.0.1，不会自动安装 v6 Beta/RC。发行包和二进制均校验固定 SHA256，校验失败时拒绝替换现有核心。
+执行 `snell install` 或菜单 1 时，脚本读取 Surge 官方发布页，按当前架构选择版本号最高的纯数字下载版本（例如 v6.0.0），不选择带 Beta/RC 后缀的下载包。官方当前的 v6.0.0 虽然没有版本后缀，发布说明仍标注为测试阶段；此策略跟随官方实际下载版本，不承诺它是稳定版。
+
+安装和更新以 v6 为基线，不再安装 v5。以后 v6.x 的纯数字新版本无需修改脚本即可检测和安装；检测到其他主版本时停止并提示先适配管理脚本，避免未经兼容处理直接替换。不会后台定时检查。官方页面请求失败、缺少当前架构的有效链接时直接失败，不回退固定版本。
+
+已知的 v6.0.0 发行包和二进制使用脚本内固定 SHA256 校验。未来未预置校验值的版本通过官方 HTTPS 下载、检查 ZIP 完整性，再运行 `--version` 核对版本与可执行性，并明确提示没有预置 SHA256；这些检查不等同于发行方签名验证。成功安装后记录核心 SHA256，用于后续本地完整性检查。
 
 - [Snell 官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)
 - [Surge Snell 配置手册](https://manual.nssurge.com/policies/snell.html)
@@ -41,7 +45,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/snel
 
 ```bash
 snell                 # 交互菜单
-snell install         # 检查、安装或修复稳定版核心
+snell install         # 检测、安装或修复官方最新 v6 核心
 snell add             # 添加实例
 snell list            # 查看 Surge 客户端配置
 snell status          # 查看实例状态和最近日志
@@ -57,33 +61,38 @@ snell help
 
 ```ini
 [snell-server]
-listen = ::0:10086
+listen = 0.0.0.0:10086,[::]:10086
 psk = <32 字符随机 PSK>
 ipv6 = true
 tfo = true
-obfs = off
+mode = default
+dns-ip-preference = default
 dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888
 ```
 
 对应的 Surge 配置：
 
 ```text
-snell-10086 = snell, 1.2.3.4, 10086, psk=<PSK>, version=5, tfo=true, reuse=true
+snell-10086 = snell, 1.2.3.4, 10086, psk=<PSK>, version=6, tfo=true, reuse=true, mode=default
 ```
 
-如手动将服务端改为 `obfs = http`，脚本会在客户端配置中追加 `obfs=http`。Snell v5 不支持 TLS 混淆。
+v6 不支持旧 `obfs` 参数，也不支持 v5 的 QUIC Proxy Mode；普通 UDP 转发仍支持。升级旧实例时删除 `obfs`、`obfs-host`、`obfs-uri`，缺少 `mode` 时补入 `mode=default`，保留原端口、监听地址、PSK 和 DNS。新建实例显式监听 IPv4/IPv6。
+
+`mode=default` 启用加密和基于 PSK 的流量整形。手动设置 `unshaped` 时保留加密、关闭整形；`unsafe-raw` 关闭加密及整形。客户端导出会同步实际模式，客户端与服务端必须一致。
+
+`dns-ip-preference` 支持 `default`、`prefer-ipv4`、`prefer-ipv6`、`ipv4-only`、`ipv6-only`，新建实例默认使用 `default`。客户端需支持 Snell v6（官方手册标注 Surge iOS 5.20.0+、Mac 6.7.0+），并使用 `version=6`。跨主版本升级前会要求确认，升级后通过 `snell list` 获取新配置；PSK 不变。
 
 ## 更新与失败恢复
 
 核心更新按以下顺序执行：
 
-1. 下载官方稳定版发行包，显示进度条；完成后提示校验、解压和核心检查阶段。
-2. 备份核心、systemd 服务和版本记录。
+1. 检测并下载官方最新 v6 发行包，显示进度条；完成后提示校验、解压和核心检查阶段。
+2. 备份核心、systemd 服务、版本记录和待迁移的实例配置。
 3. 记录当前正在运行的实例并短暂停止它们。
 4. 原子替换文件，仅恢复更新前处于运行状态的实例。
-5. 新核心启动失败时自动恢复旧核心及原运行状态。
+5. 新核心启动失败或停服/替换期间收到 Ctrl+C、TERM 时，自动恢复旧核心、实例配置及原运行状态。恢复期间忽略重复中断；回滚不完整时保留备份并输出路径，供人工恢复。
 
-已经停止的实例不会因为更新而被自动启动。核心已是正确的 v5.0.1 时只检查配置权限，不产生停机。
+已经停止的实例不会因为更新而被自动启动。本地版本、核心 SHA256、服务文件及配置均符合预期时，只整理配置权限，不重新下载或停机。
 
 覆盖现有端口会生成新 PSK。新配置启动失败时会恢复旧配置、旧 PSK 及原来的启用/运行状态。
 

@@ -62,7 +62,7 @@ curl() {
     for arg in "$@"; do
         case "$arg" in https://*) args+=("$HTTP_URL") ;; *) args+=("$arg") ;; esac
     done
-    command curl --noproxy '*' "${args[@]}"
+    command curl --noproxy '*' "${args[@]}" --proto '=http,https' --proto-redir '=http,https'
 }
 sleep() { :; }
 fresh_script_url() { echo 'https://example.invalid/update'; }
@@ -126,6 +126,8 @@ VT_URL="$SCRIPT_URL"
         source = (ROOT / "snell.sh").read_text()
         code = self.wrapper() + r'''
 SNELL_VERSION=5.0.1
+resolve_latest_release() { :; }
+core_configs_need_migration() { return 1; }
 SNELL_BIN="$TEST_DIR/core"
 SNELL_CONF_DIR="$TEST_DIR/config"
 SERVICE_FILE="$TEST_DIR/service"

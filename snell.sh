@@ -16,7 +16,9 @@ cleanup() {
         rm -rf "$f" 2>/dev/null
     done
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 CURRENT_ACTION="初始化"
 unexpected_error() {
@@ -36,7 +38,8 @@ DIM="\033[2m"
 PLAIN="\033[0m"
 
 SCRIPT_VERSION="1.0.0"
-SNELL_VERSION="5.0.1"
+SNELL_VERSION="" # 每次安装时从官方发布页解析
+RELEASE_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 
 SNELL_BIN="/usr/local/bin/snell-server"
 SNELL_CONF_DIR="/etc/snell"
@@ -45,7 +48,7 @@ SERVICE_FILE="${SYSTEMD_DIR}/snell@.service"
 DL_BASE="https://dl.nssurge.com/snell"
 USER_MARKER="${SNELL_CONF_DIR}/.user-created-by-snell-script"
 
-# Snell v5.0.1 官方发行包 SHA256（固定稳定版，拒绝静默切换测试版）
+# 旧版官方发行包 SHA256，用于校验及识别缺少元数据的旧安装
 SNELL_AMD64_ARCHIVE_SHA256="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_AMD64_BINARY_SHA256="5b2e221f2c6e29b1db8e47053e1221be29d5627da807cb932b089f514a3609f0"
 SNELL_AARCH64_ARCHIVE_SHA256="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
@@ -66,13 +69,16 @@ get_installed_major_ver() {
         return 0
     fi
 
-    # 兼容旧安装：元数据缺失时只在二进制与官方稳定版完全一致时识别为 v5。
-    local arch archive_sha binary_sha
-    if [[ -x "$SNELL_BIN" ]] \
-        && IFS=$'\t' read -r arch archive_sha binary_sha < <(get_stable_asset_info) \
-        && printf '%s  %s\n' "$binary_sha" "$SNELL_BIN" | sha256sum -c - >/dev/null 2>&1; then
-        echo "5"
-    fi
+    # 元数据缺失时仅信任脚本内已知发行版的二进制哈希。
+    local version arch archive_sha binary_sha
+    for version in 6.0.0 5.0.1; do
+        if [[ -x "$SNELL_BIN" ]] \
+            && IFS=$'\t' read -r arch archive_sha binary_sha < <(SNELL_VERSION="$version" get_stable_asset_info) \
+            && printf '%s  %s\n' "$binary_sha" "$SNELL_BIN" | sha256sum -c - >/dev/null 2>&1; then
+            echo "${version%%.*}"
+            return 0
+        fi
+    done
 }
 
 # 读取完整版本号
@@ -266,20 +272,68 @@ sync_script() {
     return 0
 }
 
-# 稳定版发行资产信息：架构、压缩包 SHA256、二进制 SHA256
+# 已知版本校验值；后续版本通过官方 HTTPS 下载、ZIP 完整性及运行版本验证。
 get_stable_asset_info() {
+    local arch archive_sha="-" binary_sha="-"
     case $(uname -m) in
-        x86_64|amd64)
-            printf '%s\t%s\t%s\n' "amd64" "$SNELL_AMD64_ARCHIVE_SHA256" "$SNELL_AMD64_BINARY_SHA256" ;;
-        aarch64|arm64)
-            printf '%s\t%s\t%s\n' "aarch64" "$SNELL_AARCH64_ARCHIVE_SHA256" "$SNELL_AARCH64_BINARY_SHA256" ;;
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=aarch64 ;;
         *) return 1 ;;
     esac
+    case "${SNELL_VERSION}:${arch}" in
+        5.0.1:amd64) archive_sha=$SNELL_AMD64_ARCHIVE_SHA256; binary_sha=$SNELL_AMD64_BINARY_SHA256 ;;
+        5.0.1:aarch64) archive_sha=$SNELL_AARCH64_ARCHIVE_SHA256; binary_sha=$SNELL_AARCH64_BINARY_SHA256 ;;
+        6.0.0:amd64)
+            archive_sha=8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2
+            binary_sha=27d8bead8dd7a33f2207b58c7bb6b4c274f67f537b621dcbee7112ffd22e23e6 ;;
+        6.0.0:aarch64)
+            archive_sha=a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7
+            binary_sha=316c924cb2f7bea75278303265cf004c66379244e101c64ab672a1c987bf8041 ;;
+    esac
+    printf '%s\t%s\t%s\n' "$arch" "$archive_sha" "$binary_sha"
+}
+
+# 仅接受官方域名、当前架构、纯数字版本的实际下载链接，不猜测下载地址。
+resolve_latest_release() {
+    local page links url version latest="" arch unused
+    IFS=$'\t' read -r arch unused < <(get_stable_asset_info) || return 1
+    if ! page=$(curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 30 "$RELEASE_URL"); then
+        warn "无法读取 Snell 官方发布页，已取消更新。"
+        return 1
+    fi
+    links=$(printf '%s\n' "$page" | grep -oE "https://dl[.]nssurge[.]com/snell/snell-server-v[0-9]+[.][0-9]+[.][0-9]+-linux-${arch}[.]zip" | sort -u) || true
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        version=${url##*/snell-server-v}; version=${version%-linux-*}
+        if [[ -z "$latest" ]] || version_is_older "$latest" "$version"; then latest=$version; fi
+    done <<< "$links"
+    if [[ -z "$latest" ]]; then
+        warn "官方发布页未找到当前架构的有效版本，已取消更新。"
+        return 1
+    fi
+    SNELL_VERSION=$latest
+    if [[ "${latest%%.*}" != 6 ]]; then
+        warn "检测到 Snell v${latest}，此主版本尚未适配，请先更新管理脚本。"
+        return 1
+    fi
+    info "官方最新下载版本: v${SNELL_VERSION} (${arch})"
+}
+
+# v6 配置需去除旧混淆字段，并显式记录默认模式。
+core_configs_need_migration() {
+    [[ "${SNELL_VERSION%%.*}" == 6 ]] || return 1
+    local conf
+    for conf in "$SNELL_CONF_DIR/"*.conf; do
+        [[ -f "$conf" && ! -L "$conf" && "${conf##*/}" =~ ^[0-9]+[.]conf$ ]] || continue
+        if grep -Eq '^[[:space:]]*obfs(-host|-uri)?[[:space:]]*=' "$conf" \
+            || [[ -z "$(read_config_value "$conf" mode)" ]]; then return 0; fi
+    done
+    return 1
 }
 
 # 依赖检查
 check_deps() {
-    local deps=(curl unzip ss sha256sum install realpath cmp find getent useradd userdel groupdel)
+    local deps=(curl unzip ss sha256sum install realpath cmp find timeout getent useradd userdel groupdel)
     local missing=() dep
     for dep in "${deps[@]}"; do
         command -v "$dep" &>/dev/null || missing+=("$dep")
@@ -476,6 +530,11 @@ rollback_core_install() {
         rm -f "${SNELL_CONF_DIR}/.version" || failed=true
     fi
 
+    local conf
+    for conf in "${backup_dir}/configs/"*.conf; do
+        [[ -f "$conf" ]] || continue
+        cp -a "$conf" "${SNELL_CONF_DIR}/${conf##*/}" || failed=true
+    done
     systemctl daemon-reload >/dev/null 2>&1 || failed=true
     for port in "${active_ports[@]+"${active_ports[@]}"}"; do
         systemctl start "snell@${port}" >/dev/null 2>&1 || failed=true
@@ -498,13 +557,40 @@ rollback_core_install() {
     [[ "$failed" == "false" ]]
 }
 
+# 回滚不完整时保留安装目录中的备份，供人工恢复。
+preserve_core_backup() {
+    local preserve_dir=$1 item
+    local remaining=()
+    for item in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+        [[ "$item" == "$preserve_dir" ]] || remaining+=("$item")
+    done
+    _CLEANUP_FILES=("${remaining[@]+"${remaining[@]}"}")
+    warn "恢复备份已保留在: ${preserve_dir}/backup"
+}
+
+# 仅在停服/替换事务内使用；变量来自 install_core 的动态作用域。
+interrupt_core_install() {
+    local rc=$1
+    trap '' INT TERM
+    warn "核心更新被中断，正在恢复更新前状态..."
+    if rollback_core_install "$backup_dir" "$had_bin" "$had_service" "$had_version" \
+        "$had_user" "$had_conf_dir" "${active_ports[@]+"${active_ports[@]}"}"; then
+        warn "已恢复旧核心、配置及原运行状态。"
+    else
+        warn "中断后的自动回滚不完整，请检查 Snell 文件和服务。"
+        preserve_core_backup "$tmp_dir"
+    fi
+    exit "$rc"
+}
+
 # 1. 安装/更新 Snell 核心二进制
 install_core() {
     CURRENT_ACTION="安装或更新 Snell 核心"
+    resolve_latest_release || return 1
     local arch archive_sha binary_sha
     if ! IFS=$'\t' read -r arch archive_sha binary_sha < <(get_stable_asset_info) \
         || [[ -z "$arch" || -z "$archive_sha" || -z "$binary_sha" ]]; then
-        warn "当前架构没有 Snell v${SNELL_VERSION} 官方稳定版。"
+        warn "当前架构没有 Snell v${SNELL_VERSION} 官方版本。"
         return 1
     fi
 
@@ -514,6 +600,12 @@ install_core() {
         current_binary_sha=$(sha256sum "$SNELL_BIN" 2>/dev/null | awk '{print $1}' || true)
     fi
 
+    # 未预置哈希的版本使用上次成功安装时记录的本地哈希检查是否被修改。
+    local installed_sha=""
+    if [[ "$archive_sha" == "-" && -f "${SNELL_CONF_DIR}/.version" && ! -L "${SNELL_CONF_DIR}/.version" ]]; then
+        installed_sha=$(sed -n '2p' "${SNELL_CONF_DIR}/.version")
+        [[ "$installed_sha" =~ ^[a-f0-9]{64}$ ]] && binary_sha=$installed_sha
+    fi
     local expected_service
     expected_service=$(mktemp /tmp/snell_service.XXXXXX) || { warn "无法创建服务临时文件"; return 1; }
     _CLEANUP_FILES+=("$expected_service")
@@ -521,15 +613,20 @@ install_core() {
 
     if [[ "$current_ver" == "$SNELL_VERSION" ]] \
         && [[ "$current_binary_sha" == "$binary_sha" ]] \
-        && [[ -f "$SERVICE_FILE" ]] && cmp -s "$expected_service" "$SERVICE_FILE"; then
+        && [[ -f "$SERVICE_FILE" ]] && cmp -s "$expected_service" "$SERVICE_FILE" \
+        && ! core_configs_need_migration; then
         ensure_snell_user || return 1
         secure_config_permissions || { warn "修复配置权限失败"; return 1; }
-        info "Snell 稳定版 v${SNELL_VERSION} 已是最新，无需更新。"
+        info "Snell v${SNELL_VERSION} 已是最新，无需更新。"
         return 0
     fi
 
+    if [[ -n "$current_ver" && "${current_ver%%.*}" -gt "${SNELL_VERSION%%.*}" ]]; then
+        warn "官方页面版本低于已安装主版本，拒绝跨主版本降级，请检查官方发布页。"
+        return 1
+    fi
     local current_is_newer=false
-    if [[ "$current_ver" =~ ^([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -gt 5 ]]; then
+    if [[ "$current_ver" =~ ^([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -gt "${SNELL_VERSION%%.*}" ]]; then
         current_is_newer=true
     elif [[ "$current_ver" =~ ^[0-9]+([.][0-9]+)*$ ]] \
         && version_is_older "$SNELL_VERSION" "$current_ver"; then
@@ -537,20 +634,28 @@ install_core() {
     fi
 
     if [[ -x "$SNELL_BIN" && -z "$current_ver" ]]; then
-        warn "已安装核心版本未知，将使用官方稳定版 v${SNELL_VERSION} 替换。"
+        warn "已安装核心版本未知，将使用官方版本 v${SNELL_VERSION} 替换。"
         local confirm_unknown
         read -rp " 是否继续? [y/N] " confirm_unknown || return 0
         confirm_unknown=$(strip_cr "$confirm_unknown")
         [[ "$confirm_unknown" =~ ^[yY]$ ]] || return 0
     elif [[ "$current_is_newer" == "true" ]]; then
-        warn "当前为 v${current_ver}，稳定通道为 v${SNELL_VERSION}；继续将切换回稳定版。"
+        warn "当前为 v${current_ver}，官方最新版本为 v${SNELL_VERSION}；继续将切换版本。"
         local confirm_stable
         read -rp " 确认切换? [y/N] " confirm_stable || return 0
         confirm_stable=$(strip_cr "$confirm_stable")
         [[ "$confirm_stable" =~ ^[yY]$ ]] || return 0
     fi
 
-    echo -e "${BLUE}>>> 准备安装 Snell 稳定版 v${SNELL_VERSION} (${arch})${PLAIN}"
+    if [[ -n "$current_ver" && "${current_ver%%.*}" != "${SNELL_VERSION%%.*}" ]]; then
+        warn "即将跨主版本升级至 v${SNELL_VERSION}，请同步升级 Surge 客户端并使用新的客户端配置。v6 不再支持旧 obfs 和 QUIC Proxy Mode。"
+        local confirm_major
+        read -rp " 确认升级? [y/N] " confirm_major || return 0
+        confirm_major=$(strip_cr "$confirm_major")
+        [[ "$confirm_major" =~ ^[yY]$ ]] || return 0
+    fi
+
+    echo -e "${BLUE}>>> 准备安装 Snell v${SNELL_VERSION} (${arch})${PLAIN}"
     local tmp_dir archive candidate
     tmp_dir=$(mktemp -d /tmp/snell_install.XXXXXX) || { warn "无法创建安装临时目录"; return 1; }
     _CLEANUP_FILES+=("$tmp_dir")
@@ -558,25 +663,37 @@ install_core() {
     candidate="${tmp_dir}/snell-server"
 
     local url="${DL_BASE}/snell-server-v${SNELL_VERSION}-linux-${arch}.zip"
-    if ! curl -fL --progress-bar --connect-timeout 15 --max-time 120 -o "$archive" "$url"; then
+    if ! curl -fL --proto '=https' --proto-redir '=https' --progress-bar --connect-timeout 15 --max-time 120 -o "$archive" "$url"; then
         warn "Snell 下载失败；现有核心和实例未改动。"
         return 1
     fi
     info "下载完成，正在校验官方发行包..."
-    if ! printf '%s  %s\n' "$archive_sha" "$archive" | sha256sum -c - >/dev/null 2>&1; then
+    if [[ "$archive_sha" != "-" ]] && ! printf '%s  %s\n' "$archive_sha" "$archive" | sha256sum -c - >/dev/null 2>&1; then
         warn "Snell 官方发行包 SHA256 校验失败，已拒绝安装。"
         return 1
     fi
     info "校验通过，正在解压并检查核心..."
-    if ! unzip -q "$archive" snell-server -d "$tmp_dir" || [[ ! -s "$candidate" ]]; then
+    if ! unzip -tq "$archive" >/dev/null 2>&1 || ! unzip -q "$archive" snell-server -d "$tmp_dir" || [[ ! -s "$candidate" ]]; then
         warn "Snell 发行包解压失败或缺少二进制。"
         return 1
     fi
-    if ! printf '%s  %s\n' "$binary_sha" "$candidate" | sha256sum -c - >/dev/null 2>&1; then
+    if [[ "$archive_sha" != "-" ]] && ! printf '%s  %s\n' "$binary_sha" "$candidate" | sha256sum -c - >/dev/null 2>&1; then
         warn "Snell 二进制 SHA256 校验失败，已拒绝安装。"
         return 1
     fi
     chmod 755 "$candidate" || { warn "无法设置 Snell 二进制权限"; return 1; }
+
+    if [[ "$archive_sha" == "-" ]]; then
+        warn "此版本尚无脚本预置 SHA256；来源依赖官方 HTTPS，ZIP 完整性检查不等同于发行方签名验证。"
+    fi
+    local reported_ver
+    if ! reported_ver=$(timeout 10 "$candidate" --version 2>&1) \
+        || ! printf '%s\n' "$reported_ver" | grep -Eq "(^|[[:space:]])snell-server v${SNELL_VERSION//./\\.}([[:space:]]|$)"; then
+        warn "核心无法执行或报告版本与 v${SNELL_VERSION} 不一致，已拒绝安装。"
+        printf '%s\n' "$reported_ver" | sed 's/^/  /' >&2
+        return 1
+    fi
+    binary_sha=$(sha256sum "$candidate" | awk '{print $1}')
 
     local had_bin=false had_service=false had_version=false had_user=false had_conf_dir=false
     [[ -f "$SNELL_BIN" ]] && had_bin=true
@@ -629,7 +746,7 @@ install_core() {
             return 1
         }
     _CLEANUP_FILES+=("$new_version")
-    if ! printf '%s\n' "$SNELL_VERSION" > "$new_version" || ! chmod 644 "$new_version"; then
+    if ! printf '%s\n%s\n' "$SNELL_VERSION" "$binary_sha" > "$new_version" || ! chmod 644 "$new_version"; then
         rm -f "$new_bin" "$new_service" "$new_version"
         remove_new_user_on_abort "$had_user" "$had_conf_dir"
         warn "准备版本文件失败"
@@ -637,6 +754,12 @@ install_core() {
     fi
 
     local configs=() active_ports=() conf port
+    mkdir -p "${backup_dir}/configs" || return 1
+    # 配置也在目标文件系统中准备，避免 /tmp 为独立挂载时 mv 退化为复制。
+    local staged_conf_dir
+    staged_conf_dir=$(mktemp -d "${SNELL_CONF_DIR}/.core-configs.XXXXXX") \
+        || { warn "无法创建配置暂存目录"; return 1; }
+    _CLEANUP_FILES+=("$staged_conf_dir")
     shopt -s nullglob
     configs=("$SNELL_CONF_DIR"/*.conf)
     shopt -u nullglob
@@ -644,9 +767,19 @@ install_core() {
         [[ -f "$conf" && ! -L "$conf" ]] || continue
         port=$(basename "$conf" .conf)
         [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if [[ "${SNELL_VERSION%%.*}" == 6 ]]; then
+            cp -a "$conf" "${backup_dir}/configs/${port}.conf" || return 1
+            cp -a "$conf" "${staged_conf_dir}/${port}.conf" || return 1
+            if ! sed -E '/^[[:space:]]*obfs(-host|-uri)?[[:space:]]*=/d' "$conf" > "${staged_conf_dir}/${port}.conf"; then return 1; fi
+            if [[ -z "$(read_config_value "$conf" mode)" ]]; then
+                printf '\nmode = default\n' >> "${staged_conf_dir}/${port}.conf" || return 1
+            fi
+        fi
         systemctl is-active --quiet "snell@${port}" 2>/dev/null && active_ports+=("$port")
     done
 
+    trap 'interrupt_core_install 130' INT
+    trap 'interrupt_core_install 143' TERM
     if [[ ${#active_ports[@]} -gt 0 ]]; then
         warn "正在短暂停止 ${#active_ports[@]} 个运行实例以更新核心..."
         for port in "${active_ports[@]+"${active_ports[@]}"}"; do
@@ -656,14 +789,23 @@ install_core() {
                 for port in "${active_ports[@]+"${active_ports[@]}"}"; do
                     systemctl start "snell@${port}" >/dev/null 2>&1 || restore_failed=true
                 done
-                [[ "$restore_failed" == "true" ]] && warn "部分实例运行状态恢复失败，请立即检查。"
+                if [[ "$restore_failed" == "true" ]]; then
+                    warn "部分实例运行状态恢复失败，请立即检查。"
+                    preserve_core_backup "$tmp_dir"
+                fi
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
                 return 1
             fi
         done
     fi
 
     local install_failed=false
-    mv -f "$new_bin" "$SNELL_BIN" || install_failed=true
+    for conf in "${staged_conf_dir}/"*.conf; do
+        [[ -f "$conf" ]] || continue
+        mv -f "$conf" "${SNELL_CONF_DIR}/${conf##*/}" || install_failed=true
+    done
+    [[ "$install_failed" == "false" ]] && mv -f "$new_bin" "$SNELL_BIN" || install_failed=true
     [[ "$install_failed" == "false" ]] && mv -f "$new_service" "$SERVICE_FILE" || install_failed=true
     [[ "$install_failed" == "false" ]] && mv -f "$new_version" "${SNELL_CONF_DIR}/.version" || install_failed=true
     [[ "$install_failed" == "false" ]] && systemctl daemon-reload || install_failed=true
@@ -684,16 +826,22 @@ install_core() {
         warn "新核心或服务启动失败，正在恢复更新前状态..."
         journalctl -u 'snell@*' -n 20 --no-pager 2>/dev/null | sed 's/^/  /' >&2 || true
         rm -f "$new_bin" "$new_service" "$new_version" || true
+        trap '' INT TERM
         if rollback_core_install "$backup_dir" "$had_bin" "$had_service" "$had_version" \
             "$had_user" "$had_conf_dir" "${active_ports[@]+"${active_ports[@]}"}"; then
             warn "更新失败，已恢复旧核心及原运行状态。"
         else
             warn "自动回滚不完整，请立即检查 Snell 文件和服务。"
+            preserve_core_backup "$tmp_dir"
         fi
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
         return 1
     fi
 
-    info "Snell 稳定版 v${SNELL_VERSION} 安装/更新完成。"
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    info "Snell v${SNELL_VERSION} 安装/更新完成。请运行 snell list 获取对应客户端配置。"
 }
 
 # 2. 添加新实例 (多实例逻辑)
@@ -761,13 +909,18 @@ add_instance() {
         return 1
     fi
 
+    local protocol_settings="obfs = off" listen_address="::0:${port}"
+    if [[ "$(get_installed_major_ver)" == 6 ]]; then
+        protocol_settings=$'mode = default\ndns-ip-preference = default'
+        listen_address="0.0.0.0:${port},[::]:${port}"
+    fi
     if ! cat > "$tmp_conf" <<EOF
 [snell-server]
-listen = ::0:${port}
+listen = ${listen_address}
 psk = ${psk}
 ipv6 = true
 tfo = true
-obfs = off
+${protocol_settings}
 dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888
 EOF
     then
@@ -956,21 +1109,32 @@ read_config_value() {
 }
 
 format_client_config() {
-    local port=$1 ip=$2 conf="${SNELL_CONF_DIR}/${port}.conf"
+    local port=$1 ip=$2
+    local conf="${SNELL_CONF_DIR}/${port}.conf"
     local key snell_ver obfs extra=""
     key=$(read_config_value "$conf" psk)
     snell_ver=$(get_installed_major_ver)
     obfs=$(read_config_value "$conf" obfs)
 
-    if [[ -z "$key" || "$snell_ver" != "5" ]]; then
-        warn "端口 ${port} 的 PSK 无效或核心不是受支持的稳定版 v5，请先检查并更新核心。" >&2
+    if [[ -z "$key" || ! "$snell_ver" =~ ^[56]$ ]]; then
+        warn "端口 ${port} 的 PSK 无效或核心版本不受支持，请先检查并更新核心。" >&2
         return 1
     fi
-    case "${obfs:-off}" in
-        off) ;;
-        http) extra=", obfs=http" ;;
-        *) warn "端口 ${port} 使用稳定版 v5 不支持的混淆模式: ${obfs}" >&2; return 1 ;;
-    esac
+    if [[ "$snell_ver" == 6 ]]; then
+        [[ "${obfs:-off}" == off ]] || { warn "v6 不支持 obfs，请更新核心以迁移配置。" >&2; return 1; }
+        local mode
+        mode=$(read_config_value "$conf" mode)
+        case "${mode:-default}" in
+            default|unshaped|unsafe-raw) extra=", mode=${mode:-default}" ;;
+            *) warn "端口 ${port} 的 mode 无效: ${mode}" >&2; return 1 ;;
+        esac
+    else
+        case "${obfs:-off}" in
+            off) ;;
+            http) extra=", obfs=http" ;;
+            *) warn "端口 ${port} 使用 v5 不支持的混淆模式: ${obfs}" >&2; return 1 ;;
+        esac
+    fi
 
     printf 'snell-%s = snell, %s, %s, psk=%s, version=%s, tfo=true, reuse=true%s\n' \
         "$port" "$ip" "$port" "$key" "$snell_ver" "$extra"
@@ -1282,7 +1446,7 @@ menu() {
             core_status="${GREEN}已安装${PLAIN} ${DIM}(版本未知)${PLAIN}"
         fi
     fi
-    echo -e " 核心: ${core_status}    稳定通道: v${SNELL_VERSION}    架构: $(uname -m)"
+    echo -e " 核心: ${core_status}    更新来源: 官方最新下载版本    架构: $(uname -m)"
     echo -e "------------------------------------------------------------------------"
 
     # ---- 实例列表 ----
@@ -1352,7 +1516,7 @@ menu() {
 
 show_help() {
     echo
-    echo " snell.sh — Snell v${SNELL_VERSION} 稳定版多实例管理器 v${SCRIPT_VERSION}"
+    echo " snell.sh — Snell 多实例管理器 v${SCRIPT_VERSION}"
     echo
     echo " 用法:"
     echo "   snell                交互菜单"
