@@ -88,6 +88,7 @@ _SENTINEL_GEO_REQUESTS=0
 _TG_SYNC_FAILED=false
 _TG_LAST_FAILURE_SCOPE=""
 _TG_LAST_FAILURE_DETAIL=""
+_NOTIFY_DEADLINE=0
 _MENU_LOCK_HELD=false
 _global_cleanup() {
     for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
@@ -997,8 +998,18 @@ fmt_bytes_plain() {
 
 _tg_send_chunk() {
     local token=$1 chat_id=$2 api_url=$3 chunk_text=$4
+    local max_time=10 remaining
+    if [ "$_NOTIFY_DEADLINE" -gt 0 ]; then
+        remaining=$((_NOTIFY_DEADLINE - SECONDS))
+        if [ "$remaining" -le 0 ]; then
+            _TG_LAST_FAILURE_SCOPE=service
+            _TG_LAST_FAILURE_DETAIL="本轮通知时间预算已用尽"
+            return 1
+        fi
+        [ "$remaining" -ge "$max_time" ] || max_time=$remaining
+    fi
     local output curl_rc=0 status body error_code description description_lc is_message_error=false
-    output=$(curl -sS --max-time 10 --write-out $'\n%{http_code}' \
+    output=$(curl -sS --max-time "$max_time" --write-out $'\n%{http_code}' \
         --data-urlencode "chat_id=$chat_id" \
         --data-urlencode "text=$chunk_text" \
         --data-urlencode 'parse_mode=Markdown' \
@@ -1606,15 +1617,21 @@ check_ip_sentinel() {
         local alert_sent=false
         if _sentinel_alert_due "$alert_level" "$s_ip_alert_level" \
             "$current_ts" "$s_last_alert_ts" "$cooldown_min" \
+            && [ "$_TG_SYNC_FAILED" == false ] \
             && telegram_notifications_ready; then
             # --- 归属地查询 (最多 15 个 IP 合并为一次 HTTP 请求) ---
             local details="" idx=1 detail_ips ips_json geo_response
             detail_ips=$(printf '%s\n' "${filtered_ips[@]:0:15}")
             ips_json=$(printf '%s\n' "$detail_ips" | jq -R -s -c 'split("\n") | map(select(length > 0))')
             geo_response=""
-            if [ "$_SENTINEL_GEO_REQUESTS" -lt 15 ]; then
+            local geo_timeout=3
+            if [ "$_NOTIFY_DEADLINE" -gt 0 ]; then
+                local remaining=$((_NOTIFY_DEADLINE - SECONDS))
+                [ "$remaining" -ge "$geo_timeout" ] || geo_timeout=$remaining
+            fi
+            if [ "$_SENTINEL_GEO_REQUESTS" -lt 15 ] && [ "$geo_timeout" -gt 0 ]; then
                 _SENTINEL_GEO_REQUESTS=$((_SENTINEL_GEO_REQUESTS + 1))
-                geo_response=$(curl -sf --max-time 3 \
+                geo_response=$(curl -sf --max-time "$geo_timeout" \
                     -H 'Content-Type: application/json' \
                     -d "$ips_json" \
                     'http://ip-api.com/batch?fields=status,country,regionName,isp,query&lang=zh-CN' 2>/dev/null || true)
@@ -1910,7 +1927,7 @@ cron_task() {
         [.key, (.value.comment // ""), (.value.group_id // "")]
         | map(tostring) | join("\u001f")')
 
-    declare -A _burst_enabled _burst_comment _burst_gid
+    declare -A _burst_enabled _burst_comment _burst_gid _burst_mbps
     while IFS=$'\x1f' read -r _bp _bc _bg; do
         [ -z "$_bp" ] && continue
         _burst_enabled["$_bp"]=true
@@ -1972,7 +1989,7 @@ cron_task() {
         fi
 
         _save_port_state "$port" || cron_failed=true
-        _send_pending_qos_notice "$port" "${_burst_comment[$port]:-}" "$current_mbps" "${_burst_gid[$port]:-}" || cron_failed=true
+        _burst_mbps["$port"]=$current_mbps
     done
 
     # 月度清账先于组聚合：累计、基线和周期标记一次提交。
@@ -2056,10 +2073,6 @@ cron_task() {
         fi
         _load_port_state "$port" || { cron_failed=true; continue; }
 
-        # 用户到期提醒由本机 Telegram 发送；3 天窗口内每个端口/日期只提醒一次。
-        _notify_user_expiry_if_due "$port" "$p3_comment" "$expiry_date" "$expiry_day" \
-            "$current_utc_day" "$gid" || cron_failed=true
-
         # 确定用于判断的流量值
         local check_usage=0
         if [ -n "$gid" ] && [ "$gid" != "null" ]; then
@@ -2094,6 +2107,27 @@ cron_task() {
                 fi
             fi
         fi
+
+    done <<< "$_p3_cfg"
+
+    # 全部端口的采集、限速和配额策略完成后再发送通知。
+    # 时间预算仅约束外部通知；未确认送达的状态保留到下一轮重试。
+    _NOTIFY_DEADLINE=$((SECONDS + 15))
+    while IFS=$'\x1f' read -r port quota_gb mode gid reset_day p3_comment expiry_date expiry_day; do
+        [ -n "$port" ] || continue
+        if [[ -n "${invalid_state_ports[$port]+x}" || -n "${reset_failed_ports[$port]+x}" ]] \
+            || { [ -n "$gid" ] && [[ -n "${invalid_state_groups[$gid]+x}" || -n "${reset_failed_groups[$gid]+x}" ]]; }; then
+            continue
+        fi
+        _load_port_state "$port" || { cron_failed=true; continue; }
+        _send_pending_qos_notice "$port" "${_burst_comment[$port]:-}" "${_burst_mbps[$port]:-0}" "${_burst_gid[$port]:-}" || cron_failed=true
+        _notify_user_expiry_if_due "$port" "$p3_comment" "$expiry_date" "$expiry_day" \
+            "$current_utc_day" "$gid" || cron_failed=true
+        local check_usage=$((s_acc_in + s_acc_out))
+        [ "$mode" != out_only ] || check_usage=$s_acc_out
+        if [ -n "$gid" ] && [ "$gid" != null ]; then check_usage=${group_usage[$gid]:-0}; fi
+        local quota_bytes=$((quota_gb * 1073741824)) is_blocked_nft=false
+        [[ "$blocked_ports_str" != *" $port "* ]] || is_blocked_nft=true
 
         # 阈值通知
         if [ "$quota_bytes" != "0" ] && [ -n "$quota_bytes" ]; then
@@ -2135,6 +2169,7 @@ cron_task() {
 
     # --- 阶段四: 接入 IP 监控 (Sentinel) ---
     check_ip_sentinel "$current_ts" || cron_failed=true
+    _NOTIFY_DEADLINE=0
 
     push_to_worker || cron_failed=true
     [ "$cron_failed" == "false" ]
@@ -2275,16 +2310,58 @@ show_main_menu() {
 
     local port_list=()
     local i=1
-    local ports=$(jq -r '.ports | keys[]' "$CONFIG_FILE" | sort -n)
+    local menu_file port mode burst_enabled comment quota gid reset_day
+    local menu_ports=()
+    local -A menu_modes=() menu_bursts=() menu_comments=() menu_quotas=() menu_groups=() menu_resets=()
+    menu_file=$(mktemp) || { pm_error "无法创建菜单快照"; stop_edit_lock; exit 1; }
+    _CLEANUP_FILES+=("$menu_file")
+    # NUL 分隔保留备注中的空白、反斜线及换行；一次解析全部静态字段。
+    if ! jq -j '
+        .ports | to_entries | sort_by(.key | tonumber) | .[] |
+        [.key, (.value.quota_mode // "in_out"), (.value.dyn_limit.enable // false),
+         (.value.comment // ""), .value.quota_gb, (.value.group_id // ""), (.value.reset_day // 0)]
+        | map(tostring) | if any(.[]; explode | index(0) != null) then error("NUL in menu field")
+                         else .[] + "\u0000" end
+    ' "$CONFIG_FILE" > "$menu_file"; then
+        pm_error "无法读取菜单配置，已停止展示"; stop_edit_lock; exit 1
+    fi
+    while IFS= read -r -d '' port && IFS= read -r -d '' mode \
+        && IFS= read -r -d '' burst_enabled && IFS= read -r -d '' comment \
+        && IFS= read -r -d '' quota && IFS= read -r -d '' gid && IFS= read -r -d '' reset_day; do
+        menu_ports+=("$port")
+        menu_modes["$port"]=$mode; menu_bursts["$port"]=$burst_enabled
+        menu_comments["$port"]=$comment; menu_quotas["$port"]=$quota
+        menu_groups["$port"]=$gid; menu_resets["$port"]=$reset_day
+    done < "$menu_file"
+    rm -f "$menu_file"
+
+    local blocked_json blocked_ports blocked_port blocked_key blocked_known=true
+    local -A menu_blocked=()
+    if [ "${#menu_ports[@]}" -gt 0 ]; then
+        if ! blocked_json=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null) \
+            || ! blocked_ports=$(jq -er '
+                if (.nftables | type) != "array" or
+                   (any(.nftables[]; .set.name? == "blocked_ports") | not) then error("missing set")
+                else [.nftables[] | select(.set.name? == "blocked_ports") | (.set.elem // [])[]]
+                     | if all(.[]; type == "number" and . == floor and . >= 1 and . <= 65535)
+                       then map(tostring) | join("\n") else error("invalid elements") end end
+            ' <<< "$blocked_json"); then
+            blocked_known=false
+            pm_error "无法读取封禁状态，未按未封禁处理"
+        else
+            while IFS= read -r blocked_port; do
+                [ -z "$blocked_port" ] || menu_blocked["$blocked_port"]=1
+            done <<< "$blocked_ports"
+        fi
+    fi
     local -A menu_group_usage=() menu_invalid_groups=()
 
     # 与配额执行逻辑保持一致：分组端口显示组内合计用量。
-    local group_port group_conf group_mode group_gid group_used
-    for group_port in $ports; do
-        group_conf=$(jq ".ports[\"$group_port\"]" "$CONFIG_FILE")
-        group_gid=$(echo "$group_conf" | jq -r '.group_id // empty')
+    local group_port group_mode group_gid group_used
+    for group_port in "${menu_ports[@]}"; do
+        group_gid=${menu_groups[$group_port]}
         [ -z "$group_gid" ] && continue
-        group_mode=$(echo "$group_conf" | jq -r '.quota_mode // "in_out"')
+        group_mode=${menu_modes[$group_port]}
         if ! _load_port_state "$group_port"; then menu_invalid_groups["$group_gid"]=1; continue; fi
         if [ "$group_mode" == "out_only" ]; then
             group_used=$s_acc_out
@@ -2294,13 +2371,9 @@ show_main_menu() {
         menu_group_usage["$group_gid"]=$(( ${menu_group_usage["$group_gid"]:-0} + group_used ))
     done
 
-    for port in $ports; do
-        local conf=$(jq ".ports[\"$port\"]" "$CONFIG_FILE")
-        local mode=$(echo "$conf" | jq -r '.quota_mode')
-        local burst_enabled=$(echo "$conf" | jq -r '.dyn_limit.enable // false')
-        local comment=$(echo "$conf" | jq -r '.comment // ""')
-        local quota=$(echo "$conf" | jq -r '.quota_gb')
-        local gid=$(echo "$conf" | jq -r '.group_id // empty')
+    for port in "${menu_ports[@]}"; do
+        mode=${menu_modes[$port]}; burst_enabled=${menu_bursts[$port]}
+        comment=${menu_comments[$port]}; quota=${menu_quotas[$port]}; gid=${menu_groups[$port]}
         
         # 从 state 文件读取运行数据
         local state_ok=true
@@ -2319,19 +2392,11 @@ show_main_menu() {
         fi
         
         local status_clean=""
+        blocked_key=$((10#$port))
         
-        local blocked_json blocked_status
-        if ! blocked_json=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null) \
-            || ! blocked_status=$(jq -er --argjson p "$port" '
-                if (.nftables | type) != "array" or
-                   (any(.nftables[]; .set.name? == "blocked_ports") | not) then error("missing set")
-                else [.nftables[] | select(.set.name? == "blocked_ports") | (.set.elem // [])[]]
-                     | if all(.[]; type == "number") then any(. == $p) | tostring
-                       else error("invalid elements") end end
-            ' <<< "$blocked_json"); then
+        if [ "$blocked_known" != true ]; then
             status_clean="[封禁状态未知，查看日志]"
-            pm_error "端口 ${port} 无法读取封禁状态，未按未封禁处理"
-        elif [ "$blocked_status" == true ]; then
+        elif [[ -n "${menu_blocked[$blocked_key]+x}" ]]; then
             status_clean="[已阻断]"
         else
             status_clean="$(fmt_bytes $total_used)"
@@ -2341,7 +2406,7 @@ show_main_menu() {
             status_clean="[状态异常，查看日志]"
         fi
 
-        local reset_day=$(echo "$conf" | jq -r '.reset_day // 0')
+        reset_day=${menu_resets[$port]}
         local quota_str="${status_clean} / ${quota} GB"
         local reset_str=""
         if [ "$reset_day" -gt 0 ] 2>/dev/null; then reset_str=" · ${reset_day} 日重置"; fi

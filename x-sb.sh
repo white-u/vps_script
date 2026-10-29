@@ -201,7 +201,7 @@ install_xray() {
     
     local arch=$(map_arch)
     local latest_tag
-    latest_tag=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    latest_tag=$(curl -fsSL --connect-timeout 8 --max-time 15 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
     local latest_ver="${latest_tag#v}"  # 去掉 v 前缀, 对齐 xray version 输出格式
     
     if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then

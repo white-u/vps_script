@@ -22,6 +22,9 @@
 
 const GEO_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const GEO_CACHE_MAX_ENTRIES = 500;
+const GEO_LOOKUP_BUDGET_MS = 2500;
+const GEO_FAILURE_BACKOFF_MS = 30_000;
+const TELEGRAM_TIMEOUT_MS = 8000;
 const TG_DIVIDER = "━━━━━━━━━━━━━━";
 const geoCache = new Map();
 let geoRateLimitedUntil = 0;
@@ -1105,6 +1108,7 @@ async function lookupIpGeos(ips) {
   const uniqueIps = [...new Set(ips)];
   const missingIps = [];
   const now = Date.now();
+  const deadline = now + GEO_LOOKUP_BUDGET_MS;
 
   for (const ip of uniqueIps) {
     const cached = geoCache.get(ip);
@@ -1119,11 +1123,11 @@ async function lookupIpGeos(ips) {
   // ip-api batch 单次最多接受 100 项；顺序分批避免多节点查询产生瞬时并发峰值。
   for (let offset = 0; offset < missingIps.length; offset += 100) {
     if (Date.now() < geoRateLimitedUntil) break;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
     const batch = missingIps.slice(offset, offset + 100);
     try {
-      const timeoutSignal = typeof AbortSignal !== "undefined" && AbortSignal.timeout
-        ? AbortSignal.timeout(2500)
-        : undefined;
+      const timeoutSignal = AbortSignal.timeout(remainingMs);
       const response = await fetch("http://ip-api.com/batch?fields=status,country,regionName,city,isp,query&lang=zh-CN", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1139,12 +1143,13 @@ async function lookupIpGeos(ips) {
       }
       if (!response.ok) {
         if (isRateLimited) break;
-        continue;
+        geoRateLimitedUntil = Date.now() + GEO_FAILURE_BACKOFF_MS;
+        break;
       }
       const rows = await response.json();
       if (!Array.isArray(rows)) {
-        if (isRateLimited) break;
-        continue;
+        geoRateLimitedUntil = Math.max(geoRateLimitedUntil, Date.now() + GEO_FAILURE_BACKOFF_MS);
+        break;
       }
       for (let index = 0; index < rows.length; index++) {
         const row = rows[index];
@@ -1161,7 +1166,9 @@ async function lookupIpGeos(ips) {
       }
       if (isRateLimited) break;
     } catch {
-      // 单批失败仅降级该批 IP，不影响其他节点和 Telegram 主报告。
+      // 服务故障时停止本轮查询并短暂退避，报告仍显示 IP，缓存的成功结果继续使用。
+      geoRateLimitedUntil = Math.max(geoRateLimitedUntil, Date.now() + GEO_FAILURE_BACKOFF_MS);
+      break;
     }
   }
   while (geoCache.size > GEO_CACHE_MAX_ENTRIES) {
@@ -1290,7 +1297,8 @@ async function tgAnswerCallback(env, callbackQueryId) {
     await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id: callbackQueryId })
+      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+      signal: AbortSignal.timeout(2500)
     });
   } catch {
     // 回调确认失败不影响后续详情查询。
@@ -1333,7 +1341,8 @@ async function fetchTelegramApi(token, method, payload) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS)
     });
     if (response.ok) return response;
 
