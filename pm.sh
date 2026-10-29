@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.9 (手动更新下载进度)
+# 版本: v5.6.9 (首版基线)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -19,13 +19,14 @@ LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
 SCRIPT_VERSION="5.6.9"
-# 配置结构版本号 (用于数据迁移)
+# 首版支持的配置结构；保留原编号，防止把旧数据误认成当前格式。
 CURRENT_CONFIG_VERSION=6
-# 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
+# 编辑会话标记；真正的互斥由 CRON_LOCK_FILE 上的 flock 保证，不依赖此文件是否存在。
 USER_EDIT_LOCK="/tmp/pm_user_editing"
 NFT_TABLE="inet port_monitor"
 TC_CLASS_MAP="burst_classes"
 MAX_QUOTA_GB=8589934591
+# 首版状态格式标识；缺少标识或版本不匹配时拒绝读写，不转换为默认零状态。
 PORT_STATE_VERSION=2
 BURST_TRIGGER_MBPS=300
 BURST_TRIGGER_MINUTES=20
@@ -193,8 +194,11 @@ validate_script_candidate() {
 
 validate_config_candidate() {
     local file=$1
-    jq -e --argjson max_quota "$MAX_QUOTA_GB" '
-        type == "object" and (.ports | type == "object") and
+    jq -e --argjson max_quota "$MAX_QUOTA_GB" --argjson config_version "$CURRENT_CONFIG_VERSION" '
+        type == "object" and .config_version == $config_version and
+        (.node_id | type == "string") and (.interface | type == "string") and
+        (.telegram | type == "object") and (.push | type == "object") and
+        (.ports | type == "object") and
         all(.ports | to_entries[];
             (.key | try tonumber catch null) as $port |
             (.key | test("^[0-9]+$")) and
@@ -242,7 +246,7 @@ version_is_older() {
 # 所有运行时变量使用 s_ 前缀, 避免与其他变量冲突
 _init_port_state_defaults() {
     _PORT_STATE_VALID=true
-    s_state_version=0
+    s_state_version=$PORT_STATE_VERSION
     s_acc_in=0; s_acc_out=0; s_last_k_in=0; s_last_k_out=0
     s_last_reset_ts=0; s_high_seconds=0; s_is_punished=false; s_punish_end_ts=0
     s_quota_level=0; s_punish_notified=false; s_recover_notified=true
@@ -260,7 +264,7 @@ _load_port_state() {
         return 1
     fi
 
-    # 状态文件是数据而不是脚本。旧版可缺少新增字段，累计和基线必须完整有效。
+    # 状态文件是数据而不是脚本，累计和基线必须完整有效。
     local key value invalid=false
     local -A seen=()
     if ! while IFS='=' read -r key value || [ -n "$key" ]; do
@@ -291,12 +295,9 @@ _load_port_state() {
         return 1
     fi
 
-    # v1 状态可能包含旧的自定义 QoS 惩罚；升级后统一从固定策略的未触发状态开始。
-    if [ "$s_state_version" -lt "$PORT_STATE_VERSION" ]; then
-        s_state_version=$PORT_STATE_VERSION
-        s_high_seconds=0; s_is_punished=false; s_punish_end_ts=0
-        s_punish_notified=false; s_recover_notified=true
-        s_rules_dirty=false; s_pending_qos_notice=""
+    if [[ -z "${seen[s_state_version]+x}" || "$s_state_version" != "$PORT_STATE_VERSION" ]]; then
+        pm_error "端口 ${1} 状态格式版本不受支持（要求 ${PORT_STATE_VERSION}），原文件已保留，不再自动转换旧状态: ${sf}"
+        return 1
     fi
     _PORT_STATE_VALID=true
 }
@@ -350,13 +351,11 @@ check_root() {
     fi
 }
 
-# 智能安装逻辑：兼容管道运行、Loader加载和本地运行
+# 安装快捷命令：先下载并校验，下载失败时才尝试使用本地脚本。
 install_shortcut() {
-    # 如果是 Cron 模式，或者当前运行的程序路径($0)已经是安装目标，则跳过安装
+    # 后台监控、接入查询或已经从安装路径启动时，不重复安装。
     [[ "$1" == "--monitor" || "$1" == "--ipl" ]] && return
     [[ "$0" == "$INSTALL_PATH" ]] && return
-    
-    # 增加逻辑：如果是被 source 加载的 (Loader 模式)，$0 也是 INSTALL_PATH，会自动跳过，无需额外改动
     
     echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
     
@@ -367,7 +366,7 @@ install_shortcut() {
         return 1
     }
     
-    # 验证下载完整性
+    # 校验下载文件的格式、版本字段和 Bash 语法。
     if curl -fsSLo "$tmp_dl" --connect-timeout 8 --max-time 15 "$(fresh_script_url)" \
         && validate_script_candidate "$tmp_dl"; then
         if ! chmod 755 "$tmp_dl" || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
@@ -440,199 +439,42 @@ install_deps() {
         fi
     fi
 
-    # 初始化配置目录与文件
-    if ! mkdir -p "$CONFIG_DIR" "$STATE_DIR"; then
-        echo -e "${RED}无法创建配置目录 ${CONFIG_DIR}。${PLAIN}" >&2
-        exit 1
-    fi
-    chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null || {
-        echo -e "${RED}无法保护配置目录权限。${PLAIN}" >&2
-        exit 1
-    }
-    # 仅首次运行时创建配置；已有配置损坏时保留现场并停止，禁止静默清空。
-    if [ ! -e "$CONFIG_FILE" ]; then
-        safe_write_config '{"node_id": "'"$(hostname 2>/dev/null || echo unknown)"'", "interface": "'"$(get_iface)"'", "ports": {}, "telegram": {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}}' || exit 1
-    elif [ ! -s "$CONFIG_FILE" ] || ! validate_config_candidate "$CONFIG_FILE"; then
-        local corrupt_backup="${CONFIG_FILE}.corrupt.$(date +%Y%m%d%H%M%S)"
-        cp -p "$CONFIG_FILE" "$corrupt_backup" 2>/dev/null || true
-        echo -e "${RED}错误: 配置文件损坏或字段无效，已保留为 ${corrupt_backup}，请修复后重试。${PLAIN}" >&2
-        exit 1
-    fi
-    # 确保存在 telegram 字段 (旧版本升级兼容)
-    if ! jq -e '.telegram' "$CONFIG_FILE" >/dev/null 2>&1; then
-        local tmp=$(mktemp)
-        if ! jq '.telegram = {"enable": false, "bot_token": "", "chat_id": "", "api_url": "https://api.telegram.org", "thresholds": [50, 80, 100]}' "$CONFIG_FILE" > "$tmp" \
-            || ! safe_write_config_from_file "$tmp"; then
-            rm -f "$tmp"; pm_error "Telegram 默认配置补全失败"; exit 1
-        fi
-        rm -f "$tmp"
-    fi
-    # 确保存在 node_id 字段 (旧版本升级兼容)
-    if ! jq -e '.node_id' "$CONFIG_FILE" >/dev/null 2>&1; then
-        local tmp=$(mktemp)
-        if ! jq --arg nid "$(hostname 2>/dev/null || echo unknown)" '.node_id = $nid' "$CONFIG_FILE" > "$tmp" \
-            || ! safe_write_config_from_file "$tmp"; then
-            rm -f "$tmp"; pm_error "节点标识补全失败"; exit 1
-        fi
-        rm -f "$tmp"
-    fi
-    # 确保存在 push 字段 (v4.4+ 云端推送)
-    if ! jq -e '.push' "$CONFIG_FILE" >/dev/null 2>&1; then
-        local tmp=$(mktemp)
-        if ! jq '.push = {"enable": false, "worker_url": "", "secret": "", "node_key": ""}' "$CONFIG_FILE" > "$tmp" \
-            || ! safe_write_config_from_file "$tmp"; then
-            rm -f "$tmp"; pm_error "云端推送默认配置补全失败"; exit 1
-        fi
-        rm -f "$tmp"
-    fi
-    # 保护配置文件 (含 bot_token)
-    chmod 600 "$CONFIG_FILE" || { echo -e "${RED}无法保护配置文件权限。${PLAIN}" >&2; exit 1; }
-    find "$STATE_DIR" -maxdepth 1 -type f -name '*.txt' -exec chmod 600 {} + 2>/dev/null || true
-    
-    # 执行数据迁移
-    migrate_config || exit 1
+    init_config || exit 1
 }
 
-# ==============================================================================
-# 1.5 数据迁移模块 (Schema Migration)
-# ==============================================================================
-
-migrate_config() {
-    local modified=false
-    local tmp_json=$(cat "$CONFIG_FILE")
-    
-    # 获取当前文件内的版本号 (若无则为0)
-    local file_ver=$(echo "$tmp_json" | jq -r '.config_version // 0')
-    
-    # --- 迁移逻辑链 ---
-    
-    # v0 -> v1: 初始化版本号 & 规范化 group_id
-    if [ "$file_ver" -lt 1 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v1)...${PLAIN}"
-        
-        # 1. 补全 config_version
-        # 2. 遍历所有端口，如果缺 group_id，补全为空字符串 (规范化)
-        # 3. 清理可能存在的废弃字段 (示例: 删除 legacy_field)
-        tmp_json=$(echo "$tmp_json" | jq '
-            .config_version = 1 |
-            .ports |= with_entries(
-                .value.group_id = (.value.group_id // "") |
-                del(.value.legacy_field)
-            )
-        ')
-        modified=true
+# 直接创建首版完整结构；已有配置只校验，不补字段、不转换历史格式。
+init_config() {
+    if ! mkdir -p "$CONFIG_DIR" "$STATE_DIR"; then
+        pm_error "无法创建配置目录 ${CONFIG_DIR}"
+        return 1
     fi
-    
-    # 未来 v1 -> v2 可以继续追加:
-    if [ "$file_ver" -lt 2 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v2)...${PLAIN}"
-        # 为所有端口补全 ip_limit 默认结构 (接入监控)
-        tmp_json=$(echo "$tmp_json" | jq '
-            .config_version = 2 |
-            .ports |= with_entries(
-                .value.ip_limit = (.value.ip_limit // {
-                    "enable": false,
-                    "max_ips": 3,
-                    "action": "alert",
-                    "cooldown_min": 30,
-                    "whitelist": [],
-                    "last_alert_ts": 0,
-                    "last_alert_ips": []
-                })
-            )
-        ')
-        modified=true
+    chmod 700 "$CONFIG_DIR" "$STATE_DIR" || {
+        pm_error "无法保护配置目录权限"
+        return 1
+    }
+    if [ ! -e "$CONFIG_FILE" ]; then
+        local initial_config
+        initial_config=$(jq -n --argjson version "$CURRENT_CONFIG_VERSION" \
+            --arg node_id "$(hostname)" --arg interface "$(get_iface)" '{
+                config_version: $version,
+                node_id: $node_id,
+                interface: $interface,
+                ports: {},
+                telegram: {enable: false, bot_token: "", chat_id: "",
+                    api_url: "https://api.telegram.org", thresholds: [50, 80, 100]},
+                push: {enable: false, worker_url: "", secret: "", node_key: ""}
+            }') || { pm_error "初始配置生成失败"; return 1; }
+        safe_write_config "$initial_config" || return 1
+    elif [ ! -s "$CONFIG_FILE" ] || ! validate_config_candidate "$CONFIG_FILE"; then
+        pm_error "配置损坏、字段无效或格式版本不受支持（要求 config_version=${CURRENT_CONFIG_VERSION}），原配置已保留；首版不再自动迁移旧配置，请使用匹配的备份或单独备份后重新配置"
+        return 1
     fi
-
-    # v2 -> v3: 运行状态分离至 state/*.txt (cron 零 jq 读写)
-    if [ "$file_ver" -lt 3 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v3: 状态分离)...${PLAIN}"
-        mkdir -p "$STATE_DIR"
-        # 从 config.json 提取每个端口的运行状态写入 .txt
-        local _mig_ports=$(echo "$tmp_json" | jq -r '.ports | keys[]')
-        for _mp in $_mig_ports; do
-            local _sf="$STATE_DIR/${_mp}.txt"
-            if [ -f "$_sf" ]; then
-                [ -s "$_sf" ] || { pm_error "端口 ${_mp} 的已有迁移状态为空，请检查后重试"; return 1; }
-                continue
-            fi
-            IFS=$'\t' read -r _ai _ao _ki _ko _lrt _ql _lat _laips <<< \
-                "$(echo "$tmp_json" | jq -r ".ports[\"$_mp\"] | [
-                    ((.stats.acc_in//0)|floor), ((.stats.acc_out//0)|floor),
-                    ((.stats.last_kernel_in//0)|floor), ((.stats.last_kernel_out//0)|floor),
-                    ((.last_reset_ts//0)|floor),
-                    (.notify_state.quota_level//0),
-                    (.ip_limit.last_alert_ts//0),
-                    ((.ip_limit.last_alert_ips//[]) | join(\",\"))
-                ] | @tsv")"
-            local _mv
-            for _mv in "$_ai" "$_ao" "$_ki" "$_ko" "$_lrt" "$_ql" "$_lat"; do
-                [[ "$_mv" =~ ^[0-9]+$ ]] || { pm_error "端口 ${_mp} 的旧流量状态无效，迁移已停止"; return 1; }
-            done
-            _init_port_state_defaults
-            s_acc_in=$_ai; s_acc_out=$_ao; s_last_k_in=$_ki; s_last_k_out=$_ko
-            s_last_reset_ts=$_lrt; s_quota_level=$_ql; s_last_alert_ts=$_lat
-            s_last_alert_ips=${_laips:-}
-            _save_port_state "$_mp" || { pm_error "端口 ${_mp} 的状态迁移未完成，配置版本保持不变"; return 1; }
-        done
-        tmp_json=$(echo "$tmp_json" | jq '.config_version = 3')
-        modified=true
-    fi
-
-    # v3 -> v4: 为每个端口增加用户到期日期；空字符串表示不提醒。
-    if [ "$file_ver" -lt 4 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v${file_ver} -> v4: 用户到期提醒)...${PLAIN}"
-        tmp_json=$(echo "$tmp_json" | jq '
-            .config_version = 4 |
-            .ports |= with_entries(
-                .value.expiry_date = (
-                    if ((.value.expiry_date // "") | type) == "string"
-                    then (.value.expiry_date // "")
-                    else ""
-                    end
-                )
-            )
-        ')
-        modified=true
-    fi
-
-    # v4 -> v5: 移除基础限速与自定义 QoS 参数，只保留固定突发策略开关。
-    if [ "$file_ver" -lt 5 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v4 -> v5: 固定突发限速)...${PLAIN}"
-        tmp_json=$(echo "$tmp_json" | jq '
-            .config_version = 5 |
-            .ports |= with_entries(
-                .value.dyn_limit = {"enable": (.value.dyn_limit.enable == true)} |
-                del(.value.limit_mbps)
-            )
-        ')
-        modified=true
-    fi
-
-    # v5 -> v6: Telegram 不再提供配额重置通知和定时流量报告。
-    if [ "$file_ver" -lt 6 ]; then
-        echo -e "${YELLOW}正在升级配置文件结构 (v5 -> v6: 精简通知设置)...${PLAIN}"
-        tmp_json=$(echo "$tmp_json" | jq '
-            .config_version = 6 |
-            if ((.telegram // {}) | type) == "object" then
-                .telegram |= del(.report_interval_hours, .last_report_ts)
-            else . end
-        ')
-        modified=true
-    fi
-    if [ "$modified" == "true" ]; then
-        local tmp_file=$(mktemp)
-        printf '%s\n' "$tmp_json" > "$tmp_file"
-        if ! safe_write_config_from_file "$tmp_file"; then
-            rm -f "$tmp_file"
-            pm_error "配置文件迁移写入失败，原配置保持不变"
-            return 1
-        fi
-        rm -f "$tmp_file"
-        find "$STATE_DIR" -maxdepth 1 -type f -name '*.txt' -exec chmod 600 {} + 2>/dev/null || true
-        echo -e "${GREEN}配置文件已升级至 v${CURRENT_CONFIG_VERSION}。${PLAIN}"
-        sleep 1
-    fi
+    # 配置包含凭据，状态包含流量累计；保护权限但不改写已有数据。
+    chmod 600 "$CONFIG_FILE" || { pm_error "无法保护配置文件权限"; return 1; }
+    find "$STATE_DIR" -maxdepth 1 -type f -name '*.txt' -exec chmod 600 {} + || {
+        pm_error "无法保护端口状态文件权限"
+        return 1
+    }
 }
 
 # ==============================================================================
@@ -1038,9 +880,9 @@ ensure_runtime_rules() {
     fi
     nft_table_healthy && return 0
 
-    echo -e "${YELLOW}检测到旧版或缺失的内核规则，正在进行一次性迁移...${PLAIN}"
-    reload_all_rules || { pm_error "Nftables/TC 规则迁移失败"; return 1; }
-    echo -e "${GREEN}内核规则已更新。${PLAIN}"
+    echo -e "${YELLOW}检测到内核规则缺失或不一致，正在恢复...${PLAIN}"
+    reload_all_rules || { pm_error "Nftables/TC 规则恢复失败"; return 1; }
+    echo -e "${GREEN}内核规则已恢复。${PLAIN}"
 }
 
 # ==============================================================================
@@ -1117,7 +959,7 @@ get_host_label() {
     fi
     [ -z "$host_part" ] && host_part="Unknown"
     
-    # 附加用户 + 组名（底层继续使用 comment 字段以兼容旧配置与 Worker）
+    # 用户显示名取自 comment 字段，与 Worker 的展示字段保持一致。
     local raw="$host_part"
     if [ -n "$comment" ] && [ "$comment" != "null" ] && [ "$comment" != "" ]; then
         raw="${raw} · ${comment}"
@@ -2416,7 +2258,7 @@ show_main_menu() {
     clear
     echo -e "$UI_DIVIDER"
     echo -e "  Linux 端口流量管理 v${SCRIPT_VERSION}"
-    echo -e "  每分钟刷新 · 编辑期间后台任务暂停"
+    echo -e "  每分钟采样 · 编辑期间后台任务暂停"
     echo -e "$UI_DIVIDER"
 
     local port_list=()
@@ -2858,7 +2700,7 @@ config_port_menu() {
                 fi
                 ;;
             7)
-                # [优化] 自动列出已有分组供选择
+                # 列出已有分组，供用户选择或输入新名称。
                 echo -e "\n$UI_SEPARATOR"
                 echo -e " 分组设置"
                 echo -e "$UI_SEPARATOR"
@@ -2885,7 +2727,7 @@ config_port_menu() {
                     val="${group_map[$input_val]}"
                     echo -e "已选择分组: ${BLUE}${val}${PLAIN}"
                 else
-                    # [Sanitization] 输入清洗: 只允许字母数字下划线中划线
+                    # 新组名只允许字母、数字、下划线和连字符。
                     if [ -n "$input_val" ] && [ "$input_val" != "0" ]; then
                         if [[ ! "$input_val" =~ ^[a-zA-Z0-9_-]+$ ]]; then
                             echo -e "${RED}错误: 组名仅支持字母、数字、下划线(_)和连字符(-)！${PLAIN}"
@@ -3393,7 +3235,7 @@ update_script() {
             return 1
         fi
         echo -e "${GREEN}更新成功 (v${remote_ver})，正在重启...${PLAIN}"; sleep 1
-        # exec 前释放菜单持有的 Cron 锁，新版启动后才能立即完成规则迁移。
+        # exec 前释放菜单持有的 Cron 锁，重新启动后才能立即检查和恢复规则。
         stop_edit_lock
         exec "$INSTALL_PATH"
     else
@@ -3489,16 +3331,16 @@ install_shortcut "${1:-}" || exit 1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 if [ "${1:-}" == "--monitor" ] || [ "${1:-}" == "--ipl" ]; then
-    # [OPT-FAST] cron/CLI 模式: 跳过完整 install_deps (依赖已在首次运行时安装, 配置已迁移)
-    # 仅做最小化检查: 配置文件存在且 JSON 合法
+    # 后台监控和接入查询复用首次初始化的依赖，不运行完整安装流程。
+    # 配置须非空、结构版本受支持，且通过字段校验。
     if [ ! -s "$CONFIG_FILE" ] || ! validate_config_candidate "$CONFIG_FILE"; then
-        pm_error "配置文件不存在或损坏，监控任务已停止；请运行 pm 进行检查"
-        echo -e "${RED}错误: 配置文件不存在或损坏，监控任务已停止；请运行 pm 进行检查。${PLAIN}" >&2
+        pm_error "配置文件不存在、损坏或格式版本不受支持，监控任务已停止；请运行 pm 进行检查"
+        echo -e "${RED}错误: 配置文件不存在、损坏或格式版本不受支持，监控任务已停止；请运行 pm 进行检查。${PLAIN}" >&2
         exit 1
     fi
     mkdir -p "$STATE_DIR"
 else
-    # 首次安装、升级迁移也与既有 Cron 互斥，避免迁移状态时被旧任务覆盖。
+    # 首次初始化与规则恢复也与既有 Cron 互斥，避免后台任务并发改写状态。
     exec 7>"$CRON_LOCK_FILE" || { pm_error "无法打开后台任务锁"; exit 1; }
     flock -x 7 || { pm_error "无法等待后台任务结束"; exit 1; }
     install_deps

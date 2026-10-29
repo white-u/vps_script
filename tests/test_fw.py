@@ -1,7 +1,7 @@
 """FW regression tests; use Python 3, jq, curl and Bash 4+ (BASH_BIN overrides Bash).
 
 Services/listeners are simulated; downloads use real curl and a local HTTP server.
-VT's absolute paths are redirected into
+The scripts' absolute paths are redirected into
 each test's temporary directory before loading its functions; no host services
 or firewall rules are changed.
 """

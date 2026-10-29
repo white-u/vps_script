@@ -29,7 +29,7 @@ WORK_DIR="/var/lib/sing-box"
 # ✅ store metadata (pbk etc.) OUTSIDE sing-box config to avoid schema/strict parsing issues
 META_FILE="${SB_CONF_DIR}/nodes_meta.json"
 
-# If not empty, force install this sing-box version (without v prefix), e.g. "1.12.22"
+# Optional sing-box target version (without v prefix), e.g. "1.14.0"; config checks still apply.
 PINNED_SB_VERSION=""
 SS2022_METHOD="2022-blake3-aes-128-gcm"
 SS2022_KEY_BYTES=16
@@ -590,6 +590,7 @@ restart_singbox_checked() {
   return 0
 }
 
+# 保留安全路由补全与历史出口清理；符合当前要求时不改写配置。
 migrate_config_if_needed() {
   [[ -x "$SB_BIN" && -s "$SB_CONF_FILE" ]] || return 0
   local needs_guard=0 has_removed_exit=0

@@ -8,19 +8,21 @@
 
 `x-sb.sh` 是一个基于 **Xray-core** 的轻量级管理脚本。它专注于提供 **VLESS-Vision-REALITY** 和 **Shadowsocks-2022** 这两种高性能、抗封锁能力强的协议组合。
 
-与臃肿的面板不同，`x-sb.sh` 坚持 **“最小化依赖、最大化性能”** 的原则，直接操作 JSON 配置文件，支持热重载，不依赖数据库。
+脚本直接操作 JSON 配置文件，不依赖数据库。保存配置后通过 systemd 重启 Xray，现有连接可能短暂中断。
+
+这是独立保留的脚本，仅支持 Debian/Ubuntu、systemd，以及 amd64、arm64；`vt` 不调度或统一卸载它。仓库的实际 Linux 集成测试脚本仅覆盖 PM，不包含 Xray 核心或客户端握手验证。
 
 ### 1.1 核心特性
 
 *   **协议支持:**
-    *   **VLESS-Vision-REALITY:** 目前最先进的抗封锁协议，无需域名证书，自选 SNI (如 Microsoft/Apple)，速度极快。
-    *   **Shadowsocks-2022:** 基于 BLAKE3 的新一代 SS 协议，在支持硬件加速的 CPU 上性能爆表。
+    *   **VLESS-Vision-REALITY:** 使用脚本生成的密钥与所选目标域名，不要求用户自行申请服务端域名证书。
+    *   **Shadowsocks-2022:** 使用 AEAD-2022 方法与随机生成的密钥。
 *   **安全机制:**
     *   **配置回滚:** 每次修改配置前，先进行 JSON 语法校验和 Xray 语义校验。如果新配置导致服务无法启动，脚本会自动回滚到上一次的正确配置，防止失联。
-    *   **端口随机:** 默认生成 10000-65535 的随机端口，避免特征扫描。
+    *   **端口选择:** 支持手动指定端口或由脚本随机选择，创建前检查端口占用。
 *   **进阶功能:**
     *   **链式代理 (Chain Proxy):** 支持为特定节点配置上游 SOCKS5 代理 (如 WARP/Clash)，实现落地 IP 优选或解锁流媒体。
-    *   **路由规则:** 内置广告屏蔽 (Geosite: category-ads-all) 和 回国流量屏蔽 (Geoip: cn) 规则。
+    *   **路由规则:** 默认阻止私网 IP；进阶菜单可切换广告和中国大陆域名/IP 屏蔽规则。
 
 ---
 
@@ -37,10 +39,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/x-sb
 | 命令 | 说明 |
 |------|------|
 | `x-sb` | 进入交互式管理菜单 (主入口) |
-| `x-sb add` | 快速添加一个新节点 |
-| `x-sb list` | 列出所有节点信息 |
-| `x-sb update` | 更新管理脚本自身 |
-| `x-sb install` | 强制重新安装/更新 Xray 核心 |
+| `x-sb install` | 检查或更新 Xray 核心，目标版本已安装时跳过二进制替换 |
+
+仅 `install` 有独立命令行分支；添加、查看、更新脚本和卸载均通过菜单操作。`x-sb add`、`x-sb list`、`x-sb update` 不会执行对应操作，而是进入主菜单。
 
 ### 2.3 交互菜单
 
@@ -77,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/x-sb
 *   **配置项:**
     *   `SNI`: 目标网站域名 (脚本内置了几个大厂域名供选择)。
     *   `Private Key`: 脚本自动生成的 X25519 密钥。
-    *   `Short ID`: 简短的随机字符串，用于抗重放攻击。
+    *   `Short ID`: 脚本生成的短标识，客户端需使用同一值。
 
 ### 3.2 Shadowsocks-2022
 

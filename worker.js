@@ -11,15 +11,12 @@
  *   - ADMIN_ID       : 管理员 Telegram ID (字符串)
  *   - TELEGRAM_WEBHOOK_SECRET : Telegram Webhook secret_token
  *
- * 注意: USERS_JSON 已废弃，用户权限现在存储在 D1 的 users 表中
+ * D1 表: nodes 保存节点快照，users 保存查询权限，telegram_updates 保存管理员写操作去重记录。
  *
- * v3.5 变更: 特殊分组名安全聚合，大批量授权回执与删除预览使用有界摘要
- * v3.4 变更: 长查询按页显示，Telegram 限流按 retry_after 有界重试
- * v3.3 变更: 管理员写操作按 Telegram update_id 幂等提交，节点及权限删除原子化
- * v3.2 变更: 增加 TG-ID 查询、权限操作引导、真实端口校验与删除确认
- * v3.1 变更: 精简流量卡片并补全 Telegram 按钮菜单
- * v3.0 变更: 用户到期提醒改由 PM 本机 Telegram 发送，Worker 仅展示到期状态
- * v2.9 变更: 展示 PM v5.6.0 固定突发限速状态，并兼容旧节点基础限速字段
+ * 首版职责: 接收签名推送、按权限查询、分页展示流量及固定突发限速状态。
+ * 管理员写操作按 update_id 去重，删除用户权限需先预览并追加 --yes 确认。
+ * 用户到期提醒由 PM 本机 Telegram 发送，Worker 仅展示到期状态。
+ * 大批量授权回执与删除预览采用摘要；完整权限通过 /users 分页查看。
  * ============================================================
  */
 
@@ -57,7 +54,7 @@ export default {
 };
 
 // ==============================================================
-// 1. 接收 VPS 推送 (不变)
+// 1. 接收并验证 VPS 签名推送
 // ==============================================================
 async function handlePush(request, env) {
   const secret = env.SHARED_SECRET;
@@ -981,8 +978,6 @@ function renderReport(input, geoMap) {
     const comment   = p.comment || "";
     const quotaGb   = p.quota_gb || 0;
     const mode      = p.quota_mode || "in_out";
-    // limit_mbps 仅用于兼容尚未升级到 PM v5.6.0 的旧节点。
-    const legacyLimitMbps = p.limit_mbps || 0;
     const accIn     = Math.floor(p.stats?.acc_in || 0);
     const accOut    = Math.floor(p.stats?.acc_out || 0);
     const resetDay  = p.reset_day || 0;
@@ -1024,8 +1019,6 @@ function renderReport(input, geoMap) {
     }
     if (isPunished) {
       block += `\n├ ⚡ 突发限速 ${burstLimitMbps} Mbps`;
-    } else if (legacyLimitMbps > 0) {
-      block += `\n├ 🔒 旧版出站限速 ${legacyLimitMbps} Mbps`;
     }
 
     const shownIps = onlineIps.slice(0, 8).map(ip => String(ip || "").trim()).filter(Boolean);

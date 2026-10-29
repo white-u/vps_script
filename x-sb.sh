@@ -737,8 +737,7 @@ get_node_tag_by_id() {
     done <<< "$nodes"
 }
 
-# 用 openssl 从 x25519 私钥推算公钥 (兼容所有 Xray 版本)
-# Xray 26.x 移除了 PublicKey 输出, 必须自行计算
+# 用 OpenSSL 从配置中的 X25519 私钥推导分享链接所需的公钥。
 get_x25519_pubkey() {
     local priv_key=$1
     # base64url → standard base64 (补 padding)
@@ -803,7 +802,7 @@ show_node_info() {
         local flow=$(echo "$node" | jq -r '.settings.clients[0].flow')
         local sni=$(echo "$node" | jq -r '.streamSettings.realitySettings.serverNames[0]')
         local pbk=$(echo "$node" | jq -r '.streamSettings.realitySettings.privateKey')
-        # 优先读配置中的 publicKey, 降级用 openssl 计算 (兼容旧配置)
+        # 优先读取 publicKey；未保存公钥时从 privateKey 推导。
         local pubk=$(echo "$node" | jq -r '.streamSettings.realitySettings.publicKey // empty')
         if [[ -z "$pubk" ]]; then
             pubk=$(get_x25519_pubkey "$pbk")

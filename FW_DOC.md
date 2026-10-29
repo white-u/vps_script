@@ -90,10 +90,12 @@ FW **不会自动修改** UFW、firewalld、nftables 或 iptables。如外部无
 
 ## 开发验证
 
-在项目根目录运行（需要 Python 3、jq、curl 和 Bash 4+）：
+只验证 FW 时，在项目根目录运行（需要 Python 3、jq、curl 和 Bash 4+）：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -p 'test_fw.py' -v
 ```
 
 可用 `BASH_BIN` 指定 Bash 路径。测试在临时目录中模拟服务和监听状态，并使用本地 HTTP 服务与真实 curl 验证下载进度、下载失败和校验失败；同时覆盖更新、删除序号、监听失败回滚、中断恢复、回滚失败备份保留，以及 `vt` 在安装完整或未完成时的 FW 卸载，不操作宿主机服务和防火墙。真实 Linux/systemd 与公网转发仍需在目标环境验证。
+
+运行包括下载进度和其他组件在内的完整回归测试时，还需 Node.js，命令及实际 Linux 集成测试范围见 [README](README.md#回归测试)。
