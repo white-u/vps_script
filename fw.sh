@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.3.5
+# 端口转发管理脚本 (基于 realm) v2.3.6
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -53,7 +53,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.3.5"
+SCRIPT_VERSION="2.3.6"
 REALM_VERSION="2.9.6"
 
 REALM_BIN="/usr/local/bin/realm"
@@ -924,7 +924,7 @@ update_script() {
     tmp_script=$(mktemp "${SCRIPT_PATH}.update.XXXXXX") || err "无法创建更新临时文件"
     _CLEANUP_FILES+=("$tmp_script")
 
-    if ! curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
+    if ! curl -fL --progress-bar -o "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
         err "下载失败，请检查网络；现有脚本未被覆盖。"
     fi
     if ! validate_script_candidate "$tmp_script"; then

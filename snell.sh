@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 v5.3.2
+# Snell 多实例管理脚本 v5.3.3
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
@@ -35,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="5.3.2"
+SCRIPT_VERSION="5.3.3"
 SNELL_VERSION="5.0.1"
 
 SNELL_BIN="/usr/local/bin/snell-server"
@@ -558,14 +558,16 @@ install_core() {
     candidate="${tmp_dir}/snell-server"
 
     local url="${DL_BASE}/snell-server-v${SNELL_VERSION}-linux-${arch}.zip"
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$archive" "$url"; then
+    if ! curl -fL --progress-bar --connect-timeout 15 --max-time 120 -o "$archive" "$url"; then
         warn "Snell 下载失败；现有核心和实例未改动。"
         return 1
     fi
+    info "下载完成，正在校验官方发行包..."
     if ! printf '%s  %s\n' "$archive_sha" "$archive" | sha256sum -c - >/dev/null 2>&1; then
         warn "Snell 官方发行包 SHA256 校验失败，已拒绝安装。"
         return 1
     fi
+    info "校验通过，正在解压并检查核心..."
     if ! unzip -q "$archive" snell-server -d "$tmp_dir" || [[ ! -s "$candidate" ]]; then
         warn "Snell 发行包解压失败或缺少二进制。"
         return 1
@@ -1044,7 +1046,7 @@ update_script() {
         || { warn "无法创建更新临时文件"; return 1; }
     _CLEANUP_FILES+=("$tmp_script")
 
-    if ! curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
+    if ! curl -fL --progress-bar -o "$tmp_script" --connect-timeout 8 --max-time 30 "$(fresh_script_url)"; then
         warn "下载失败，请检查网络；现有脚本未被覆盖。"
         return 1
     fi

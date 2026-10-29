@@ -2,7 +2,7 @@
 
 `fw.sh` 是基于 [Realm](https://github.com/zhboner/realm) 的轻量端口转发管理脚本，默认同时转发 TCP 和 UDP。
 
-**脚本版本**：v2.3.5　|　**快捷命令**：`fw`
+**脚本版本**：v2.3.6　|　**快捷命令**：`fw`
 
 ## 支持范围
 

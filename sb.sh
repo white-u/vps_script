@@ -11,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -799,13 +799,13 @@ install_singbox() {
   tmp_dir=$(mktemp -d /tmp/sb.dir.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp_dir")
 
-  if ! curl -fL --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+  if ! curl -fL --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
     # 旧版 sing-box 尚未单列 musl 资产，当时的通用 Linux 构建为静态链接。
     if [[ "$asset_name" == *-musl.tar.gz ]]; then
       asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
       url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
       echo -e "${YELLOW}该版本没有独立 musl 文件，尝试旧版通用静态构建...${PLAIN}"
-      if ! curl -fL --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+      if ! curl -fL --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
         echo -e "${RED}下载失败：${url}${PLAIN}"
         return 1
       fi
@@ -1456,7 +1456,7 @@ update_script() {
   }
   _CLEANUP_FILES+=("$tmp")
 
-  if ! curl -fsSLo "$tmp" --connect-timeout 8 --max-time 20 "$(fresh_script_url)"; then
+  if ! curl -fL --progress-bar -o "$tmp" --connect-timeout 8 --max-time 20 "$(fresh_script_url)"; then
     echo -e "${RED}下载失败：${SCRIPT_URL}，现有脚本未被覆盖。${PLAIN}"
     return 1
   fi

@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.8 (异常状态保护与离线周期恢复)
+# 版本: v5.6.9 (手动更新下载进度)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.8"
+SCRIPT_VERSION="5.6.9"
 # 配置结构版本号 (用于数据迁移)
 CURRENT_CONFIG_VERSION=6
 # 信号锁文件：当此文件存在时，Cron 暂停运行，防止覆盖用户正在编辑的数据
@@ -3371,7 +3371,7 @@ update_script() {
         echo -e "${RED}无法创建更新临时文件，现有脚本未被覆盖。${PLAIN}" >&2
         return 1
     }
-    if curl -fsSLo "$tmp" --connect-timeout 8 --max-time 30 "$(fresh_script_url)" \
+    if curl -fL --progress-bar -o "$tmp" --connect-timeout 8 --max-time 30 "$(fresh_script_url)" \
         && validate_script_candidate "$tmp"; then
         local remote_ver
         remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
