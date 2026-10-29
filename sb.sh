@@ -11,7 +11,7 @@ YELLOW='\033[33m'
 BLUE='\033[36m'
 PLAIN='\033[0m'
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 SHORTCUT_NAME="sb"
 INSTALL_PATH="/usr/local/bin/${SHORTCUT_NAME}"
 
@@ -83,9 +83,14 @@ run_menu_action() {
   local rc=0
   "$@" || rc=$?
   if [[ $rc -ne 0 ]]; then
-    echo -e "${RED}❌ ${label}失败（退出码 ${rc}）。服务日志: $(service_log_hint)${PLAIN}" >&2
+    echo -e "${RED}❌ ${label}未完成（退出码 ${rc}）。请查看上方提示；状态与日志可在菜单 8 查看。${PLAIN}" >&2
   fi
   return 0
+}
+
+pause_to_menu() {
+  echo
+  read -rp "按回车返回主菜单..." || return 0
 }
 
 check_root() {
@@ -525,8 +530,49 @@ show_service_logs() {
       echo -e "${YELLOW}尚无服务日志: $OPENRC_LOG_FILE${PLAIN}" >&2
     fi
   else
-    journalctl -u sing-box --no-pager -n 30 2>/dev/null | tail -30
+    journalctl -u sing-box --no-pager -n 30
   fi
+}
+
+show_status_and_logs() {
+  echo -e "${BLUE}>>> 状态、配置检查与最近日志${PLAIN}"
+  if [[ ! -x "$SB_BIN" ]]; then
+    echo -e "${YELLOW}尚未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"
+    return 0
+  fi
+
+  local ver out rc=0
+  ver=$(get_current_sb_ver)
+  echo "核心版本: ${ver}"
+  if service_is_active; then
+    echo -e "服务状态: ${GREEN}运行中${PLAIN}"
+  else
+    echo -e "服务状态: ${YELLOW}已停止或启动异常${PLAIN}"
+  fi
+
+  echo
+  echo "--- 配置检查 ---"
+  if [[ ! -s "$SB_CONF_FILE" ]]; then
+    echo -e "${RED}配置文件不存在或为空，无法检查。${PLAIN}" >&2
+    rc=1
+  elif out=$("$SB_BIN" check -c "$SB_CONF_FILE" 2>&1); then
+    [[ -z "$out" ]] || printf '%s\n' "$out"
+    echo -e "${GREEN}配置检查通过。${PLAIN}"
+  else
+    echo -e "${RED}配置检查失败:${PLAIN}" >&2
+    printf '%s\n' "$out" >&2
+    rc=1
+  fi
+
+  echo
+  echo "--- 最近 30 行服务日志 ---"
+  if ! show_service_logs; then
+    echo -e "${RED}服务日志读取失败，请检查上方报错。${PLAIN}" >&2
+    rc=1
+  fi
+  echo
+  echo "检查结束，未更新核心或重启服务。实际连通性仍需在客户端确认。"
+  return "$rc"
 }
 
 restart_singbox_checked() {
@@ -753,13 +799,13 @@ install_singbox() {
   tmp_dir=$(mktemp -d /tmp/sb.dir.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp_dir")
 
-  if ! curl -fL --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+  if ! curl -fL --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
     # 旧版 sing-box 尚未单列 musl 资产，当时的通用 Linux 构建为静态链接。
     if [[ "$asset_name" == *-musl.tar.gz ]]; then
       asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
       url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
       echo -e "${YELLOW}该版本没有独立 musl 文件，尝试旧版通用静态构建...${PLAIN}"
-      if ! curl -fL --max-time 120 --progress-bar "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+      if ! curl -fL --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
         echo -e "${RED}下载失败：${url}${PLAIN}"
         return 1
       fi
@@ -769,6 +815,7 @@ install_singbox() {
     fi
   fi
 
+  echo -e "${GREEN}下载完成，正在校验安装包...${PLAIN}"
   local expected_digest actual_digest
   expected_digest=$(get_release_asset_digest "$latest_tag" "$asset_name") || expected_digest=""
   if [[ -n "$expected_digest" ]]; then
@@ -867,7 +914,7 @@ get_random_port() {
   local port
   while true; do
     port=$((RANDOM % 55000 + 10000))
-    if is_port_available "$port"; then echo "$port"; return; fi
+    if is_port_available "$port" >/dev/null; then echo "$port"; return; fi
   done
 }
 
@@ -890,6 +937,33 @@ is_port_available() {
     fi
   fi
   return 0
+}
+
+prompt_node_port() {
+  local default_port=$1 label=$2 port
+  while true; do
+    if ! read -rp "请输入端口 [${label}${default_port}，0 返回主菜单]: " port; then
+      echo "输入已结束，已取消添加节点，返回主菜单。" >&2
+      return 2
+    fi
+    port=$(strip_cr "$port")
+    [[ -n "$port" ]] || port=$default_port
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then
+      echo -e "${RED}端口号无效 (1-65535)。${PLAIN}" >&2
+      echo "请重新输入端口，或输入 0 返回主菜单。" >&2
+      continue
+    fi
+    port=$((10#$port))
+    if [[ "$port" == "0" ]]; then
+      echo "已取消添加节点，返回主菜单。" >&2
+      return 2
+    fi
+    if is_port_available "$port" >&2; then
+      echo "$port"
+      return 0
+    fi
+    echo "请重新输入端口，或输入 0 返回主菜单。" >&2
+  done
 }
 
 validate_reality_target() {
@@ -956,33 +1030,58 @@ validate_reality_target() {
 }
 
 pick_sni() {
-  echo -e "${YELLOW}选择 Reality 目标（选定后验证）:${PLAIN}" >&2
-  local sni idx target i=0
-  for sni in "${SNI_LIST[@]}"; do
-    i=$((i + 1))
-    printf ' %d. %s\n' "$i" "$sni" >&2
-  done
+  local sni idx target i default_idx=1 manual_target=""
   local manual=$(( ${#SNI_LIST[@]} + 1 ))
-  echo -e " ${manual}. 手动输入" >&2
-
-  read -p "请选择 [1]: " idx
-  idx=$(strip_cr "$idx")
-  [[ -z "$idx" ]] && idx=1
-
-  target=""
-  if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#SNI_LIST[@]}" ]; then
-    target="${SNI_LIST[$((idx-1))]}"
-  elif [[ "$idx" == "$manual" ]]; then
-    read -p "请输入域名 (如 www.apple.com): " target
-    target=$(strip_cr "$target")
-  else
-    echo -e "${RED}选项无效。${PLAIN}" >&2
-    return 1
-  fi
-  [[ -z "$target" ]] && return 1
-  printf '正在验证 Reality 目标: %s ...\n' "$target" >&2
-  validate_reality_target "$target" || return 1
-  echo "$target"
+  while true; do
+    echo -e "${YELLOW}选择 Reality 目标（选定后验证）:${PLAIN}" >&2
+    i=0
+    for sni in "${SNI_LIST[@]}"; do
+      i=$((i + 1))
+      printf ' %d. %s\n' "$i" "$sni" >&2
+    done
+    echo " ${manual}. 手动输入" >&2
+    echo " 0. 取消添加，返回主菜单" >&2
+    if ! read -rp "请选择 [${default_idx}]: " idx; then
+      echo "输入已结束，已取消添加节点，返回主菜单。" >&2
+      return 2
+    fi
+    idx=$(strip_cr "$idx")
+    [[ -n "$idx" ]] || idx=$default_idx
+    if [[ ! "$idx" =~ ^[0-9]+$ || ${#idx} -gt 2 ]]; then
+      echo -e "${RED}选项无效，请输入列表中的编号。${PLAIN}" >&2
+      continue
+    fi
+    idx=$((10#$idx))
+    if [[ "$idx" -eq 0 ]]; then
+      echo "已取消添加节点，返回主菜单。" >&2
+      return 2
+    elif [[ "$idx" -ge 1 && "$idx" -le "${#SNI_LIST[@]}" ]]; then
+      target="${SNI_LIST[$((idx-1))]}"
+    elif [[ "$idx" -eq "$manual" ]]; then
+      if ! read -rp "请输入域名 [${manual_target:-如 www.apple.com}，0 返回目标选择]: " target; then
+        echo "输入已结束，已取消添加节点，返回主菜单。" >&2
+        return 2
+      fi
+      target=$(strip_cr "$target")
+      if [[ "$target" == "0" ]]; then
+        echo "已返回 Reality 目标选择。" >&2
+        continue
+      fi
+      [[ -n "$target" ]] || target=$manual_target
+      manual_target=$target
+    else
+      echo -e "${RED}选项无效，请输入列表中的编号。${PLAIN}" >&2
+      continue
+    fi
+    default_idx=$idx
+    printf '正在验证 Reality 目标: %s ...\n' "$target" >&2
+    if validate_reality_target "$target"; then
+      echo -e "${GREEN}Reality 目标验证通过。${PLAIN}" >&2
+      echo "$target"
+      return 0
+    fi
+    echo -e "${YELLOW}验证未通过，节点尚未创建，已选端口保留。请重新选择目标或修改手动域名。${PLAIN}" >&2
+  done
 }
 
 gen_reality_keypair() {
@@ -1115,23 +1214,30 @@ show_node_info() {
 
 add_reality() {
   echo -e "${BLUE}>>> 添加 VLESS-Vision-REALITY 节点${PLAIN}"
-  [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return; }
+  [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return 1; }
 
-  read -p "请输入端口 [默认443]: " port
-  port=$(strip_cr "$port")
-  [[ -z "$port" ]] && port=443
-  is_port_available "$port" || return
-
-  local sni; sni=$(pick_sni) || { echo -e "${RED}未选择通过验证的 Reality 目标，节点未创建。${PLAIN}"; return 1; }
+  local port sni rc
+  port=$(prompt_node_port 443 "默认") || {
+    rc=$?
+    [[ "$rc" -eq 2 ]] && return 0
+    return "$rc"
+  }
+  echo "已选择端口: ${port}"
+  sni=$(pick_sni) || {
+    rc=$?
+    [[ "$rc" -eq 2 ]] && return 0
+    echo -e "${RED}未选择通过验证的 Reality 目标，节点未创建。${PLAIN}" >&2
+    return "$rc"
+  }
   local uuid; uuid=$(gen_uuid)
 
   local keypair; keypair=$(gen_reality_keypair)
-  [[ -z "$keypair" ]] && { echo -e "${RED}生成 Reality keypair 失败。${PLAIN}"; return; }
+  [[ -z "$keypair" ]] && { echo -e "${RED}生成 Reality keypair 失败。${PLAIN}"; return 1; }
 
   local privk pubk
   privk=$(echo "$keypair" | awk -F': *' 'tolower($1)~/(privatekey|private key)/{print $2}' | head -1 | tr -d '\r" ')
   pubk=$(echo "$keypair" | awk -F': *' 'tolower($1)~/(publickey|public key)/{print $2}' | head -1 | tr -d '\r" ')
-  [[ -z "$privk" || -z "$pubk" ]] && { echo -e "${RED}解析 Reality keypair 失败。${PLAIN}"; echo "$keypair"; return; }
+  [[ -z "$privk" || -z "$pubk" ]] && { echo -e "${RED}解析 Reality keypair 失败。${PLAIN}"; return 1; }
 
   local sid; sid=$(openssl rand -hex 4)
   local tag="reality_${port}"
@@ -1183,17 +1289,20 @@ add_reality() {
     show_node_info "$tag"
   else
     rm -f "$tmp"
+    return 1
   fi
 }
 
 add_ss2022() {
   echo -e "${BLUE}>>> 添加 Shadowsocks-2022 节点${PLAIN}"
   [[ -x "$SB_BIN" ]] || { echo -e "${RED}未安装 sing-box，请先选择菜单 1 安装。${PLAIN}"; return 1; }
-  local port; port=$(get_random_port)
-  read -p "请输入端口 [随机 ${port}]: " inport
-  inport=$(strip_cr "$inport")
-  [[ -n "$inport" ]] && port="$inport"
-  is_port_available "$port" || return
+  local port default_port rc
+  default_port=$(get_random_port)
+  port=$(prompt_node_port "$default_port" "随机") || {
+    rc=$?
+    [[ "$rc" -eq 2 ]] && return 0
+    return "$rc"
+  }
 
   local method="$SS2022_METHOD"
   local key; key=$("$SB_BIN" generate rand --base64 "$SS2022_KEY_BYTES" 2>/dev/null)
@@ -1233,6 +1342,7 @@ add_ss2022() {
     show_node_info "$tag"
   else
     rm -f "$tmp"
+    return 1
   fi
 }
 
@@ -1418,7 +1528,7 @@ main_menu() {
   if [[ -x "$SB_BIN" ]]; then
     migrate_config_if_needed || {
       echo -e "${RED}配置迁移失败，现有配置未被静默覆盖。${PLAIN}" >&2
-      read -p "按回车继续..."
+      pause_to_menu
     }
   fi
   while true; do
@@ -1455,34 +1565,53 @@ main_menu() {
     echo " 5. 删除节点"
     echo " 6. 更新 SB 脚本"
     echo -e " 7. ${RED}卸载全部${PLAIN}"
+    echo " 8. 查看状态、检查配置与日志"
     echo " 0. 退出"
     echo -e "${BLUE}========================================================================${PLAIN}"
-    read -rp " 请输入选项: " choice
+    if ! read -rp " 请输入选项: " choice; then
+      echo
+      echo "输入已结束，退出 SB 管理。"
+      return 0
+    fi
     choice=$(strip_cr "$choice")
 
     case "$choice" in
-      1) run_menu_action "安装或更新 sing-box" install_singbox; read -p "按回车继续..." ;;
-      2) run_menu_action "添加 Reality 节点" add_reality; read -p "按回车继续..." ;;
-      3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read -p "按回车继续..." ;;
+      1) run_menu_action "安装或更新 sing-box" install_singbox; pause_to_menu ;;
+      2) run_menu_action "添加 Reality 节点" add_reality; pause_to_menu ;;
+      3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; pause_to_menu ;;
       4)
         list_nodes
         if [[ "$_NODE_COUNT" -gt 0 ]]; then
-          read -rp " 请输入节点 ID（0 返回）: " id
-          id=$(strip_cr "$id")
-          [[ "$id" == "0" ]] && continue
-          if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$id" -ge 1 ]] && [[ "$id" -le "$_NODE_COUNT" ]]; then
-            t=$(get_node_tag_by_id "$id")
-            [[ -n "$t" ]] && show_node_info "$t"
-          else
-            echo -e "${RED}节点 ID 无效。${PLAIN}"
-          fi
+          while true; do
+            if ! read -rp " 请输入节点 ID（0 返回主菜单）: " id; then
+              echo "输入已结束，返回主菜单。"
+              break
+            fi
+            id=$(strip_cr "$id")
+            if [[ ! "$id" =~ ^[0-9]+$ || ${#id} -gt 9 ]]; then
+              echo -e "${RED}节点 ID 无效，请重新输入，或输入 0 返回主菜单。${PLAIN}"
+              continue
+            fi
+            id=$((10#$id))
+            if [[ "$id" == "0" ]]; then
+              echo "已返回主菜单。"
+              break
+            fi
+            if [[ "$id" -ge 1 && "$id" -le "$_NODE_COUNT" ]]; then
+              t=$(get_node_tag_by_id "$id")
+              [[ -n "$t" ]] && show_node_info "$t"
+              break
+            fi
+            echo -e "${RED}节点 ID 无效，请重新输入，或输入 0 返回主菜单。${PLAIN}"
+          done
         fi
-        read -p "按回车继续..." ;;
-      5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
-      6) run_menu_action "更新 sb 管理脚本" update_script ;;
-      7) run_menu_action "卸载 sing-box" uninstall_all ;;
-      0) exit 0 ;;
-      *) echo -e "${RED}无效选项，请输入 0-7。${PLAIN}"; read -p "按回车继续..." ;;
+        pause_to_menu ;;
+      5) run_menu_action "删除节点" delete_node; pause_to_menu ;;
+      6) run_menu_action "更新 sb 管理脚本" update_script; pause_to_menu ;;
+      7) run_menu_action "卸载 sing-box" uninstall_all; pause_to_menu ;;
+      8) run_menu_action "状态与配置检查" show_status_and_logs; pause_to_menu ;;
+      0) echo "已退出 SB 管理。"; exit 0 ;;
+      *) echo -e "${RED}无效选项，请输入 0-8。${PLAIN}"; pause_to_menu ;;
     esac
   done
 }
