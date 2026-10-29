@@ -503,6 +503,18 @@ validate_sshd_settings && sshd -T -C user=nobody,host=198.51.100.3,addr=198.51.1
                 self.assert_ok(result)
                 self.assertEqual(result.stdout.strip(), 'client.example.org')
 
+    def test_auth_summary_reflects_effective_policy_instead_of_prompt_answer(self):
+        for password, interactive in (('no', 'no'), ('yes', 'no'), ('no', 'yes')):
+            with self.subTest(password=password, interactive=interactive):
+                code = self.ssh_code() + '\nDISABLE_PWD=n\n' + self.apply_settings()
+                code += f'\nsshd_set PasswordAuthentication {password}\n'
+                code += f'sshd_set ChallengeResponseAuthentication {interactive}\n'
+                code += 'validate_sshd_settings && printf "%s\\n" "$SSH_AUTH_SUMMARY"'
+                result = self.shell(code, SSHD_BIN=self.sshd)
+                self.assert_ok(result)
+                self.assertIn('密码已启用' if password == 'yes' else '密码已禁用', result.stdout)
+                self.assertIn('交互式认证已启用' if interactive == 'yes' else '交互式认证已禁用', result.stdout)
+
     def test_parser_failure_restores_backup_without_reload(self):
         original = self.config.read_bytes()
         (self.path / 'backup').write_bytes(original)

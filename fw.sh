@@ -72,6 +72,18 @@ SCRIPT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/fw.sh"
 err() { echo -e "${RED}❌ 错误: $1${PLAIN}"; exit 1; }
 info() { echo -e "${GREEN}INFO: $1${PLAIN}"; }
 warn() { echo -e "${YELLOW}警告: $1${PLAIN}"; }
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
 strip_cr() { echo "${1//$'\r'/}"; }
 
 check_root() {
@@ -968,7 +980,7 @@ uninstall_all() {
     echo -e " ${RED}  警告: 即将卸载 realm 并清除全部配置!${PLAIN}"
     echo -e " ${RED}════════════════════════════════════════${PLAIN}"
     echo
-    read -rp " 确认执行? (输入 yes 确认): " confirm
+    read_prompt -rp " 确认执行? (输入 yes 确认): " confirm
     confirm=$(strip_cr "$confirm")
     [[ "${confirm,,}" != "yes" ]] && { echo " 已取消。"; return; }
 
@@ -1198,27 +1210,27 @@ menu() {
     echo -e " 7. ${RED}卸载全部${PLAIN}"
     echo -e " 0. 退出"
     echo -e "========================================================================"
-    read -rp " 请输入选项: " choice
+    read_prompt -rp " 请输入选项: " choice
     choice=$(strip_cr "$choice")
 
     case $choice in
-        1) install_realm; read -rp " 按回车返回..." ;;
+        1) install_realm; read_prompt -rp " 按回车返回..." ;;
         2)
             if ! realm_installed; then
                 warn "realm 未安装"
-                read -rp " 现在安装? [Y/n] " c || return
+                read_prompt -rp " 现在安装? [Y/n] " c
                 c=$(strip_cr "$c")
                 [[ "$c" =~ ^[nN] ]] && return
                 install_realm
             fi
             menu_add ;;
         3) test_forward_rule ;;
-        4) menu_status; read -rp " 按回车返回..." ;;
+        4) menu_status; read_prompt -rp " 按回车返回..." ;;
         5) menu_delete ;;
-        6) update_script menu; read -rp " 按回车返回..." ;;
+        6) update_script menu; read_prompt -rp " 按回车返回..." ;;
         7) uninstall_all ;;
         0) exit 0 ;;
-        *) ;;
+        *) warn "无效选项，请输入 0-7。"; pause_to_menu ;;
     esac
 }
 

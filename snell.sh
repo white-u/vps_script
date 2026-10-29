@@ -111,6 +111,18 @@ get_instance_status() {
 err() { echo -e "${RED}❌ 错误: $1${PLAIN}"; exit 1; }
 info() { echo -e "${GREEN}INFO: $1${PLAIN}"; }
 warn() { echo -e "${YELLOW}警告: $1${PLAIN}"; }
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
 strip_cr() { echo "${1//$'\r'/}"; }
 
 open_port() {
@@ -869,7 +881,7 @@ add_instance() {
         if [[ -f "$conf" ]]; then
             warn "端口 $port 的配置文件已存在!"
             local override
-            read -rp "是否覆盖? [y/N]: " override
+            read_prompt -rp "是否覆盖? [y/N]: " override
             override=$(strip_cr "$override")
             if [[ "$override" =~ ^[yY]$ ]]; then
                 existing=true
@@ -1015,7 +1027,7 @@ del_instance() {
     fi
     echo -e " ─────────────────────────────────────"
 
-    read -rp "请选择要删除的序号 (输入 0 取消): " choice
+    read_prompt -rp "请选择要删除的序号 (输入 0 取消): " choice
     choice=$(strip_cr "$choice")
     [[ "$choice" == "0" ]] && return
     [[ "$choice" =~ ^[0-9]+$ ]] || { warn "输入无效"; return; }
@@ -1028,7 +1040,7 @@ del_instance() {
     fi
     local target_port="${ports[$idx]}"
 
-    read -rp "确认删除端口 $target_port 的实例? [y/N]: " confirm
+    read_prompt -rp "确认删除端口 $target_port 的实例? [y/N]: " confirm
     confirm=$(strip_cr "$confirm")
     if [[ "$confirm" =~ ^[yY]$ ]]; then
         local was_active=false was_enabled=false
@@ -1265,7 +1277,7 @@ uninstall_all() {
     echo -e " ${RED}  警告: 即将卸载 Snell 核心及所有实例!${PLAIN}"
     echo -e " ${RED}════════════════════════════════════════${PLAIN}"
     echo
-    read -rp " 确认执行? (输入 yes 确认): " confirm
+    read_prompt -rp " 确认执行? (输入 yes 确认): " confirm
     confirm=$(strip_cr "$confirm")
     [[ ! "$confirm" =~ ^([yY][eE][sS])$ ]] && { echo " 已取消。"; return; }
     
@@ -1498,19 +1510,19 @@ menu() {
     echo -e " 7. ${RED}卸载全部${PLAIN}"
     echo -e " 0. 退出"
     echo -e "========================================================================"
-    read -rp " 请输入选项: " choice
+    read_prompt -rp " 请输入选项: " choice
     choice=$(strip_cr "$choice")
     
     case $choice in
-        1) run_menu_action "安装或更新 Snell" install_core; read -rp " 按回车返回..." ;;
-        2) run_menu_action "添加 Snell 实例" add_instance; read -rp " 按回车返回..." ;;
-        3) run_menu_action "读取 Snell 状态" show_service_status; read -rp " 按回车返回..." ;;
-        4) run_menu_action "查看客户端配置" show_all_configs; read -rp " 按回车返回..." ;;
-        5) run_menu_action "删除 Snell 实例" del_instance; read -rp " 按回车返回..." ;;
-        6) run_menu_action "更新 Snell 脚本" update_script; read -rp " 按回车返回..." ;;
-        7) run_menu_action "卸载 Snell" uninstall_all; read -rp " 按回车返回..." ;;
+        1) run_menu_action "安装或更新 Snell" install_core; read_prompt -rp " 按回车返回..." ;;
+        2) run_menu_action "添加 Snell 实例" add_instance; read_prompt -rp " 按回车返回..." ;;
+        3) run_menu_action "读取 Snell 状态" show_service_status; read_prompt -rp " 按回车返回..." ;;
+        4) run_menu_action "查看客户端配置" show_all_configs; read_prompt -rp " 按回车返回..." ;;
+        5) run_menu_action "删除 Snell 实例" del_instance; read_prompt -rp " 按回车返回..." ;;
+        6) run_menu_action "更新 Snell 脚本" update_script; read_prompt -rp " 按回车返回..." ;;
+        7) run_menu_action "卸载 Snell" uninstall_all; read_prompt -rp " 按回车返回..." ;;
         0) exit 0 ;;
-        *) warn "无效选项，请输入 0-7。"; read -rp " 按回车返回..." ;;
+        *) warn "无效选项，请输入 0-7。"; read_prompt -rp " 按回车返回..." ;;
     esac
 }
 

@@ -226,10 +226,12 @@ service_disable() {
 remove_service_definition() {
   local manager
   manager=$(detect_service_manager)
-  service_disable || true
-  rm -f "$SYSTEMD_FILE" "$OPENRC_FILE" /run/sing-box.pid
+  if [[ -e "$SYSTEMD_FILE" || -e "$OPENRC_FILE" ]]; then
+    service_disable || return 1
+  fi
+  rm -f "$SYSTEMD_FILE" "$OPENRC_FILE" /run/sing-box.pid || return 1
   if [[ "$manager" == "systemd" ]]; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
   fi
 }
 
@@ -289,29 +291,32 @@ open_port() {
 }
 
 close_port() {
-  local port=$1
-  local mode=${2:-both}
-  local protocols=(tcp udp)
-  [[ "$mode" == "tcp" ]] && protocols=(tcp)
-  local proto
-
-  if command -v ufw >/dev/null 2>&1; then
-    for proto in "${protocols[@]}"; do
-      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
-    done
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    for proto in "${protocols[@]}"; do
-      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-    done
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  elif command -v iptables >/dev/null 2>&1; then
-    for proto in "${protocols[@]}"; do
-      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
-    done
-    if command -v iptables-save >/dev/null 2>&1; then
-      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    local port=$1 mode=${2:-both} proto rc=0 query_rc
+    local protocols=(tcp udp)
+    [[ "$mode" != tcp ]] || protocols=(tcp)
+    if command -v ufw >/dev/null 2>&1; then
+        for proto in "${protocols[@]}"; do
+            ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        for proto in "${protocols[@]}"; do
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || rc=1
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || rc=1
+    elif command -v iptables >/dev/null 2>&1; then
+        for proto in "${protocols[@]}"; do
+            if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || rc=1
+            else
+                query_rc=$?
+                [[ "$query_rc" -eq 1 ]] || rc=1
+            fi
+        done
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || rc=1
+        fi
     fi
-  fi
+    return "$rc"
 }
 
 network_mode_for_type() {
@@ -1440,8 +1445,13 @@ delete_node() {
 
   if safe_save_config "$tmp"; then
     rm -f "$tmp"
-    [[ -n "$port" && "$port" != "null" ]] && close_port "$port" "$(network_mode_for_type "$proto")"
-    meta_del_tag "$tag" || echo -e "${YELLOW}警告: 节点已删除，但元数据清理失败。${PLAIN}" >&2
+    local cleanup_rc=0
+    if [[ -n "$port" && "$port" != null ]] && ! close_port "$port" "$(network_mode_for_type "$proto")"; then
+      echo "节点配置已删除，但端口防火墙清理失败。" >&2
+      cleanup_rc=1
+    fi
+    meta_del_tag "$tag" || { echo "节点已删除，但元数据清理失败。" >&2; cleanup_rc=1; }
+    [[ "$cleanup_rc" -eq 0 ]] || return 1
     echo -e "${GREEN}删除完成。${PLAIN}"
   else
     rm -f "$tmp"
@@ -1499,23 +1509,23 @@ uninstall_all() {
     return 1
   fi
 
+  local ports p proto tag
   if [[ -f "$SB_CONF_FILE" ]]; then
+    ports=$(jq -r '.inbounds[]? | select(.listen_port != null) | [.listen_port, .type, .tag] | @tsv' "$SB_CONF_FILE") || {
+      echo "端口配置读取失败，已停止卸载。" >&2; return 1;
+    }
     while IFS=$'\t' read -r p proto tag; do
       [[ -n "$p" ]] || continue
-      # 旧版跨机出口端口从未由脚本放行，卸载时也不修改其防火墙规则。
-      if [[ "$tag" == relay_* ]]; then
-        continue
-      else
-        close_port "$p" "$(network_mode_for_type "$proto")"
-      fi
-    done < <(jq -r '.inbounds[]? | select(.listen_port != null) | [.listen_port, .type, .tag] | @tsv' "$SB_CONF_FILE" 2>/dev/null)
+      [[ "$tag" != relay_* ]] || continue
+      close_port "$p" "$(network_mode_for_type "$proto")" || {
+        echo "端口 $p 的防火墙清理失败，文件已保留。" >&2; return 1;
+      }
+    done <<< "$ports"
   fi
-
-  remove_service_definition
-
-  rm -rf "$SB_CONF_DIR" "$WORK_DIR"
-  rm -f "$SB_BIN" "$OPENRC_LOG_FILE"
-  rm -f "$INSTALL_PATH"
+  remove_service_definition || { echo "服务清理失败，卸载未完成，请排查后重试。" >&2; return 1; }
+  rm -rf "$SB_CONF_DIR" "$WORK_DIR" || { echo "配置删除失败，卸载未完成。" >&2; return 1; }
+  rm -f "$SB_BIN" "$OPENRC_LOG_FILE" || { echo "程序或日志删除失败，卸载未完成。" >&2; return 1; }
+  rm -f "$INSTALL_PATH" || { echo "快捷命令删除失败，卸载未完成。" >&2; return 1; }
 
   echo -e "${GREEN}卸载完成。${PLAIN}"
   exit 0

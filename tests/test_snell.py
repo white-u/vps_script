@@ -43,7 +43,7 @@ mktemp() {
 }
 if ! command -v sha256sum >/dev/null 2>&1; then sha256sum() { shasum -a 256 "$@"; }; fi
 '''
-        script = setup + ''.join(function(SOURCE, n) for n in names) + code
+        script = setup + function(SOURCE, 'read_prompt') + ''.join(function(SOURCE, n) for n in names) + code
         return subprocess.run([BASH, '-c', script], input=stdin, text=True,
                               capture_output=True, timeout=15,
                               env={**os.environ, 'TEST_DIR': str(self.root)})

@@ -62,11 +62,36 @@ parse_iperf_retr() {
     fi
 }
 
-# 兼容 Linux/macOS 的单包预检函数
-# Linux: -W 单位毫秒；macOS: -W 单位也是毫秒，但 -t 才是秒级超时
-# 统一用 -W 3000 (3秒) 兼容两平台
+# iputils 的 -W 单位为秒，macOS 为毫秒；同时限制整个预检的运行时间。
 ping_check() {
-    ping -c 1 -W 3000 "$1" &>/dev/null
+    case "$(uname -s)" in
+        Darwin) ping -c 1 -W 3000 -t 3 "$1" &>/dev/null ;;
+        *) ping -c 1 -W 3 -w 3 "$1" &>/dev/null ;;
+    esac
+}
+
+analyze_qos() {
+    SUMMARY_RATIO="N/A"
+    SUMMARY_QOS_CONCLUSION="⚠️ 测量不完整，无法评估 QoS"
+    if [[ ! "$S_AVG" =~ ^[0-9]+([.][0-9]+)?$ || ! "$L_AVG" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        || ! awk -v s="$S_AVG" -v l="$L_AVG" 'BEGIN {exit !(s > 0 && l > 0)}'; then
+        echo -e "${YELLOW}${SUMMARY_QOS_CONCLUSION}${PLAIN}"
+        return 0
+    fi
+    local ratio
+    if ! ratio=$(awk -v s="$S_AVG" -v l="$L_AVG" 'BEGIN {printf "%.2f", l / s}'); then
+        echo -e "${RED}延迟计算失败，无法评估 QoS${PLAIN}" >&2
+        return 1
+    fi
+    SUMMARY_RATIO=$ratio
+    printf '小包延迟: %s ms | 大包延迟: %s ms\n延迟比例: %s 倍\n' "$S_AVG" "$L_AVG" "$ratio"
+    printf '去程丢包率: %s\n' "$SUMMARY_LOSS"
+    if awk -v ratio="$ratio" 'BEGIN {exit !(ratio > 1.2)}'; then
+        SUMMARY_QOS_CONCLUSION="❌ 大包延迟升高，疑似 QoS 或链路拥塞"
+    else
+        SUMMARY_QOS_CONCLUSION="✅ 未见明显大包延迟升高（不代表无丢包或无 QoS）"
+    fi
+    printf '%s\n' "$SUMMARY_QOS_CONCLUSION"
 }
 
 valid_ipv4() {
@@ -159,7 +184,10 @@ echo -e "${GREEN}目标可达，开始测试${PLAIN}"
 echo -e "\n${YELLOW}[1/4] 正在探测去程质量 (QoS 识别)...${PLAIN}"
 
 echo -n "正在发送小包 (64B)... "
-PING_S_OUT=$(ping -s 64 -c 10 -q "$TARGET" 2>/dev/null)
+if ! PING_S_OUT=$(ping -s 64 -c 10 -q "$TARGET" 2>/dev/null); then
+    echo -e "${RED}失败：小包测量失败，已停止评估${PLAIN}"
+    exit 1
+fi
 S_AVG=$(echo "$PING_S_OUT" | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
 if [ -z "$S_AVG" ]; then
     echo -e "${RED}失败：目标不可达或不响应 ICMP${PLAIN}"
@@ -175,36 +203,18 @@ S_LOSS=$(echo "$PING_S_OUT" | grep -Eo '[0-9]+% packet loss' | grep -Eo '^[0-9]+
 [ "$S_LOSS" = "N/A" ] && SUMMARY_LOSS="N/A" || SUMMARY_LOSS="${S_LOSS}%"
 
 echo -n "正在发送大包 (1400B)... "
-L_AVG=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
-[ -z "$L_AVG" ] && L_AVG="0"
-echo -e "${GREEN}${L_AVG} ms${PLAIN}"
-SUMMARY_LATENCY_LARGE="${L_AVG} ms"
-
-QOS_RESULT=$(awk -v s="$S_AVG" -v l="$L_AVG" -v loss="$S_LOSS" 'BEGIN {
-    s = s + 0; l = l + 0;
-    if (l == 0) l = s;
-    diff = l - s; ratio = (s > 0) ? l / s : 1;
-    printf "----------------------------------------------------\n";
-    printf "分析结果:\n";
-    printf "去程丢包率: %s%%\n", loss;
-    printf "小包延迟: %.3f ms | 大包延迟: %.3f ms\n", s, l;
-    printf "延迟差值: %.3f ms\n", diff;
-    printf "延迟比例: \033[33m%.2f 倍\033[0m (1.00 - 1.10 为极品)\n", ratio;
-    if (ratio > 1.2)
-        print "\033[31m[结论] 链路存在大包 QoS 限制，高带宽应用可能波动。\033[0m";
-    else
-        print "\033[32m[结论] 链路透明度高，适合高带宽转发。\033[0m";
-    printf "RATIO:%.2f\n", ratio;
-    printf "----------------------------------------------------\n";
-}')
-echo "$QOS_RESULT" | grep -v '^RATIO:'
-
-SUMMARY_RATIO=$(echo "$QOS_RESULT" | grep '^RATIO:' | cut -d: -f2)
-if awk "BEGIN {exit !($SUMMARY_RATIO > 1.2)}"; then
-    SUMMARY_QOS_CONCLUSION="❌ 存在大包 QoS 限制"
-else
-    SUMMARY_QOS_CONCLUSION="✅ 链路透明，无 QoS"
+L_AVG=""
+if L_PING_OUT=$(ping -s 1400 -c 10 -q "$TARGET" 2>/dev/null); then
+    L_AVG=$(printf '%s\n' "$L_PING_OUT" | tail -1 | awk -F '/' '{print $5}' | tr -d ' ')
 fi
+if [[ "$L_AVG" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo -e "${GREEN}${L_AVG} ms${PLAIN}"
+    SUMMARY_LATENCY_LARGE="${L_AVG} ms"
+else
+    echo -e "${RED}失败：大包无有效测量结果${PLAIN}"
+    SUMMARY_LATENCY_LARGE="测试失败"
+fi
+analyze_qos || exit 1
 
 # --- 2. 路由分析 ---
 echo -e "\n${YELLOW}[2/4] 正在分析去程路由路径...${PLAIN}"
@@ -267,7 +277,11 @@ echo -e "${BLUE}----------------------------------------------------${PLAIN}"
 echo -e "${CYAN}  【延迟 & QoS】${PLAIN}"
 echo -e "  小包延迟   : ${SUMMARY_LATENCY_SMALL}"
 echo -e "  大包延迟   : ${SUMMARY_LATENCY_LARGE}"
-echo -e "  延迟比例   : ${SUMMARY_RATIO} 倍"
+if [[ "$SUMMARY_RATIO" == N/A ]]; then
+    echo -e "  延迟比例   : N/A"
+else
+    echo -e "  延迟比例   : ${SUMMARY_RATIO} 倍"
+fi
 echo -e "  去程丢包   : ${SUMMARY_LOSS}"
 echo -e "  QoS 结论   : ${SUMMARY_QOS_CONCLUSION}"
 echo -e "${BLUE}----------------------------------------------------${PLAIN}"

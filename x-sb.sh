@@ -44,6 +44,18 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Windows 换行符清洗
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
 strip_cr() { echo "${1//$'\r'/}"; }
 
 fresh_script_url() {
@@ -156,20 +168,29 @@ open_port() {
 }
 
 close_port() {
-    local port=$1
+    local port=$1 mode=${2:-both} proto rc=0 query_rc
+    local protocols=(tcp udp)
+    [[ "$mode" != tcp ]] || protocols=(tcp)
     if command -v ufw >/dev/null 2>&1; then
-        ufw delete allow "$port" >/dev/null 2>&1 || true
+        ufw --force delete allow "$port" >/dev/null 2>&1 || rc=1
     elif command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
-        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || rc=1
+        firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || rc=1
+        firewall-cmd --reload >/dev/null 2>&1 || rc=1
     elif command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        for proto in "${protocols[@]}"; do
+            if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || rc=1
+            else
+                query_rc=$?
+                [[ "$query_rc" -eq 1 ]] || rc=1
+            fi
+        done
         if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || rc=1
         fi
     fi
+    return "$rc"
 }
 
 # ==================== Xray 核心管理 ====================
@@ -353,63 +374,63 @@ EOF
 
 # ==================== JSON 辅助操作 ====================
 
-safe_save_config() {
-    local tmp_json=$1
-    
-    # 1. JSON 语法校验
-    if ! jq . "$tmp_json" >/dev/null 2>&1; then
-        echo -e "${RED}JSON 语法校验失败，未保存。${PLAIN}"
+replace_xray_config() {
+    local source=$1 stage
+    stage=$(mktemp "${XRAY_CONF_FILE}.new.XXXXXX") || return 1
+    if ! cp "$source" "$stage" || ! chmod 640 "$stage" || ! mv -f "$stage" "$XRAY_CONF_FILE"; then
+        rm -f "$stage"
         return 1
     fi
-    
-    # 2. Xray 语义校验 (不启动服务, 仅验证配置)
-    if [[ -f "$XRAY_BIN" ]]; then
-        local test_output
-        test_output=$("$XRAY_BIN" run -test -c "$tmp_json" 2>&1)
-        if [[ $? -ne 0 ]]; then
-            echo -e "${RED}Xray 配置校验失败，未保存。错误信息:${PLAIN}"
-            echo "$test_output" | tail -5
+}
+
+safe_save_config() {
+    local tmp_json=$1 backup="" test_output
+    if ! jq . "$tmp_json" >/dev/null 2>&1; then
+        echo -e "${RED}JSON 语法校验失败，未保存。${PLAIN}" >&2
+        return 1
+    fi
+    if [[ -f "$XRAY_BIN" ]] && ! test_output=$("$XRAY_BIN" run -test -c "$tmp_json" 2>&1); then
+        echo -e "${RED}Xray 配置校验失败，未保存。${PLAIN}" >&2
+        printf '%s\n' "$test_output" | tail -5 >&2
+        return 1
+    fi
+    if [[ -s "$XRAY_CONF_FILE" ]]; then
+        backup=$(mktemp "${XRAY_CONF_FILE}.bak.XXXXXX") || {
+            echo "无法创建配置备份，未保存。" >&2; return 1;
+        }
+        if ! cp -p "$XRAY_CONF_FILE" "$backup"; then
+            rm -f "$backup"
+            echo "配置备份失败，未保存。" >&2
             return 1
         fi
     fi
-    
-    # 3. 备份旧配置
-    local backup=""
-    if [[ -f "$XRAY_CONF_FILE" ]] && [[ -s "$XRAY_CONF_FILE" ]]; then
-        backup="${XRAY_CONF_FILE}.bak"
-        cp "$XRAY_CONF_FILE" "$backup"
-    fi
-    
-    # 4. 写入新配置并重启
-    cp "$tmp_json" "$XRAY_CONF_FILE"
-    chmod 640 "$XRAY_CONF_FILE"
-    
-    # 清理旧日志 (防止积压)
-    truncate -s 0 /var/log/xray/error.log 2>/dev/null
-
-    systemctl restart xray
-    sleep 1
-    
-    if systemctl is-active --quiet xray; then
-        echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
-        rm -f "$backup"
-    else
-        echo -e "${RED}Xray 启动失败! 正在回滚...${PLAIN}"
-        # 显示失败原因
-        journalctl -u xray --no-pager -n 5 2>/dev/null | grep -i "failed\|error" | head -3
-        if [[ -n "$backup" ]] && [[ -f "$backup" ]]; then
-            cp "$backup" "$XRAY_CONF_FILE"
-            systemctl restart xray 2>/dev/null
-            sleep 1
-            if systemctl is-active --quiet xray; then
-                echo -e "${YELLOW}已回滚到上一份有效配置，服务已恢复。${PLAIN}"
-            else
-                echo -e "${RED}回滚后仍无法启动，请手动检查: journalctl -u xray -n 20${PLAIN}"
-            fi
-        fi
-        rm -f "$backup"
+    if ! replace_xray_config "$tmp_json"; then
+        echo "配置写入失败，现有配置未被替换。" >&2
+        [[ -z "$backup" ]] || rm -f "$backup"
         return 1
     fi
+    if systemctl restart xray && sleep 1 && systemctl is-active --quiet xray; then
+        echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
+        [[ -z "$backup" ]] || rm -f "$backup" || echo "配置已生效，但旧备份清理失败: $backup" >&2
+        return 0
+    fi
+    echo -e "${RED}Xray 重启失败，正在回滚...${PLAIN}" >&2
+    journalctl -u xray --no-pager -n 5 >&2 || true
+    if [[ -z "$backup" ]]; then
+        echo "没有旧配置可回滚，当前配置已保留供排查。" >&2
+        return 1
+    fi
+    if ! replace_xray_config "$backup"; then
+        echo "配置恢复失败，恢复备份已保留: $backup" >&2
+        return 1
+    fi
+    if systemctl restart xray && sleep 1 && systemctl is-active --quiet xray; then
+        echo "已回滚到上一份配置，服务已恢复。" >&2
+        rm -f "$backup" || echo "恢复成功，但备份清理失败: $backup" >&2
+    else
+        echo "旧配置已恢复，但服务启动失败；备份已保留: $backup" >&2
+    fi
+    return 1
 }
 
 get_random_port() {
@@ -447,7 +468,7 @@ is_port_available() {
 add_reality() {
     echo -e "${BLUE}>>> 添加 VLESS-Vision-Reality 节点 (⭐ 推荐)${PLAIN}"
     
-    read -p "请输入端口 [默认443]: " port
+    read_prompt -p "请输入端口 [默认443]: " port
     port=$(strip_cr "$port")
     [[ -z "$port" ]] && port=443
     if ! is_port_available "$port"; then return; fi
@@ -465,7 +486,7 @@ add_reality() {
     local manual_idx=$(( ${#valid_snis[@]} + 1 ))
     echo -e " $manual_idx. 手动输入"
     
-    read -p "请选择目标域名 [1]: " sni_idx
+    read_prompt -p "请选择目标域名 [1]: " sni_idx
     sni_idx=$(strip_cr "$sni_idx")
     [[ -z "$sni_idx" ]] && sni_idx=1
     
@@ -475,7 +496,7 @@ add_reality() {
     if [[ "$sni_idx" =~ ^[0-9]+$ ]] && [ "$sni_idx" -ge 1 ] && [ "$sni_idx" -le "${#valid_snis[@]}" ]; then
         target_sni="${valid_snis[$((sni_idx-1))]}"
     else
-        read -p "请输入域名 (如 www.apple.com): " target_sni
+        read_prompt -p "请输入域名 (如 www.apple.com): " target_sni
         target_sni=$(strip_cr "$target_sni")
     fi
     
@@ -501,7 +522,8 @@ add_reality() {
     local short_id=$(openssl rand -hex 4)
     local tag="reality_$port"
     
-    local chain_setting=$(ask_chain_proxy)
+    local chain_setting
+    chain_setting=$(ask_chain_proxy) || return 1
     local tmp=$(mktemp /tmp/xray_XXXXXX.json)
     _CLEANUP_FILES+=("$tmp")
     cp "$XRAY_CONF_FILE" "$tmp"
@@ -544,13 +566,14 @@ add_reality() {
         show_node_info "$tag"
     else
         rm -f "$tmp"
+        return 1
     fi
 }
 
 add_ss2022() {
     echo -e "${BLUE}>>> 添加 Shadowsocks-2022 节点${PLAIN}"
     local port=$(get_random_port)
-    read -p "请输入端口 [随机 $port]: " input_port
+    read_prompt -p "请输入端口 [随机 $port]: " input_port
     input_port=$(strip_cr "$input_port")
     [[ -n "$input_port" ]] && port=$input_port
     if ! is_port_available "$port"; then return; fi
@@ -558,7 +581,8 @@ add_ss2022() {
     local key=$(openssl rand -base64 16)
     local tag="ss_$port"
     
-    local chain_setting=$(ask_chain_proxy)
+    local chain_setting
+    chain_setting=$(ask_chain_proxy) || return 1
     local tmp=$(mktemp /tmp/xray_XXXXXX.json)
     _CLEANUP_FILES+=("$tmp")
     cp "$XRAY_CONF_FILE" "$tmp"
@@ -585,6 +609,7 @@ add_ss2022() {
         show_node_info "$tag"
     else
         rm -f "$tmp"
+        return 1
     fi
 }
 
@@ -595,9 +620,13 @@ ask_chain_proxy() {
     if [[ -z "$has_chain" ]]; then echo ""; return; fi
     
     echo -e "${YELLOW}进阶: 是否为此节点启用 SOCKS5 链式转发 (解锁/分流)? [y/N]${PLAIN}" >&2
-    read -p "选择: " sel
+    if ! read -rp "选择: " sel; then
+        echo "输入已结束，未创建节点。" >&2
+        return 1
+    fi
     sel=$(strip_cr "$sel")
-    [[ "${sel,,}" == "y" ]] && echo "yes"
+    if [[ "${sel,,}" == y ]]; then echo yes; fi
+    return 0
 }
 
 apply_chain_routing() {
@@ -622,12 +651,12 @@ configure_advanced() {
         echo -e " 2. 配置 全局路由规则 (屏蔽广告/回国流量)"
         echo -e " 0. 返回"
         echo -e "----------------------------------------"
-        read -p "请选择: " choice
+        read_prompt -p "请选择: " choice
         choice=$(strip_cr "$choice")
         
         case $choice in
             1) 
-                read -p "请输入上游 SOCKS5 地址 (如 127.0.0.1:40000): " addr
+                read_prompt -p "请输入上游 SOCKS5 地址 (如 127.0.0.1:40000): " addr
                 addr=$(strip_cr "$addr")
                 if [[ -z "$addr" ]]; then
                     local tmp=$(mktemp /tmp/xray_XXXXXX.json)
@@ -636,7 +665,8 @@ configure_advanced() {
                     jq 'del(.outbounds[] | select(.tag=="chain_proxy")) |
                         .routing.rules |= [.[] | select(.outboundTag != "chain_proxy")]
                     ' "$XRAY_CONF_FILE" > "$tmp"
-                    safe_save_config "$tmp" && rm -f "$tmp"
+                    if ! safe_save_config "$tmp"; then read_prompt -rp "配置未应用，按回车继续..."; fi
+                    rm -f "$tmp"
                 else
                     local ip=${addr%:*}
                     local port=${addr#*:}
@@ -651,7 +681,8 @@ configure_advanced() {
                             "servers": [{"address": $ip, "port": ($port|tonumber)}]
                         }
                     }]' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
-                    safe_save_config "$tmp" && rm -f "$tmp"
+                    if ! safe_save_config "$tmp"; then read_prompt -rp "配置未应用，按回车继续..."; fi
+                    rm -f "$tmp"
                 fi
                 ;;
             2)
@@ -678,10 +709,12 @@ configure_advanced() {
                     }
                   ] + .routing.rules
                 ' "$XRAY_CONF_FILE" > "$tmp"
-                safe_save_config "$tmp" && rm -f "$tmp"
+                if ! safe_save_config "$tmp"; then read_prompt -rp "配置未应用，按回车继续..."; fi
+                rm -f "$tmp"
                 sleep 1
                 ;;
             0) return ;;
+            *) echo "无效选项，请输入 0-2。"; read_prompt -rp "按回车继续..." ;;
         esac
     done
 }
@@ -843,7 +876,7 @@ show_node_info() {
 delete_node() {
     list_nodes
     [[ "$_NODE_COUNT" -eq 0 ]] && return
-    read -p "请输入要删除的节点 ID (0 返回): " id
+    read_prompt -p "请输入要删除的节点 ID (0 返回): " id
     id=$(strip_cr "$id")
     if [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -gt 0 ] && [ "$id" -le "$_NODE_COUNT" ]; then
         local target_tag
@@ -860,9 +893,13 @@ delete_node() {
             jq --arg t "$target_tag" 'del(.routing.rules[] | select(.inboundTag and (.inboundTag[] == $t)))' "$tmp" > "${tmp}.1" && mv "${tmp}.1" "$tmp"
             if safe_save_config "$tmp"; then
                 rm -f "$tmp"
-                [[ -n "$del_port" && "$del_port" != "null" ]] && close_port "$del_port"
+                if [[ -n "$del_port" && "$del_port" != null ]] && ! close_port "$del_port"; then
+                    echo "节点配置已删除，但端口防火墙清理失败。" >&2
+                    return 1
+                fi
             else
                 rm -f "$tmp"
+                return 1
             fi
         fi
     fi
@@ -910,25 +947,41 @@ update_script() {
 
 uninstall_script() {
     echo -e "${RED}!!! 危险操作警告 !!!${PLAIN}"
-    read -p "确认彻底卸载 Xray 及所有配置? (输入 yes 确认): " cf
+    local cf state ports p
+    read_prompt -rp "确认彻底卸载 Xray 及所有配置? (输入 yes 确认): " cf
     cf=$(strip_cr "$cf")
-    if [[ "${cf,,}" == "yes" ]]; then
-       # 关闭防火墙中已放行的端口
-       if [[ -f "$XRAY_CONF_FILE" ]]; then
-           local p
-           for p in $(jq -r '.inbounds[]?.port // empty' "$XRAY_CONF_FILE" 2>/dev/null); do
-               close_port "$p"
-           done
-       fi
-       systemctl stop xray 2>/dev/null
-       systemctl disable xray 2>/dev/null
-       rm -f "$SYSTEMD_FILE"
-       systemctl daemon-reload
-       rm -rf "$XRAY_CONF_DIR" "$XRAY_BIN" "$DAT_DIR" /var/log/xray
-       rm -f "$INSTALL_PATH"
-       echo -e "${GREEN}卸载完成。${PLAIN}"
-       exit 0
+    [[ "${cf,,}" == yes ]] || { echo "已取消。"; return 0; }
+    if ! systemctl stop xray; then
+        state=$(systemctl show xray -p LoadState -p ActiveState 2>/dev/null) || state=""
+        if ! grep -Fqx 'LoadState=not-found' <<< "$state" || ! grep -Fqx 'ActiveState=inactive' <<< "$state"; then
+            echo "Xray 停止失败，文件和防火墙规则已保留。" >&2
+            return 1
+        fi
     fi
+    if systemctl is-active --quiet xray; then
+        echo "Xray 仍在运行，已停止卸载。" >&2
+        return 1
+    fi
+    if [[ -f "$XRAY_CONF_FILE" ]]; then
+        ports=$(jq -r '.inbounds[]?.port // empty' "$XRAY_CONF_FILE") || {
+            echo "无法读取端口配置，已停止卸载。" >&2; return 1;
+        }
+        for p in $ports; do
+            close_port "$p" || { echo "端口 $p 的防火墙清理失败，文件已保留。" >&2; return 1; }
+        done
+    fi
+    if [[ -f "$SYSTEMD_FILE" ]]; then
+        systemctl disable xray || { echo "取消开机启动失败，文件已保留。" >&2; return 1; }
+        rm -f "$SYSTEMD_FILE" || { echo "服务文件删除失败，卸载未完成。" >&2; return 1; }
+        systemctl daemon-reload || { echo "服务配置重载失败，卸载未完成。" >&2; return 1; }
+    fi
+    if ! rm -rf "$XRAY_CONF_DIR" "$XRAY_BIN" "$DAT_DIR" /var/log/xray; then
+        echo "Xray 文件删除失败，卸载未完成，请排查后重试。" >&2
+        return 1
+    fi
+    rm -f "$INSTALL_PATH" || { echo "快捷命令删除失败，卸载未完成。" >&2; return 1; }
+    echo -e "${GREEN}卸载完成。${PLAIN}"
+    exit 0
 }
 
 main_menu() {
@@ -941,7 +994,10 @@ main_menu() {
         
         local status="${RED}未运行${PLAIN}"
         if systemctl is-active --quiet xray; then
-            local ver=$($XRAY_BIN version 2>/dev/null | head -1 | awk '{print $2}')
+            local ver output
+            output=$("$XRAY_BIN" version 2>/dev/null) || output=""
+            ver=$(printf '%s\n' "$output" | head -n 1 | awk '{print $2}')
+            ver=${ver:-?}
             status="${GREEN}✅ 运行中 ($ver)${PLAIN}"
         fi
         
@@ -958,30 +1014,30 @@ main_menu() {
         echo -e "  8. 卸载脚本"
         echo -e "  0. 退出"
         echo -e "${BLUE}================================================================${PLAIN}"
-        read -p "请输入选项: " choice
+        read_prompt -p "请输入选项: " choice
         choice=$(strip_cr "$choice")
         
         case $choice in
-            1) run_menu_action "安装或更新 Xray" install_xray; read -p "按回车继续..." ;;
-            2) run_menu_action "添加 Reality 节点" add_reality; read -p "按回车继续..." ;;
-            3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read -p "按回车继续..." ;;
+            1) run_menu_action "安装或更新 Xray" install_xray; read_prompt -p "按回车继续..." ;;
+            2) run_menu_action "添加 Reality 节点" add_reality; read_prompt -p "按回车继续..." ;;
+            3) run_menu_action "添加 Shadowsocks 节点" add_ss2022; read_prompt -p "按回车继续..." ;;
             4) 
                 list_nodes
-                read -p "输入节点 ID 查看详情 (0 返回): " nid
+                read_prompt -p "输入节点 ID 查看详情 (0 返回): " nid
                 nid=$(strip_cr "$nid")
                 if [[ "$nid" =~ ^[0-9]+$ ]] && [ "$nid" -gt 0 ] && [ "$nid" -le "$_NODE_COUNT" ]; then
                     local target_tag
                     target_tag=$(get_node_tag_by_id "$nid")
                     [[ -n "$target_tag" ]] && show_node_info "$target_tag"
                 fi
-                read -p "按回车继续..."
+                read_prompt -p "按回车继续..."
                 ;;
-            5) run_menu_action "删除节点" delete_node; read -p "按回车继续..." ;;
+            5) run_menu_action "删除节点" delete_node; read_prompt -p "按回车继续..." ;;
             6) configure_advanced ;;
-            7) run_menu_action "更新 x-sb 管理脚本" update_script ;;
-            8) run_menu_action "卸载 Xray" uninstall_script ;;
+            7) run_menu_action "更新 x-sb 管理脚本" update_script; read_prompt -rp "按回车继续..." ;;
+            8) run_menu_action "卸载 Xray" uninstall_script; read_prompt -rp "按回车继续..." ;;
             0) exit 0 ;;
-            *) ;;
+            *) echo -e "${RED}无效选项，请输入 0-8。${PLAIN}"; read_prompt -rp "按回车继续..." ;;
         esac
     done
 }

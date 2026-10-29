@@ -161,11 +161,23 @@ _ensure_unique_connection_snapshot() {
 
 # --- 输入清洗 ---
 # Windows 终端/SSH 粘贴可能带 \r (CR)，导致正则校验失败或 bc 报错
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
 strip_cr() { echo "${1//$'\r'/}"; }
 
 confirm_yes() {
     local prompt=$1 answer
-    read -r -p "${prompt} [y/N，默认 N]: " answer
+    read_prompt -r -p "${prompt} [y/N，默认 N]: " answer
     answer=$(strip_cr "$answer")
     [[ "$answer" =~ ^[Yy]$ ]]
 }
@@ -1722,7 +1734,7 @@ configure_ip_sentinel() {
         echo -e " 5. 管理 白名单"
         echo -e " 0. 返回"
         echo -e "$UI_DIVIDER"
-        read -r -p "请选择: " sc; sc=$(strip_cr "$sc")
+        read_prompt -r -p "请选择: " sc; sc=$(strip_cr "$sc")
         if [[ "$sc" =~ ^[1-5]$ ]]; then
             start_edit_lock || return 1
         fi
@@ -1736,7 +1748,7 @@ configure_ip_sentinel() {
                     _reset_ip_alert_state "$port" || pm_error "端口 ${port} 的接入告警状态重置失败"
                     sleep 0.5
                 else sleep 1; fi ;;
-            2)  read -r -p "最大允许独立 IP 数（1-65535）: " val; val=$(strip_cr "$val")
+            2)  read_prompt -r -p "最大允许独立 IP 数（1-65535）: " val; val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 65535 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.max_ips = $v' \
                         "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已更新。" "最大 IP 数写入失败"; then
@@ -1747,7 +1759,7 @@ configure_ip_sentinel() {
             3)  echo -e " 1. 仅报警"
                 echo -e " 2. 自动断开多余 IP"
                 echo -e " 0. 取消"
-                read -r -p "请选择 [0-2，默认 0]: " am; am=$(strip_cr "$am")
+                read_prompt -r -p "请选择 [0-2，默认 0]: " am; am=$(strip_cr "$am")
                 local nact
                 case "$am" in
                     1) nact="alert" ;;
@@ -1764,7 +1776,7 @@ configure_ip_sentinel() {
                     fi
                 fi
                 sleep 1 ;;
-            4)  read -r -p "冷却时间（分钟，同级持续超限的提醒间隔）: " val; val=$(strip_cr "$val")
+            4)  read_prompt -r -p "冷却时间（分钟，同级持续超限的提醒间隔）: " val; val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 525600 ]; then
                     if jq --argjson v "$val" --arg p "$port" '.ports[$p].ip_limit.cooldown_min = $v' \
                         "$CONFIG_FILE" > "$tmp" && commit_generated_config "$tmp" "已更新。" "冷却时间写入失败"; then
@@ -1773,9 +1785,9 @@ configure_ip_sentinel() {
                 else echo -e "${RED}无效输入，请输入 1-525600 分钟。${PLAIN}"; sleep 1; fi ;;
             5)  echo -e "\n当前白名单: $ip_wl"
                 echo -e " 1. 添加 IP  2. 清空白名单  0. 返回"
-                read -r -p "请选择 [0-2，默认 0]: " wc; wc=$(strip_cr "$wc")
+                read_prompt -r -p "请选择 [0-2，默认 0]: " wc; wc=$(strip_cr "$wc")
                 if [ "$wc" = "1" ]; then
-                    read -r -p "输入 IP 地址（支持 IPv4/IPv6，留空取消）: " wip; wip=$(strip_cr "$wip")
+                    read_prompt -r -p "输入 IP 地址（支持 IPv4/IPv6，留空取消）: " wip; wip=$(strip_cr "$wip")
                     if [ -n "$wip" ]; then
                         if ! _normalize_ip_address "$wip" >/dev/null; then
                             echo -e "${RED}无效 IP 地址，白名单未修改。${PLAIN}"
@@ -2308,12 +2320,23 @@ show_main_menu() {
         
         local status_clean=""
         
-        if nft -j list set $NFT_TABLE blocked_ports 2>/dev/null | jq -r --argjson p "$port" '[ .nftables[] | select(.set) | .set.elem[]? ] | any(. == $p)' | grep -q "true"; then
+        local blocked_json blocked_status
+        if ! blocked_json=$(nft -j list set $NFT_TABLE blocked_ports 2>/dev/null) \
+            || ! blocked_status=$(jq -er --argjson p "$port" '
+                if (.nftables | type) != "array" or
+                   (any(.nftables[]; .set.name? == "blocked_ports") | not) then error("missing set")
+                else [.nftables[] | select(.set.name? == "blocked_ports") | (.set.elem // [])[]]
+                     | if all(.[]; type == "number") then any(. == $p) | tostring
+                       else error("invalid elements") end end
+            ' <<< "$blocked_json"); then
+            status_clean="[封禁状态未知，查看日志]"
+            pm_error "端口 ${port} 无法读取封禁状态，未按未封禁处理"
+        elif [ "$blocked_status" == true ]; then
             status_clean="[已阻断]"
         else
             status_clean="$(fmt_bytes $total_used)"
         fi
-        
+
         if [ "$state_ok" != true ] || { [ -n "$gid" ] && [[ -n "${menu_invalid_groups[$gid]+x}" ]]; }; then
             status_clean="[状态异常，查看日志]"
         fi
@@ -2365,7 +2388,7 @@ show_main_menu() {
     echo -e " 0. 退出"
     echo -e "$UI_DIVIDER"
     stop_edit_lock
-    read -r -p "请选择: " choice
+    read_prompt -r -p "请选择: " choice
     choice=$(strip_cr "$choice")
     
     case $choice in
@@ -2376,7 +2399,7 @@ show_main_menu() {
         5) _run_edit_action update_script ;;
         6) _run_edit_action uninstall_script ;;
         0) stop_edit_lock; exit 0 ;;
-        *) ;; 
+        *) echo -e "${RED}无效选项，请输入 0-6。${PLAIN}"; read_prompt -r -p "按回车返回..." _menu_reply ;;
     esac
 }
 
@@ -2410,14 +2433,14 @@ add_port_flow() {
     echo -e " [M] 手动输入端口号"
     echo -e " [0] 返回主菜单"
     echo -e "$UI_DIVIDER"
-    read -r -p "请选择: " sel
+    read_prompt -r -p "请选择: " sel
     sel=$(strip_cr "$sel")
     local target_port=""
     if [ "$sel" == "0" ]; then return; fi
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ -n "${map_ports[$sel]}" ]; then
         target_port=${map_ports[$sel]}
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
-        read -r -p "请输入端口号: " target_port
+        read_prompt -r -p "请输入端口号: " target_port
         target_port=$(strip_cr "$target_port")
     else
         return
@@ -2433,14 +2456,14 @@ add_port_flow() {
     fi
     echo -e "\n>> 正在配置端口: $target_port"
     
-    read -r -p "月流量配额（GB，正整数）: " quota
+    read_prompt -r -p "月流量配额（GB，正整数）: " quota
     quota=$(strip_cr "$quota")
     if [[ ! "$quota" =~ ^[0-9]+$ ]] || [ "$quota" -eq 0 ] || [ "$quota" -gt "$MAX_QUOTA_GB" ]; then
         echo -e "${RED}错误: 配额必须是 1-${MAX_QUOTA_GB} 的整数!${PLAIN}"; sleep 2; return
     fi
 
     echo "计费模式：1. 双向计费  2. 仅出站计费"
-    read -r -p "选择模式 [1/2，默认 1]: " mode_idx
+    read_prompt -r -p "选择模式 [1/2，默认 1]: " mode_idx
     mode_idx=$(strip_cr "$mode_idx")
     local mode
     case "$mode_idx" in
@@ -2454,17 +2477,17 @@ add_port_flow() {
     local burst_enabled=false
     confirm_yes "是否接入突发限速？" && burst_enabled=true
 
-    read -r -p "每月自动重置日 [0-31，默认 0（不自动重置）]: " reset_day
+    read_prompt -r -p "每月自动重置日 [0-31，默认 0（不自动重置）]: " reset_day
     reset_day=$(strip_cr "$reset_day")
     [ -z "$reset_day" ] && reset_day=0
     if [[ ! "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -gt 31 ]; then
         echo -e "${RED}无效重置日，请输入 0-31。${PLAIN}"; sleep 1; return
     fi
 
-    read -r -p "用户（可留空）: " comment
+    read_prompt -r -p "用户（可留空）: " comment
     comment=$(strip_cr "$comment")
 
-    read -r -p "用户到期日期（YYYY-MM-DD，留空为不提醒）: " expiry_date
+    read_prompt -r -p "用户到期日期（YYYY-MM-DD，留空为不提醒）: " expiry_date
     expiry_date=$(strip_cr "$expiry_date")
     if [ -n "$expiry_date" ] && ! validate_expiry_date "$expiry_date"; then
         echo -e "${RED}错误: 到期日期必须是有效的 YYYY-MM-DD。${PLAIN}"
@@ -2516,7 +2539,7 @@ config_port_menu() {
     local arr=("$@")
     stop_edit_lock
     echo
-    read -r -p "请输入要配置的端口 ID（0 返回）: " id
+    read_prompt -r -p "请输入要配置的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
     [ "$id" = "0" ] && return
     if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then
@@ -2570,7 +2593,7 @@ config_port_menu() {
         echo -e " 9. 设置 用户到期提醒"
         echo -e " 0. 返回主菜单"
         echo -e "$UI_DIVIDER"
-        read -r -p "请选择: " sub_choice
+        read_prompt -r -p "请选择: " sub_choice
         sub_choice=$(strip_cr "$sub_choice")
         case "$sub_choice" in
             [1-9])
@@ -2588,7 +2611,7 @@ config_port_menu() {
 
         case $sub_choice in
             1) 
-                read -r -p "新配额（GB，正整数）: " val
+                read_prompt -r -p "新配额（GB，正整数）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -gt 0 ] && [ "$val" -le "$MAX_QUOTA_GB" ]; then
                     local sync_gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
@@ -2605,7 +2628,7 @@ config_port_menu() {
                 fi 
                 ;;
             2) 
-                read -r -p "选择模式 [1 双向 / 2 仅出站，留空取消]: " m
+                read_prompt -r -p "选择模式 [1 双向 / 2 仅出站，留空取消]: " m
                 m=$(strip_cr "$m")
                 local nm
                 case "$m" in
@@ -2618,7 +2641,7 @@ config_port_menu() {
                 ;;
             3) rm -f "$tmp"; configure_burst_limit "$port" ;;
             4)
-                read -r -p "新用户（留空清除）: " val
+                read_prompt -r -p "新用户（留空清除）: " val
                 val=$(strip_cr "$val")
                 if jq --arg v "$val" --arg p "$port" '.ports[$p].comment = $v' "$CONFIG_FILE" > "$tmp" && safe_write_config_from_file "$tmp"; then success=true; fi
                 ;;
@@ -2683,7 +2706,7 @@ config_port_menu() {
                 fi 
                 ;;
             6)
-                read -r -p "自动重置日（1-31，0 为关闭）: " val
+                read_prompt -r -p "自动重置日（1-31，0 为关闭）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 31 ]; then
                     local sync_gid=$(jq -r --arg p "$port" '.ports[$p].group_id // empty' "$CONFIG_FILE")
@@ -2719,7 +2742,7 @@ config_port_menu() {
                     echo -e "$UI_SEPARATOR"
                 fi
                 
-                read -r -p "分组 ID（输入名称新建/输入序号选择/留空清除）: " input_val
+                read_prompt -r -p "分组 ID（输入名称新建/输入序号选择/留空清除）: " input_val
                 input_val=$(strip_cr "$input_val")
                 
                 local val=""
@@ -2784,7 +2807,7 @@ configure_user_expiry() {
     local port=$1 value tmp
     stop_edit_lock
     echo -e "\n用户到期前 3 天将通过本机 Telegram 通知提醒一次。"
-    read -r -p "到期日期（YYYY-MM-DD，0 为关闭，留空取消）: " value
+    read_prompt -r -p "到期日期（YYYY-MM-DD，0 为关闭，留空取消）: " value
     value=$(strip_cr "$value")
     [ -z "$value" ] && return 0
     [ "$value" = "0" ] && value=""
@@ -2845,7 +2868,7 @@ configure_burst_limit() {
     echo -e " 1. ${action}突发限速"
     echo -e " 0. 取消"
     echo -e "$UI_DIVIDER"
-    read -r -p "请选择 [0-1，默认 0]: " choice; choice=$(strip_cr "$choice")
+    read_prompt -r -p "请选择 [0-1，默认 0]: " choice; choice=$(strip_cr "$choice")
     [ "$choice" != "1" ] && return 0
 
     start_edit_lock || return 1
@@ -2904,7 +2927,7 @@ configure_notifications() {
         echo -e " 2. Cloudflare 云端推送"
         echo -e " 0. 返回主菜单"
         echo -e "$UI_DIVIDER"
-        read -r -p "请选择: " choice
+        read_prompt -r -p "请选择: " choice
         choice=$(strip_cr "$choice")
         case $choice in
             1) configure_telegram ;;
@@ -2947,7 +2970,7 @@ show_notification_logs() {
     fi
     echo -e "$UI_SEPARATOR"
     echo " 提示：成功和失败都会记录，请结合记录时间判断最近一次结果，或返回菜单执行测试。"
-    read -r -p "按回车返回..." reply
+    read_prompt -r -p "按回车返回..." reply
 }
 
 configure_telegram() {
@@ -2983,7 +3006,7 @@ configure_telegram() {
         echo -e " 6. 查看最近日志"
         echo -e " 0. 返回通知与推送"
         echo -e "$UI_DIVIDER"
-        read -r -p "请选择: " c
+        read_prompt -r -p "请选择: " c
         c=$(strip_cr "$c")
         case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
         local tmp=$(mktemp)
@@ -2991,9 +3014,9 @@ configure_telegram() {
         case $c in
             1)
                 local new_token new_chatid
-                read -r -s -p "Bot Token（留空保留当前值）: " new_token; echo
+                read_prompt -r -s -p "Bot Token（留空保留当前值）: " new_token; echo
                 new_token=$(strip_cr "$new_token")
-                read -r -p "Chat ID（留空保留当前值）: " new_chatid
+                read_prompt -r -p "Chat ID（留空保留当前值）: " new_chatid
                 new_chatid=$(strip_cr "$new_chatid")
                 [ -z "$new_token" ] && new_token="$t_token"
                 [ -z "$new_chatid" ] && new_chatid="$t_chatid"
@@ -3016,7 +3039,7 @@ configure_telegram() {
                 else sleep 1; fi ;;
             3)
                 echo -e "当前阈值: ${t_thr}%"
-                read -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
+                read_prompt -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
                 val=$(strip_cr "$val")
                 if [[ "$val" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
                     local arr_json=$(echo "$val" | tr ',' '\n' | jq -s '.')
@@ -3028,7 +3051,7 @@ configure_telegram() {
             4)
                 echo -e "当前 API: $t_api"
                 echo -e "留空恢复默认：https://api.telegram.org"
-                read -r -p "新 API 地址（留空恢复官方 API）: " val
+                read_prompt -r -p "新 API 地址（留空恢复官方 API）: " val
                 val=$(strip_cr "$val")
                 [ -z "$val" ] && val="https://api.telegram.org"
                 if jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" \
@@ -3101,7 +3124,7 @@ configure_push() {
         echo -e " 0. 返回通知与推送"
         echo -e " 提示：已开启仅表示配置状态；测试会实际上报一次，不改变开关。"
         echo -e "$UI_DIVIDER"
-        read -r -p "请选择: " c
+        read_prompt -r -p "请选择: " c
         c=$(strip_cr "$c")
         case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
         local tmp=$(mktemp)
@@ -3117,19 +3140,19 @@ configure_push() {
                     sleep 0.5
                 else sleep 1; fi ;;
             2)
-                read -r -p "Worker URL（留空取消）: " val; val=$(strip_cr "$val")
+                read_prompt -r -p "Worker URL（留空取消）: " val; val=$(strip_cr "$val")
                 if [ -n "$val" ]; then
                     if jq --arg v "$val" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" \
                         && commit_generated_config "$tmp" "已更新。" "Worker URL 写入失败"; then sleep 0.5; else sleep 1; fi
                 fi ;;
             3)
-                read -r -s -p "Secret（留空取消）: " val; echo; val=$(strip_cr "$val")
+                read_prompt -r -s -p "Secret（留空取消）: " val; echo; val=$(strip_cr "$val")
                 if [ -n "$val" ]; then
                     if jq --arg v "$val" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" \
                         && commit_generated_config "$tmp" "已更新。" "Worker Secret 写入失败"; then sleep 0.5; else sleep 1; fi
                 fi ;;
             4)
-                read -r -p "Node Key（留空取消）: " val; val=$(strip_cr "$val")
+                read_prompt -r -p "Node Key（留空取消）: " val; val=$(strip_cr "$val")
                 [ -z "$val" ] && { rm -f "$tmp"; continue; }
                 val=${val,,}
                 if [[ "$val" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
@@ -3144,7 +3167,7 @@ configure_push() {
                     echo -e "${RED}推送失败，详细原因见上方提示及 ${LOG_FILE}。${PLAIN}"
                 fi
                 stop_edit_lock
-                read -r -p "按回车返回..." val ;;
+                read_prompt -r -p "按回车返回..." val ;;
             6) show_notification_logs cloudflare ;;
             0) rm -f "$tmp"; break ;;
         esac
@@ -3156,7 +3179,7 @@ configure_push() {
 delete_port_flow() {
     local arr=("$@")
     stop_edit_lock
-    read -r -p "请输入要删除的端口 ID（0 返回）: " id
+    read_prompt -r -p "请输入要删除的端口 ID（0 返回）: " id
     id=$(strip_cr "$id")
     [ "$id" = "0" ] && return
     if [[ ! "$id" =~ ^[0-9]+$ ]] || [ "$id" -le 0 ]; then
@@ -3248,7 +3271,7 @@ update_script() {
 
 uninstall_script() {
     echo -e "${RED}警告: 将删除所有配置和监控规则!${PLAIN}"
-    read -r -p "确认卸载？输入 yes 确认，直接回车取消: " c
+    read_prompt -r -p "确认卸载？输入 yes 确认，直接回车取消: " c
     c=$(strip_cr "$c")
     [ "$c" != "yes" ] && return
 

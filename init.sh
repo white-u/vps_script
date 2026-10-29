@@ -33,6 +33,46 @@ install_nexttrace() {
     )
 }
 
+configure_bbr() {
+    local congestion qdisc stage source=/etc/sysctl.conf
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control) || fail "无法读取拥塞控制运行状态"
+    qdisc=$(sysctl -n net.core.default_qdisc) || fail "无法读取队列运行状态"
+    if [[ "$congestion" != bbr || "$qdisc" != fq ]]; then
+        sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr \
+            || fail "BBR 运行参数应用失败，未报告开启成功"
+    fi
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control) || fail "无法确认 BBR 运行状态"
+    qdisc=$(sysctl -n net.core.default_qdisc) || fail "无法确认队列运行状态"
+    [[ "$congestion" == bbr && "$qdisc" == fq ]] || fail "BBR 运行参数未生效"
+    stage=$(mktemp /etc/sysctl.conf.new.XXXXXX) || fail "无法创建 BBR 配置临时文件"
+    if [[ -e "$source" ]]; then
+        if ! cp -p "$source" "$stage"; then rm -f "$stage"; fail "BBR 配置备份失败"; fi
+    else
+        source=/dev/null
+        if ! chmod 644 "$stage"; then rm -f "$stage"; fail "BBR 配置权限设置失败"; fi
+    fi
+    if ! awk '
+        {
+            key=$0; sub(/^[ \t]+/, "", key); sub(/[ \t=].*$/, "", key)
+            if (key == "net.core.default_qdisc") {
+                if (!fq++) print "net.core.default_qdisc = fq"; next
+            }
+            if (key == "net.ipv4.tcp_congestion_control") {
+                if (!bbr++) print "net.ipv4.tcp_congestion_control = bbr"; next
+            }
+            print
+        }
+        END {
+            if (!fq) print "net.core.default_qdisc = fq"
+            if (!bbr) print "net.ipv4.tcp_congestion_control = bbr"
+        }
+    ' "$source" > "$stage" || ! mv -f "$stage" /etc/sysctl.conf; then
+        rm -f "$stage"
+        fail "BBR 运行参数已应用，但持久化配置写入失败"
+    fi
+    echo -e "${GREEN}BBR 已开启，并确认运行参数与持久化配置。${NC}"
+}
+
 configure_network_time() {
     local service="" candidate load_state sync_status attempt
     local -a candidates=(chrony.service chronyd.service ntpsec.service ntp.service openntpd.service systemd-timesyncd.service)
@@ -93,6 +133,18 @@ if [ ! -f /etc/debian_version ]; then
 fi
 
 # Windows 终端兼容: 清洗 \r (定义在开头，确保全局可用)
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
 strip_cr() { echo "${1//$'\r'/}"; }
 
 # 检查 Root 权限
@@ -128,7 +180,7 @@ configure_network_time
 echo -e "${YELLOW}[3/7] 主机名设置${NC}"
 CURRENT_HOSTNAME=$(hostname)
 echo -e "当前主机名: ${BLUE}${CURRENT_HOSTNAME}${NC}"
-read -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
+read_prompt -r -p "请输入新的主机名 (直接回车跳过): " NEW_HOSTNAME
 NEW_HOSTNAME=$(strip_cr "$NEW_HOSTNAME")
 if [ ! -z "$NEW_HOSTNAME" ]; then
     hostnamectl set-hostname "$NEW_HOSTNAME" || fail "主机名修改失败"
@@ -161,16 +213,7 @@ echo -e "${GREEN}工具安装完成。${NC}"
 # 5. 内核 BBR 加速
 # ==============================
 echo -e "${YELLOW}[5/7] 检查并开启 BBR 加速...${NC}"
-if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-    if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-    fi
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    sysctl -p || fail "内核参数加载失败，请检查 /etc/sysctl.conf"
-    echo -e "${GREEN}BBR 已开启。${NC}"
-else
-    echo -e "${GREEN}BBR 已经开启，无需重复操作。${NC}"
-fi
+configure_bbr
 
 # ==============================
 # 6. SSH 安全加固 (交互式)
@@ -264,6 +307,7 @@ PY
 
 validate_sshd_settings() {
     local effective global_effective context client_ip client_port server_ip server_port client_host use_dns
+    SSH_AUTH_SUMMARY="未知（未完成验证）"
     local -a contexts=(global root)
     read -r client_ip client_port server_ip server_port <<< "${SSH_CONNECTION:-127.0.0.1 0 127.0.0.1 0}"
     global_effective=$(sshd -T) || return 1
@@ -302,11 +346,22 @@ validate_sshd_settings() {
             return 1
         fi
     done
+    SSH_AUTH_SUMMARY="公钥已启用"
+    if grep -qx 'passwordauthentication yes' <<< "$effective"; then
+        SSH_AUTH_SUMMARY+=" · 密码已启用"
+    else
+        SSH_AUTH_SUMMARY+=" · 密码已禁用"
+    fi
+    if grep -Eq '^(kbdinteractiveauthentication|challengeresponseauthentication) yes$' <<< "$effective"; then
+        SSH_AUTH_SUMMARY+=" · 交互式认证已启用"
+    else
+        SSH_AUTH_SUMMARY+=" · 交互式认证已禁用"
+    fi
 }
 
 # --- 修改端口 ---
 while true; do
-    read -p "请输入新的 SSH 端口号 (建议 10000-65535): " SSH_PORT
+    read_prompt -p "请输入新的 SSH 端口号 (建议 10000-65535): " SSH_PORT
     SSH_PORT=$(strip_cr "$SSH_PORT")
     if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
         if [ "$SSH_PORT" -eq 22 ]; then
@@ -321,7 +376,7 @@ while true; do
 done
 
 echo -e "${YELLOW}切换 SSH 端口前，请先在云服务商安全组中放行 TCP ${SSH_PORT}。${NC}"
-read -p "确认安全组已放行该端口？请输入 yes 继续: " PORT_READY
+read_prompt -p "确认安全组已放行该端口？请输入 yes 继续: " PORT_READY
 PORT_READY=$(strip_cr "$PORT_READY")
 if [ "$PORT_READY" != "yes" ]; then
     echo -e "${YELLOW}已取消 SSH 配置，当前 SSH 服务未改动。${NC}"
@@ -339,11 +394,11 @@ fi
 
 # --- 配置密钥登录 ---
 echo -e "${YELLOW}--- 密钥登录设置 ---${NC}"
-read -p "是否导入 SSH 公钥 (Public Key)? [y/n]: " IMPORT_KEY
+read_prompt -p "是否导入 SSH 公钥 (Public Key)? [y/n]: " IMPORT_KEY
 IMPORT_KEY=$(strip_cr "$IMPORT_KEY")
 if [[ "$IMPORT_KEY" =~ ^[Yy]$ ]]; then
     echo -e "请粘贴您的公钥 (ssh-rsa AAAA...):"
-    read -r PUB_KEY
+    read_prompt -r PUB_KEY
     PUB_KEY=$(strip_cr "$PUB_KEY")
     if [ ! -z "$PUB_KEY" ]; then
         mkdir -p ~/.ssh
@@ -366,17 +421,17 @@ fi
 # --- 禁用密码登录 (独立判断) ---
 if [ -s ~/.ssh/authorized_keys ]; then
     echo -e "${GREEN}检测到已有 SSH 密钥。${NC}"
-    read -p "是否禁用密码登录 (推荐)? [y/n]: " DISABLE_PWD
+    read_prompt -p "是否禁用密码登录 (推荐)? [y/n]: " DISABLE_PWD
     DISABLE_PWD=$(strip_cr "$DISABLE_PWD")
     if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
         sshd_set "PasswordAuthentication" "no"
         sshd_set "ChallengeResponseAuthentication" "no"
         echo -e "${YELLOW}已设置禁用密码登录，稍后验证最终生效配置。${NC}"
     else
-        echo -e "${YELLOW}保留密码登录。${NC}"
+        echo -e "${YELLOW}保留原有密码认证设置，稍后显示实际生效状态。${NC}"
     fi
 else
-    echo -e "${YELLOW}未检测到 SSH 密钥，保留密码登录。${NC}"
+    echo -e "${YELLOW}未检测到 SSH 密钥，保留原有密码认证设置。${NC}"
 fi
 
 # 应用 SSH 配置
@@ -423,18 +478,14 @@ echo -e "2. 新 SSH 端口: ${RED}$SSH_PORT${NC}"
 echo -e "3. BBR 加速: ${GREEN}已开启${NC}"
 echo -e "4. 系统更新: ${GREEN}已完成${NC}"
 
-if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
-    echo -e "5. 登录方式: ${GREEN}仅密钥${NC}"
-else
-    echo -e "5. 登录方式: ${YELLOW}密码 + 密钥${NC}"
-fi
+echo -e "5. 登录认证: ${GREEN}${SSH_AUTH_SUMMARY:-未知（未完成验证）}${NC}"
 
 echo -e "6. 网络校时: ${BLUE}${TIME_SYNC_STATUS}${NC}"
 
 echo -e "${RED}!!! 特别注意 !!!${NC}"
 echo -e "请先从一个新的终端测试端口 ${RED}$SSH_PORT${NC} 登录成功，再关闭当前会话。"
 
-read -p "是否立即重启服务器? [y/n]: " REBOOT_NOW
+read_prompt -p "是否立即重启服务器? [y/n]: " REBOOT_NOW
 REBOOT_NOW=$(strip_cr "$REBOOT_NOW")
 if [[ "$REBOOT_NOW" =~ ^[Yy]$ ]]; then
     echo -e "正在重启..."

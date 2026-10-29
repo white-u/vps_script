@@ -165,14 +165,28 @@ pm_installed()    { [[ -d /etc/port_monitor ]]; }
 fw_installed()    { [[ -x /usr/local/bin/realm ]]; }
 
 # 获取版本号
-snell_version() { cat /etc/snell/.version 2>/dev/null || echo "?"; }
-sb_version()    { /usr/local/bin/sing-box version 2>/dev/null | sed -nE 's/^sing-box version v?([^[:space:]]+).*/\1/p' | head -1 || echo "?"; }
+snell_version() {
+    local version
+    version=$(head -n 1 /etc/snell/.version 2>/dev/null) || version=""
+    printf '%s\n' "${version:-?}"
+}
+sb_version() {
+    local output version
+    output=$(/usr/local/bin/sing-box version 2>/dev/null) || output=""
+    version=$(printf '%s\n' "$output" | sed -nE 's/^sing-box version v?([^[:space:]]+).*/\1/p' | head -n 1)
+    printf '%s\n' "${version:-?}"
+}
 pm_version() {
     local version
     version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' /usr/local/bin/pm 2>/dev/null | head -n 1)
     echo "${version:-?}"
 }
-fw_version()    { /usr/local/bin/realm --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?"; }
+fw_version() {
+    local output version
+    output=$(/usr/local/bin/realm --version 2>/dev/null) || output=""
+    version=$(printf '%s\n' "$output" | grep -Eo '[0-9]+([.][0-9]+)+' | head -n 1)
+    printf '%s\n' "${version:-?}"
+}
 
 # 格式化状态行
 status_line() {
@@ -403,7 +417,7 @@ nuke_all() {
     cleanup_snell || cleanup_warn "Snell 卸载未完成，请根据上方提示处理后重试"
 
     # === sing-box ===
-    if sb_installed || [[ -d /usr/local/etc/sing-box ]]; then
+    if sb_installed || [[ -d /usr/local/etc/sing-box || -e /etc/systemd/system/sing-box.service || -e /etc/init.d/sing-box ]]; then
         echo -e " ${YELLOW}清理 sing-box...${PLAIN}"
         local sb_manager="none" sb_stop_ok=true
         if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
@@ -428,25 +442,34 @@ nuke_all() {
         if [[ "$sb_stop_ok" != "true" ]]; then
             cleanup_warn "sing-box 服务停止失败，已保留其文件和防火墙规则"
         else
-            # 先读端口再删配置，服务未成功停止时不会提前关闭端口。
+            local sb_cleanup_ok=true sb_ports="" p
             if [[ -f /usr/local/etc/sing-box/config.json ]]; then
-                local p
-                for p in $(jq -r '.inbounds[]?.listen_port // empty' /usr/local/etc/sing-box/config.json 2>/dev/null); do
-                    close_port "$p"
-                done
+                if ! sb_ports=$(jq -r '.inbounds[]?.listen_port // empty' /usr/local/etc/sing-box/config.json); then
+                    cleanup_warn "sing-box 端口配置读取失败，文件已保留"
+                    sb_cleanup_ok=false
+                else
+                    for p in $sb_ports; do
+                        close_port "$p" || { cleanup_warn "sing-box 端口 $p 防火墙清理失败"; sb_cleanup_ok=false; }
+                    done
+                fi
             fi
-            if [[ "$sb_manager" == "systemd" ]]; then
-                systemctl disable sing-box >/dev/null 2>&1 || true
-            elif [[ "$sb_manager" == "openrc" ]]; then
-                rc-update del sing-box default >/dev/null 2>&1 || true
+            if [[ "$sb_manager" == systemd && -e /etc/systemd/system/sing-box.service ]]; then
+                systemctl disable sing-box || { cleanup_warn "sing-box 取消开机启动失败"; sb_cleanup_ok=false; }
+            elif [[ "$sb_manager" == openrc && -e /etc/init.d/sing-box ]]; then
+                rc-update del sing-box default || { cleanup_warn "sing-box 取消开机启动失败"; sb_cleanup_ok=false; }
             fi
-            rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box
-            rm -rf /usr/local/etc/sing-box /var/lib/sing-box
-            rm -f /usr/local/bin/sing-box /usr/local/bin/sb /var/log/sing-box.log /run/sing-box.pid
-            if sb_installed || [[ -d /usr/local/etc/sing-box ]]; then
-                cleanup_warn "sing-box 文件仍然存在"
-            else
-                echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+            if [[ "$sb_cleanup_ok" == true ]]; then
+                if ! rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box; then
+                    cleanup_warn "sing-box 服务文件删除失败，配置和程序已保留"
+                elif ! rm -rf /usr/local/etc/sing-box /var/lib/sing-box; then
+                    cleanup_warn "sing-box 配置删除失败，卸载未完成"
+                elif ! rm -f /usr/local/bin/sing-box /usr/local/bin/sb /var/log/sing-box.log /run/sing-box.pid; then
+                    cleanup_warn "sing-box 程序、日志或状态文件删除失败"
+                elif sb_installed || [[ -e /usr/local/etc/sing-box || -e /etc/systemd/system/sing-box.service || -e /etc/init.d/sing-box ]]; then
+                    cleanup_warn "sing-box 文件仍然存在"
+                else
+                    echo -e " ${GREEN}  sing-box 已清除${PLAIN}"
+                fi
             fi
         fi
     fi
@@ -455,7 +478,7 @@ nuke_all() {
     cleanup_pm || cleanup_warn "PM 卸载未完成，请根据上方提示处理后重试"
 
     # === FW (realm) ===
-    if fw_installed || [[ -d /etc/realm ]]; then
+    if fw_installed || [[ -d /etc/realm || -e /etc/systemd/system/realm.service ]]; then
         echo -e " ${YELLOW}清理 FW (realm)...${PLAIN}"
         # FW 不管理防火墙，不删除无法确认归属的放行规则。
         local realm_stop_ok=false realm_state
@@ -472,12 +495,16 @@ nuke_all() {
         elif systemctl is-active --quiet realm 2>/dev/null; then
             cleanup_warn "realm 仍在运行，已保留 FW 文件和配置"
         else
-            systemctl disable realm 2>/dev/null || true
-            rm -f /etc/systemd/system/realm.service
-            rm -rf /etc/realm
-            rm -f /usr/local/bin/realm /usr/local/bin/fw
-            if fw_installed || [[ -d /etc/realm ]] || systemctl is-active --quiet realm 2>/dev/null; then
-                cleanup_warn "realm 文件或服务仍然存在"
+            if [[ -e /etc/systemd/system/realm.service ]] && ! systemctl disable realm; then
+                cleanup_warn "realm 取消开机启动失败，文件已保留"
+            elif ! rm -f /etc/systemd/system/realm.service; then
+                cleanup_warn "realm 服务文件删除失败，配置和程序已保留"
+            elif ! rm -rf /etc/realm; then
+                cleanup_warn "realm 配置删除失败，卸载未完成"
+            elif ! rm -f /usr/local/bin/realm /usr/local/bin/fw; then
+                cleanup_warn "realm 程序删除失败，卸载未完成"
+            elif fw_installed || [[ -e /etc/realm || -e /etc/systemd/system/realm.service ]]; then
+                cleanup_warn "realm 文件仍然存在"
             else
                 echo -e " ${GREEN}  FW 已清除（未修改防火墙，旧版放行规则请手动检查）${PLAIN}"
             fi
@@ -551,7 +578,10 @@ update_self() {
 sys_info() {
     local os=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || uname -s)
     local arch=$(uname -m)
-    local uptime_str=$(uptime -p 2>/dev/null | sed 's/up //' || echo "?")
+    local uptime_str
+    uptime_str=$(uptime -p 2>/dev/null) || uptime_str=""
+    uptime_str=${uptime_str#up }
+    uptime_str=${uptime_str:-?}
     echo -e " ${DIM}${os} | ${arch} | 运行 ${uptime_str}${PLAIN}"
 }
 

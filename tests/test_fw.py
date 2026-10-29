@@ -869,7 +869,10 @@ nuke_all
                     self.assertNotIn("全部清除完成", result.stdout)
                     self.assertIn("已保留 FW 文件和配置", result.stderr)
                 else:
-                    self.assertIn("disable realm", calls)
+                    if mode in ("not-installed", "partial-install"):
+                        self.assertNotIn("disable realm", calls)
+                    else:
+                        self.assertIn("disable realm", calls)
                     self.assertIn("未修改防火墙", result.stdout)
 
 

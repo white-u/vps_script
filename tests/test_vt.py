@@ -92,5 +92,37 @@ read() { printf '[PROMPT:%s]\n' "$*"; builtin read "$@"; }
                 self.assertEqual(result.stdout.count("VPS 工具箱"), 2)
 
 
+class VTVersionTests(unittest.TestCase):
+    def test_snell_status_displays_version_without_binary_hash(self):
+        functions, marker, _ = (ROOT / "vt.sh").read_text().partition("# ─────────────────── 入口")
+        self.assertTrue(marker, "VT entry marker missing; refuse to execute installation")
+        digest = "27d8bead8dd7a33f2207b58c7bb6b4c274f67f537b621dcbee7112ffd22e23e6"
+        for content, expected in (("6.0.0\n" + digest + "\n", "6.0.0"),
+                                  ("5.0.1\n", "5.0.1"), ("", "?"), (None, "?")):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory(prefix="vt-version-test-") as tmp:
+                    version_file = Path(tmp) / ".version"
+                    if content is not None:
+                        version_file.write_text(content)
+                    library = Path(tmp) / "vt-functions.sh"
+                    library.write_text(functions.replace("/etc/snell/.version", str(version_file)))
+                    result = subprocess.run(
+                        [BASH, "-c", '''
+source "$TEST_LIB"
+snell_installed() { return 0; }
+status_line "Snell" snell_installed "$(snell_version)" "snell"
+'''], env={**os.environ, "TEST_LIB": str(library)},
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout.count("\n"), 1)
+                    self.assertIn("v" + expected, result.stdout)
+                    self.assertIn("[snell]", result.stdout)
+                    self.assertNotIn(digest, result.stdout)
+                    self.assertEqual(version_file.exists(), content is not None)
+                    if content is not None:
+                        self.assertEqual(version_file.read_text(), content)
+
+
 if __name__ == "__main__":
     unittest.main()
