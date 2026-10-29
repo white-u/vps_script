@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * Cloudflare Worker - 端口流量查询中控 v3.5
+ * Cloudflare Worker - 端口流量查询中控 v1.0.0
  * 
  * 绑定要求 (Worker Settings -> Bindings):
  *   - D1 Database: 变量名 DB

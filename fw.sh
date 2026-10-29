@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 端口转发管理脚本 (基于 realm) v2.3.6
+# 端口转发管理脚本 (基于 realm) v1.0.0
 # - 支持 TCP/UDP 端口转发
 # - 与 pm.sh 流量监控无缝协作
 # - 基于 realm 用户态转发，无需内核 FORWARD 链
@@ -53,7 +53,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="2.3.6"
+SCRIPT_VERSION="1.0.0"
 REALM_VERSION="2.9.6"
 
 REALM_BIN="/usr/local/bin/realm"

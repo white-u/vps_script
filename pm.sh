@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Linux 端口流量管理脚本 (Port Monitor & Shaper)
-# 版本: v5.6.9 (首版基线)
+# 版本: v1.0.0 (首版基线)
 # ==============================================================================
 
 # --- 全局配置 ---
@@ -18,7 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
-SCRIPT_VERSION="5.6.9"
+SCRIPT_VERSION="1.0.0"
 # 首版支持的配置结构；保留原编号，防止把旧数据误认成当前格式。
 CURRENT_CONFIG_VERSION=6
 # 编辑会话标记；真正的互斥由 CRON_LOCK_FILE 上的 flock 保证，不依赖此文件是否存在。

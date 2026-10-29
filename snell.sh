@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Snell 多实例管理脚本 v5.3.3
+# Snell 多实例管理脚本 v1.0.0
 # - 支持单机运行多个 Snell 实例 (不同端口)
 # - 支持 Systemd 模板化管理 (snell@port)
 # - 自动配置快捷命令 'snell'
@@ -35,7 +35,7 @@ BLUE="\033[36m"
 DIM="\033[2m"
 PLAIN="\033[0m"
 
-SCRIPT_VERSION="5.3.3"
+SCRIPT_VERSION="1.0.0"
 SNELL_VERSION="5.0.1"
 
 SNELL_BIN="/usr/local/bin/snell-server"
