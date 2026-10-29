@@ -5,7 +5,7 @@
 # 子脚本: snell (Snell代理), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="2.2.2"
+VT_VERSION="2.2.4"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
@@ -297,22 +297,30 @@ nuke_all() {
     # === FW (realm) ===
     if fw_installed || [[ -d /etc/realm ]]; then
         echo -e " ${YELLOW}清理 FW (realm)...${PLAIN}"
-        # 关闭防火墙中已放行的端口
-        if [[ -f /etc/realm/fw.json ]]; then
-            local p
-            for p in $(jq -r '.rules[].src_port' /etc/realm/fw.json 2>/dev/null); do
-                close_port "$p"
-            done
+        # FW 不管理防火墙，不删除无法确认归属的放行规则。
+        local realm_stop_ok=false realm_state
+        if systemctl stop realm 2>/dev/null; then
+            realm_stop_ok=true
+        elif realm_state=$(systemctl show -p LoadState -p ActiveState realm 2>/dev/null) \
+            && grep -Fqx 'LoadState=not-found' <<< "$realm_state" \
+            && grep -Fqx 'ActiveState=inactive' <<< "$realm_state"; then
+            # 初次打开或下载失败可能只有配置残留，尚未创建服务。
+            realm_stop_ok=true
         fi
-        systemctl stop realm 2>/dev/null || true
-        systemctl disable realm 2>/dev/null || true
-        rm -f /etc/systemd/system/realm.service
-        rm -rf /etc/realm
-        rm -f /usr/local/bin/realm /usr/local/bin/fw
-        if fw_installed || [[ -d /etc/realm ]] || systemctl is-active --quiet realm 2>/dev/null; then
-            cleanup_warn "realm 文件或服务仍然存在"
+        if [[ "$realm_stop_ok" != "true" ]]; then
+            cleanup_warn "realm 停止失败，已保留 FW 文件和配置"
+        elif systemctl is-active --quiet realm 2>/dev/null; then
+            cleanup_warn "realm 仍在运行，已保留 FW 文件和配置"
         else
-            echo -e " ${GREEN}  FW 已清除${PLAIN}"
+            systemctl disable realm 2>/dev/null || true
+            rm -f /etc/systemd/system/realm.service
+            rm -rf /etc/realm
+            rm -f /usr/local/bin/realm /usr/local/bin/fw
+            if fw_installed || [[ -d /etc/realm ]] || systemctl is-active --quiet realm 2>/dev/null; then
+                cleanup_warn "realm 文件或服务仍然存在"
+            else
+                echo -e " ${GREEN}  FW 已清除（未修改防火墙，旧版放行规则请手动检查）${PLAIN}"
+            fi
         fi
     fi
 
