@@ -5,7 +5,7 @@
 # 子脚本: snell (Snell代理), sb (sing-box多协议), pm (端口流量监控), fw (端口转发)
 #
 
-VT_VERSION="2.2.4"
+VT_VERSION="2.2.5"
 VT_SHORTCUT="vt"
 VT_INSTALL_PATH="/usr/local/bin/$VT_SHORTCUT"
 VT_URL="https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh"
@@ -422,7 +422,11 @@ main_menu() {
         echo -e "  9. 更新工具箱"
         echo -e "  0. 退出"
         echo -e "${BLUE}================================================================${PLAIN}"
-        read -p " 请选择: " choice
+        if ! read -p " 请选择: " choice; then
+            echo
+            echo "输入已结束，退出工具箱。"
+            return 0
+        fi
         choice=$(strip_cr "$choice")
 
         case $choice in
