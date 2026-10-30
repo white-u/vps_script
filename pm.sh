@@ -262,7 +262,7 @@ _init_port_state_defaults() {
     s_state_version=$PORT_STATE_VERSION
     s_acc_in=0; s_acc_out=0; s_last_k_in=0; s_last_k_out=0
     s_last_reset_ts=0; s_high_seconds=0; s_is_punished=false; s_punish_end_ts=0
-    s_quota_level=0; s_punish_notified=false; s_recover_notified=true
+    s_quota_level=0; s_quota_warned_level=0; s_punish_notified=false; s_recover_notified=true
     s_last_alert_ts=0; s_last_alert_ips=""; s_ip_alert_level=0
     s_expiry_notified_date=""
     s_last_sample_ts=0; s_rules_dirty=false; s_pending_qos_notice=""
@@ -282,7 +282,7 @@ _load_port_state() {
     local -A seen=()
     if ! while IFS='=' read -r key value || [ -n "$key" ]; do
         case "$key" in
-            s_state_version|s_acc_in|s_acc_out|s_last_k_in|s_last_k_out|s_last_reset_ts|s_high_seconds|s_punish_end_ts|s_quota_level|s_last_alert_ts|s_ip_alert_level|s_last_sample_ts)
+            s_state_version|s_acc_in|s_acc_out|s_last_k_in|s_last_k_out|s_last_reset_ts|s_high_seconds|s_punish_end_ts|s_quota_level|s_quota_warned_level|s_last_alert_ts|s_ip_alert_level|s_last_sample_ts)
                 if [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] && { [ "${#value}" -lt 19 ] || { [ "${#value}" -eq 19 ] && [[ "$value" < 9223372036854775808 ]]; }; }; then
                     printf -v "$key" '%s' "$value"
                     seen["$key"]=1
@@ -303,6 +303,8 @@ _load_port_state() {
     for key in s_acc_in s_acc_out s_last_k_in s_last_k_out s_last_reset_ts; do
         [[ -n "${seen[$key]+x}" ]] || invalid=true
     done
+    # 兼容没有新增进度字段的 v2 状态；非零值只用于已确认的耗尽档预警。
+    (( s_quota_warned_level == 0 || s_quota_warned_level >= 100 )) || invalid=true
     if [ "$invalid" == true ]; then
         pm_error "端口 ${1} 状态文件损坏，原文件已保留，已停止依赖该状态的操作: ${sf}"
         return 1
@@ -331,6 +333,7 @@ s_high_seconds=$s_high_seconds
 s_is_punished=$s_is_punished
 s_punish_end_ts=$s_punish_end_ts
 s_quota_level=$s_quota_level
+s_quota_warned_level=$s_quota_warned_level
 s_punish_notified=$s_punish_notified
 s_recover_notified=$s_recover_notified
 s_last_alert_ts=$s_last_alert_ts
@@ -998,18 +1001,8 @@ fmt_bytes_plain() {
 
 _tg_send_chunk() {
     local token=$1 chat_id=$2 api_url=$3 chunk_text=$4
-    local max_time=10 remaining
-    if [ "$_NOTIFY_DEADLINE" -gt 0 ]; then
-        remaining=$((_NOTIFY_DEADLINE - SECONDS))
-        if [ "$remaining" -le 0 ]; then
-            _TG_LAST_FAILURE_SCOPE=service
-            _TG_LAST_FAILURE_DETAIL="本轮通知时间预算已用尽"
-            return 1
-        fi
-        [ "$remaining" -ge "$max_time" ] || max_time=$remaining
-    fi
     local output curl_rc=0 status body error_code description description_lc is_message_error=false
-    output=$(curl -sS --max-time "$max_time" --write-out $'\n%{http_code}' \
+    output=$(curl -sS --max-time 10 --write-out $'\n%{http_code}' \
         --data-urlencode "chat_id=$chat_id" \
         --data-urlencode "text=$chunk_text" \
         --data-urlencode 'parse_mode=Markdown' \
@@ -1077,6 +1070,12 @@ _tg_send_now() {
     local chat_id=$(echo "$tg_conf" | jq -r '.chat_id // empty')
     [ -z "$token" ] || [ -z "$chat_id" ] && return 2
     local api_url=$(echo "$tg_conf" | jq -r '.api_url // "https://api.telegram.org"')
+    # 在完整通知之间检查预算，不截短已开始的请求或分段，避免每轮卡在同一位置。
+    if [ "$_NOTIFY_DEADLINE" -gt 0 ] && [ "$SECONDS" -ge "$_NOTIFY_DEADLINE" ]; then
+        _TG_LAST_FAILURE_SCOPE=service
+        _TG_LAST_FAILURE_DETAIL="本轮通知时间预算已用尽"
+        return 1
+    fi
     local send_failed=false chunks_sent=0
     _TG_LAST_FAILURE_SCOPE=""
     _TG_LAST_FAILURE_DETAIL=""
@@ -2015,7 +2014,7 @@ cron_task() {
             s_acc_in=0; s_acc_out=0
             s_last_k_in=${_ctr_cache["cnt_in_${reset_port}"]}
             s_last_k_out=${_ctr_cache["cnt_out_${reset_port}"]}
-            s_last_reset_ts=$current_ts; s_quota_level=0
+            s_last_reset_ts=$current_ts; s_quota_level=0; s_quota_warned_level=0
             if ! _save_port_state "$reset_port"; then
                 pm_error "端口 ${reset_port} 月度清账保存失败，原周期和累计已保留"
                 reset_failed_ports["$reset_port"]=1
@@ -2107,7 +2106,11 @@ cron_task() {
                 fi
             fi
         fi
-
+        # 用量回到配额内，旧耗尽事件的发送进度不再适用于下次超额。
+        if (( check_usage <= quota_bytes && s_quota_warned_level > 0 )); then
+            s_quota_warned_level=0
+            _save_port_state "$port" || cron_failed=true
+        fi
     done <<< "$_p3_cfg"
 
     # 全部端口的采集、限速和配额策略完成后再发送通知。
@@ -2115,12 +2118,14 @@ cron_task() {
     _NOTIFY_DEADLINE=$((SECONDS + 15))
     while IFS=$'\x1f' read -r port quota_gb mode gid reset_day p3_comment expiry_date expiry_day; do
         [ -n "$port" ] || continue
-        if [[ -n "${invalid_state_ports[$port]+x}" || -n "${reset_failed_ports[$port]+x}" ]] \
+        [[ -z "${invalid_state_ports[$port]+x}" ]] || continue
+        _load_port_state "$port" || { cron_failed=true; continue; }
+        _send_pending_qos_notice "$port" "${_burst_comment[$port]:-}" "${_burst_mbps[$port]:-0}" "${_burst_gid[$port]:-}" || cron_failed=true
+        # 独立限速通知不依赖组用量；配额和原有到期提醒继续保留异常组保护。
+        if [[ -n "${reset_failed_ports[$port]+x}" ]] \
             || { [ -n "$gid" ] && [[ -n "${invalid_state_groups[$gid]+x}" || -n "${reset_failed_groups[$gid]+x}" ]]; }; then
             continue
         fi
-        _load_port_state "$port" || { cron_failed=true; continue; }
-        _send_pending_qos_notice "$port" "${_burst_comment[$port]:-}" "${_burst_mbps[$port]:-0}" "${_burst_gid[$port]:-}" || cron_failed=true
         _notify_user_expiry_if_due "$port" "$p3_comment" "$expiry_date" "$expiry_day" \
             "$current_utc_day" "$gid" || cron_failed=true
         local check_usage=$((s_acc_in + s_acc_out))
@@ -2151,17 +2156,23 @@ cron_task() {
                     continue
                 fi
                 local used_fmt=$(fmt_bytes_plain "$check_usage")
-                if ! tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"; then
-                    cron_failed=true
-                    continue
+                if (( s_quota_warned_level != new_level )); then
+                    if ! tg_notify_quota "$port" "$p3_comment" "$percent" "$used_fmt" "$quota_gb" "$mode" "$new_level" "$gid"; then
+                        cron_failed=true
+                        continue
+                    fi
+                    if (( new_level >= 100 )); then
+                        s_quota_warned_level=$new_level
+                        _save_port_state "$port" || { cron_failed=true; continue; }
+                    fi
                 fi
                 if (( new_level >= 100 )) \
                     && ! tg_notify_blocked "$port" "$p3_comment" "$quota_gb" "$reset_day" "$gid"; then
                     cron_failed=true
                     continue
                 fi
-                # 本档所有通知确认成功后才推进状态，失败时保留下一轮补发机会。
-                s_quota_level=$new_level
+                # 完成整档才推进提醒级别；已确认的预警进度供下一轮续发使用。
+                s_quota_level=$new_level; s_quota_warned_level=0
                 _save_port_state "$port" || cron_failed=true
             fi
         fi
@@ -2750,7 +2761,7 @@ config_port_menu() {
                        s_acc_in=0; s_acc_out=0
                        s_last_k_in=${reset_counters["cnt_in_${reset_port}"]}
                        s_last_k_out=${reset_counters["cnt_out_${reset_port}"]}
-                       s_last_reset_ts=$reset_now; s_quota_level=0
+                       s_last_reset_ts=$reset_now; s_quota_level=0; s_quota_warned_level=0
                        _save_port_state "$reset_port" || reset_failed=true
                    done
                    if [ "$reset_failed" == false ]; then

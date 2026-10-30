@@ -184,6 +184,30 @@ ensure_runtime_rules
                 self.assertEqual(result.returncode, 1 if failed else 0)
                 self.assertEqual(marker.exists(), not healthy)
 
+    def test_optional_warning_checkpoint_loads_old_v2_state_without_rewriting_it(self):
+        self.initialize()
+        self.assert_ok(self.run_pm('_init_port_state_defaults; s_acc_in=123456; _save_port_state 443'))
+        state=self.config.parent/'state/443.txt'
+        legacy='\n'.join(line for line in state.read_text().splitlines()
+                         if not line.startswith('s_quota_warned_level='))+'\n'
+        state.write_text(legacy)
+        result=self.run_pm('_load_port_state 443 && echo "$s_acc_in:$s_quota_warned_level"')
+        self.assert_ok(result)
+        self.assertIn('123456:0',result.stdout)
+        self.assertEqual(state.read_text(),legacy)
+        self.assert_ok(self.run_pm('_load_port_state 443; s_quota_warned_level=100; _save_port_state 443'))
+        result=self.run_pm('_load_port_state 443 && echo "$s_acc_in:$s_quota_warned_level"')
+        self.assert_ok(result)
+        self.assertIn('123456:100',result.stdout)
+        valid=state.read_text()
+        for bad in ('bad','80','-1','9223372036854775808'):
+            with self.subTest(bad=bad):
+                corrupted=valid.replace('s_quota_warned_level=100',f's_quota_warned_level={bad}')
+                state.write_text(corrupted)
+                result=self.run_pm('_load_port_state 443 && _save_port_state 443')
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(state.read_text(),corrupted)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -138,21 +138,111 @@ exit "$rc"
         self.assertIn('20000:0', result.stdout)
         self.assertIn('20001:0', result.stdout)
 
-    def test_notification_deadline_bounds_requests_and_expiry_does_not_send(self):
-        self.setup_pm(1)
+    def test_notification_budget_starts_only_complete_messages_with_full_request_timeout(self):
+        config = self.setup_pm(1)
+        config['telegram'] = {'enable':True,'bot_token':'token','chat_id':'chat'}
+        self.write('config.json',json.dumps(config))
         code = r'''
 curl() { echo REQUEST >> "$TEST_DIR/curl.calls"; printf '%s\n' "$*" > "$TEST_DIR/curl.args"; printf '{"ok":true}\n200'; }
 SECONDS=20
 _NOTIFY_DEADLINE=$((SECONDS + 2))
-_tg_send_chunk token chat https://synthetic.invalid text || exit 1
+_tg_send_now text || exit 1
 _NOTIFY_DEADLINE=$((SECONDS - 1))
-_tg_send_chunk token chat https://synthetic.invalid text
+_tg_send_now text
 '''
         result = self.run_pm(code)
         self.assertNotEqual(result.returncode, 0)
         calls = (self.path/'curl.calls').read_text().splitlines()
         self.assertEqual(len(calls), 1)
-        self.assertIn('--max-time 2 ', (self.path/'curl.args').read_text())
+        self.assertIn('--max-time 10 ', (self.path/'curl.args').read_text())
+
+    def test_started_multipart_message_can_finish_after_budget_boundary(self):
+        config = self.setup_pm(1)
+        config['telegram'] = {'enable':True,'bot_token':'token','chat_id':'chat'}
+        self.write('config.json',json.dumps(config))
+        result=self.run_pm(r'''
+SECONDS=20; _NOTIFY_DEADLINE=35
+_tg_send_chunk() { echo chunk >> "$TEST_DIR/chunks"; SECONDS=$((SECONDS+8)); return 0; }
+printf -v message '%08000d' 0
+_tg_send_now "$message"
+''')
+        self.assert_ok(result)
+        self.assertEqual((self.path/'chunks').read_text().splitlines(),['chunk']*3)
+
+    def test_quota_warning_progress_survives_round_and_only_missing_message_is_retried(self):
+        config=self.setup_pm(1)
+        config['telegram']={'enable':True,'bot_token':'token','chat_id':'chat'}
+        self.write('config.json',json.dumps(config))
+        result=self.run_pm(self.cron_setup()+r'''
+nft() {
+    if [[ "$1" == -j ]]; then echo '{"nftables":[{"set":{"name":"blocked_ports","elem":[20000]}}]}'; return 0; fi
+    return 99
+}
+_tg_send_chunk() {
+    if [[ "$4" == *流量预警* ]]; then echo warning; else echo exhausted; fi >> "$TEST_DIR/notices"
+    SECONDS=$((SECONDS+16)); return 0
+}
+SECONDS=20
+cron_task; first_rc=$?
+_load_port_state 20000; echo "first:$first_rc:$s_quota_level:$s_quota_warned_level"
+_TG_SYNC_FAILED=false; SECONDS=20
+cron_task; second_rc=$?
+_load_port_state 20000; echo "second:$second_rc:$s_quota_level:$s_quota_warned_level"
+exit "$second_rc"
+''')
+        self.assert_ok(result)
+        self.assertIn('first:1:0:100',result.stdout)
+        self.assertIn('second:0:100:0',result.stdout)
+        self.assertEqual((self.path/'notices').read_text().splitlines(),['warning','exhausted'])
+
+    def test_incomplete_warning_checkpoint_is_cleared_when_usage_is_within_quota(self):
+        self.setup_pm(1)
+        result=self.run_pm(self.cron_setup()+r'''
+_load_port_state 20000; s_quota_warned_level=100; _save_port_state 20000 || exit 1
+read_kernel_counters() { printf 'cnt_in_20000\t0\ncnt_out_20000\t0\n'; }
+cron_task || exit 1
+_load_port_state 20000; echo "checkpoint:$s_quota_warned_level"
+''')
+        self.assert_ok(result)
+        self.assertIn('checkpoint:0',result.stdout)
+
+    def test_warning_checkpoint_write_failure_never_advances_level_or_sends_second_message(self):
+        config=self.setup_pm(1)
+        config['telegram']={'enable':True,'bot_token':'token','chat_id':'chat'}
+        self.write('config.json',json.dumps(config))
+        result=self.run_pm(self.cron_setup()+r'''
+eval "$(declare -f _save_port_state | sed 's/_save_port_state ()/_save_real ()/')"
+_save_port_state() { [[ "$s_quota_warned_level" == 0 ]] || return 1; _save_real "$@"; }
+_tg_send_chunk() { echo send >> "$TEST_DIR/notices"; return 0; }
+cron_task; rc=$?
+_load_port_state 20000; echo "state:$s_quota_level:$s_quota_warned_level"
+exit "$rc"
+''')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('state:0:0',result.stdout)
+        self.assertEqual((self.path/'notices').read_text().splitlines(),['send'])
+
+    def test_valid_port_recovery_notice_is_independent_of_invalid_shared_group_peer(self):
+        config=self.setup_pm(2)
+        for item in config['ports'].values(): item.update(group_id='shared',quota_gb=1000)
+        config['ports']['20000']['dyn_limit']['enable']=True
+        config['telegram']={'enable':True,'bot_token':'token','chat_id':'chat'}
+        self.write('config.json',json.dumps(config))
+        result=self.run_pm(self.cron_setup()+r'''
+_load_port_state 20000; s_is_punished=true; s_punish_end_ts=1; _save_port_state 20000 || exit 1
+printf bad > "$STATE_DIR/20001.txt"
+read_kernel_counters() { printf 'cnt_in_20000\t0\ncnt_out_20000\t0\ncnt_in_20001\t0\ncnt_out_20001\t0\n'; }
+apply_port_rules() { echo restored > "$TEST_DIR/rules"; }
+_tg_send_chunk() { echo "$4" > "$TEST_DIR/notice"; return 0; }
+cron_task; rc=$?
+_load_port_state 20000; echo "state:$s_is_punished:$s_pending_qos_notice:$s_recover_notified"
+exit "$rc"
+''')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('state:false::true',result.stdout)
+        self.assertTrue((self.path/'rules').exists())
+        self.assertIn('限速已恢复',(self.path/'notice').read_text())
+        self.assertEqual((self.path/'state/20001.txt').read_text(),'bad')
 
     def test_service_failure_skips_geo_but_keeps_sentinel_disconnect(self):
         config = self.setup_pm(1)
@@ -225,7 +315,7 @@ done
         self.write('config.json', json.dumps(config))
         result = self.run_pm(self.cron_setup()+r'''
 for port in 20000 20001; do
-    _load_port_state "$port"; s_acc_in=9999999999; s_last_reset_ts=1; s_quota_level=100
+    _load_port_state "$port"; s_acc_in=9999999999; s_last_reset_ts=1; s_quota_level=100; s_quota_warned_level=100
     _save_port_state "$port" || exit 1
 done
 nft() {
@@ -234,12 +324,12 @@ nft() {
 }
 cron_task
 for port in 20000 20001; do
-    _load_port_state "$port"; echo "$port:$s_acc_in:$s_acc_out:$s_last_k_in:$s_quota_level"
+    _load_port_state "$port"; echo "$port:$s_acc_in:$s_acc_out:$s_last_k_in:$s_quota_level:$s_quota_warned_level"
 done
 ''')
         self.assert_ok(result)
         self.assertEqual((self.path/'reset.events').read_text().splitlines(), ['delete:20000','delete:20001'])
-        for port in ('20000','20001'): self.assertIn(port+':0:0:2000000000:0', result.stdout)
+        for port in ('20000','20001'): self.assertIn(port+':0:0:2000000000:0:0', result.stdout)
 
     def test_expiry_confirmation_is_saved_only_after_success(self):
         config = self.setup_pm(1)
