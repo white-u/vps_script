@@ -31,63 +31,65 @@ install_base_tools() {
 }
 
 configure_timezone() {
-    local current inferred choice zones
+    local current inferred zones provider response
     current=$(timedatectl show --property=Timezone --value) || fail "无法读取系统时区"
     zones=$(timedatectl list-timezones) || fail "无法读取系统时区列表，请检查 tzdata"
     echo "当前系统时区: ${current}"
-    echo "正在通过 ipapi.co / ipwho.is 根据服务器出口公网 IP 推断时区（IP 定位可能有误）..."
-    if ! inferred=$(curl -q -fsSL --proto '=https' --proto-redir '=https' \
-        --connect-timeout 5 --max-time 10 https://ipapi.co/timezone/) || \
-        ! grep -qxF -- "$inferred" <<< "$zones"; then
-        warn "首选 IP 时区查询不可用，尝试备用服务 ipwho.is。"
-        inferred=$(curl -q -fsSL --proto '=https' --proto-redir '=https' \
-            --connect-timeout 5 --max-time 10 'https://ipwho.is/?fields=success,timezone') || inferred=""
-        inferred=$(python3 -c '
+    echo "正在根据服务器出口公网 IP 自动设置时区（IP 定位可能有误）..."
+    inferred=""
+    for provider in 'https://ipwho.is/?fields=success,timezone' 'https://ipinfo.io/json'; do
+        if response=$(curl -q -fsSL --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 10 "$provider"); then
+            inferred=$(python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
-    if data.get("success") is not True:
-        raise ValueError("IP 定位服务报告失败")
-    zone = data["timezone"]["id"]
-    if not isinstance(zone, str):
+    if sys.argv[1].startswith("https://ipwho.is/"):
+        if data["success"] is not True:
+            raise ValueError("IP 定位服务报告失败")
+        zone = data["timezone"]["id"]
+    else:
+        zone = data["timezone"]
+    if not isinstance(zone, str) or not zone or any(c.isspace() for c in zone):
         raise ValueError("时区格式无效")
     print(zone)
 except (ValueError, KeyError, TypeError) as error:
-    print("备用时区查询解析失败: " + str(error), file=sys.stderr)
+    print("时区查询解析失败: " + str(error), file=sys.stderr)
     sys.exit(1)
-' <<< "$inferred") || inferred=""
-    fi
-    if [[ -n "$inferred" ]] && grep -qxF -- "$inferred" <<< "$zones"; then
-        echo "推断时区: ${inferred}"
-    else
-        warn "公网 IP 时区查询失败或返回无效时区，默认保留 ${current}。"
+' "$provider" <<< "$response") || inferred=""
+            if [[ -n "$inferred" ]] && grep -qxF -- "$inferred" <<< "$zones"; then
+                echo "推断时区: ${inferred}（来源: ${provider}）"
+                break
+            fi
+        fi
+        inferred=""
+        warn "时区查询 ${provider} 失败或返回无效时区。"
+        if [[ "$provider" == https://ipwho.is/* ]]; then
+            warn "尝试备用服务 ipinfo.io。"
+        fi
+    done
+    if [[ -z "$inferred" ]]; then
+        warn "公网 IP 时区查询均不可用，保留 ${current}。"
         inferred=$current
     fi
-    while true; do
-        read_prompt -r -p "请输入时区（回车使用 ${inferred}，输入 keep 保留 ${current}）: " choice
-        choice=$(strip_cr "$choice")
-        [[ "$choice" != keep ]] || choice=$current
-        choice=${choice:-$inferred}
-        if [[ "$choice" == "$current" ]] || grep -qxF -- "$choice" <<< "$zones"; then break; fi
-        warn "无效时区，请输入系统时区名称，例如 Asia/Shanghai 或 UTC。"
-    done
-    if [[ "$choice" != "$current" ]]; then
-        timedatectl set-timezone "$choice" || fail "时区设置失败"
+    if [[ "$inferred" != "$current" ]]; then
+        timedatectl set-timezone "$inferred" || fail "时区设置失败"
     fi
     SYSTEM_TIMEZONE=$(timedatectl show --property=Timezone --value) || fail "无法确认系统时区"
-    [[ "$SYSTEM_TIMEZONE" == "$choice" ]] || fail "时区设置未生效"
+    [[ "$SYSTEM_TIMEZONE" == "$inferred" ]] || fail "时区设置未生效"
     echo "系统时区: ${SYSTEM_TIMEZONE}"
 }
 
 configure_ip_preference() {
     local choice stage backup source=/etc/gai.conf
     while true; do
-        read_prompt -r -p "网络地址优先级 [4 IPv4 优先 / 6 IPv6 优先 / keep 保留，默认 4]: " choice
+        read_prompt -r -p "网络地址优先级（1 = IPv4 优先 / 2 = IPv6 优先，回车默认 1）: " choice
         choice=$(strip_cr "$choice")
-        case "${choice:-4}" in
-            4|6) choice=${choice:-4}; break ;;
+        case "${choice:-1}" in
+            1|4) choice=4; break ;;
+            2|6) choice=6; break ;;
             keep) IP_PREFERENCE="保留系统配置"; return 0 ;;
-            *) warn "请输入 4、6 或 keep。" ;;
+            *) warn "请输入 1（IPv4 优先）或 2（IPv6 优先）。" ;;
         esac
     done
     [[ ! -L "$source" && ( ! -e "$source" || -f "$source" ) ]] || fail "gai.conf 不是普通文件，未修改"
@@ -121,7 +123,7 @@ configure_ip_preference() {
         rm -f "$stage"; fail "地址优先级配置写入失败"
     fi
     IP_PREFERENCE="IPv${choice} 优先"
-    echo "已设置 ${IP_PREFERENCE}。不禁用另一协议；使用 glibc 地址排序的新进程生效，部分应用有自己的策略。"
+    echo "已设置 ${IP_PREFERENCE}。不禁用另一协议。"
 }
 
 valid_public_key() {
@@ -226,8 +228,6 @@ activate_ssh_settings() {
     else
         fail "SSH 新端口未成功由 sshd 监听，将恢复备份"
     fi
-    read_prompt -r -p "请保持当前会话，在另一终端验证新端口 ${SSH_PORT} 登录（禁用密码时必须用公钥）。成功后输入 yes，否则恢复原配置: " SSH_LOGIN_CONFIRMED
-    [[ "$(strip_cr "$SSH_LOGIN_CONFIRMED")" == yes ]] || fail "新端口登录未确认，将恢复原配置"
     SSH_TX_ACTIVE=0
     trap - EXIT INT TERM HUP
 }
@@ -718,7 +718,7 @@ echo -e "${YELLOW}--- 密钥登录设置 ---${NC}"
 read_prompt -p "是否导入 SSH 公钥 (Public Key)? [y/n]: " IMPORT_KEY
 IMPORT_KEY=$(strip_cr "$IMPORT_KEY")
 if [[ "$IMPORT_KEY" =~ ^[Yy]$ ]]; then
-    echo -e "请粘贴完整的一行 SSH 公钥（支持 ssh-ed25519、ssh-rsa 等类型，包含类型、密钥内容及可选备注）:"
+    echo -e "请粘贴完整的一行 SSH 公钥（支持 ssh-ed25519、ssh-rsa 等类型）:"
     read_prompt -r PUB_KEY
     PUB_KEY=$(strip_cr "$PUB_KEY")
     if [ -n "$PUB_KEY" ]; then
@@ -734,18 +734,12 @@ fi
 
 # --- 禁用密码登录 (独立判断) ---
 if [[ -f "$SSH_KEY_FILE" ]] && ssh-keygen -lf "$SSH_KEY_FILE" >/dev/null 2>&1; then
-    echo -e "${GREEN}检测到有效 SSH 公钥，仍需实际验证登录。${NC}"
+    echo -e "${GREEN}检测到有效 SSH 公钥。${NC}"
     read_prompt -p "是否禁用密码登录 (推荐)? [y/n]: " DISABLE_PWD
     DISABLE_PWD=$(strip_cr "$DISABLE_PWD")
     if [[ "$DISABLE_PWD" =~ ^[Yy]$ ]]; then
-        read_prompt -r -p "请在另一终端使用公钥登录当前 SSH 端口。确认成功后输入 yes 才禁用密码: " KEY_LOGIN_CONFIRMED
-        if [[ "$(strip_cr "$KEY_LOGIN_CONFIRMED")" == yes ]]; then
-            SSH_EXPECTED_KEY_FILE=$SSH_KEY_FILE
-            echo -e "${YELLOW}将禁用密码登录，稍后统一写入并验证 SSH 配置。${NC}"
-        else
-            DISABLE_PWD=n
-            warn "未确认公钥登录成功，保留原有密码认证设置。"
-        fi
+        SSH_EXPECTED_KEY_FILE=$SSH_KEY_FILE
+        echo -e "${YELLOW}将禁用密码登录，稍后统一写入并验证 SSH 配置。${NC}"
     else
         echo -e "${YELLOW}保留原有密码认证设置，稍后显示实际生效状态。${NC}"
     fi
