@@ -440,7 +440,7 @@ ping_check 192.0.2.1
 
 class BBRTests(ShellCase):
     def bbr_code(self):
-        return functions('init', 'configure_bbr').replace('/etc/sysctl.conf', '@TEST_DIR@/sysctl.conf') + r'''
+        return functions('init', 'configure_bbr').replace('/etc/sysctl.d', '@TEST_DIR@/etc/sysctl.d') + r'''
 fail() { echo "$*" >&2; exit 1; }
 sysctl() {
     if [[ "$1" == -w ]]; then
@@ -460,12 +460,12 @@ configure_bbr
 
     def test_commented_or_stale_config_does_not_fake_runtime_success(self):
         self.write('controller', 'cubic\n')
-        self.write('sysctl.conf', '# net.ipv4.tcp_congestion_control = bbr\nnet.ipv4.tcp_congestion_control = cubic\n')
+        self.write('etc/sysctl.d/99-vps-init-bbr.conf', '# net.ipv4.tcp_congestion_control = bbr\nnet.ipv4.tcp_congestion_control = cubic\n')
         result = self.run_shell(self.bbr_code(), FAILURE='none')
         self.assert_ok(result)
         self.assertTrue((self.path / 'applied').exists())
         self.assertEqual((self.path / 'controller').read_text().strip(), 'bbr')
-        lines = [line for line in (self.path / 'sysctl.conf').read_text().splitlines() if not line.startswith('#')]
+        lines = [line for line in (self.path / 'etc/sysctl.d/99-vps-init-bbr.conf').read_text().splitlines() if not line.startswith('#')]
         self.assertIn('net.ipv4.tcp_congestion_control = bbr', lines)
         self.assertNotIn('net.ipv4.tcp_congestion_control = cubic', lines)
 
@@ -473,11 +473,36 @@ configure_bbr
         for failure in ('apply', 'ineffective', 'persist'):
             with self.subTest(failure=failure):
                 self.write('controller', 'cubic\n')
-                self.write('sysctl.conf', '# original\n')
+                self.write('etc/sysctl.d/99-vps-init-bbr.conf', '# original\n')
                 result = self.run_shell(self.bbr_code(), FAILURE=failure)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn('BBR 已开启', result.stdout)
-                self.assertEqual((self.path / 'sysctl.conf').read_text(), '# original\n')
+                self.assertEqual((self.path / 'etc/sysctl.d/99-vps-init-bbr.conf').read_text(), '# original\n')
+
+    def test_persists_in_boot_configuration_without_overwriting_legacy_file(self):
+        self.write('controller', 'cubic\n')
+        self.write('etc/sysctl.conf', '# legacy configuration\nnet.ipv4.tcp_congestion_control = cubic\n')
+        original = (self.path / 'etc/sysctl.conf').read_bytes()
+        self.assert_ok(self.run_shell(self.bbr_code(), FAILURE='none'))
+        self.assertEqual((self.path / 'etc/sysctl.conf').read_bytes(), original)
+        persisted = self.path / 'etc/sysctl.d/99-vps-init-bbr.conf'
+        self.assertIn('net.ipv4.tcp_congestion_control = bbr', persisted.read_text())
+        self.assertEqual(persisted.stat().st_mode & 0o777, 0o644)
+
+    @unittest.skipUnless(shutil.which('systemd-analyze'), 'requires systemd configuration parser')
+    def test_boot_parser_loads_bbr_after_default_and_legacy_settings(self):
+        self.write('controller', 'cubic\n')
+        self.write('usr/lib/sysctl.d/50-default.conf', 'net.core.default_qdisc = fq_codel\n')
+        self.write('etc/sysctl.d/99-sysctl.conf', 'net.ipv4.tcp_congestion_control = cubic\n')
+        self.assert_ok(self.run_shell(self.bbr_code(), FAILURE='none'))
+        parsed = subprocess.run(['systemd-analyze', '--root', str(self.path), 'cat-config', 'sysctl.d'],
+                                text=True, capture_output=True, timeout=10)
+        self.assert_ok(parsed)
+        lines = [line.strip() for line in parsed.stdout.splitlines() if line.startswith('net.')]
+        self.assertEqual([line for line in lines if line.startswith('net.core.default_qdisc')][-1],
+                         'net.core.default_qdisc = fq')
+        self.assertEqual([line for line in lines if line.startswith('net.ipv4.tcp_congestion_control')][-1],
+                         'net.ipv4.tcp_congestion_control = bbr')
 
 
 

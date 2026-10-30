@@ -186,16 +186,22 @@ class SSHSecurityTests(ShellCase):
         self.config = self.path / 'sshd_config'
         self.config.write_text(f'HostKey {self.path}/hostkey\n')
         self.config.chmod(0o600)
+        (self.path / '.ssh').mkdir(mode=0o700)
+        authorized = self.path / '.ssh/authorized_keys'
+        authorized.write_bytes((self.path / 'hostkey.pub').read_bytes())
+        authorized.chmod(0o600)
 
     def ssh_code(self):
         functions = ''.join(function(INIT, n) for n in
-                            ('sshd_set', 'resolve_ssh_client_host', 'validate_sshd_settings'))
+                            ('sshd_set', 'resolve_ssh_client_host', 'validate_root_access', 'validate_sshd_settings',
+                             'rollback_ssh_transaction', 'ssh_transaction_exit'))
         functions = functions.replace('/etc/ssh/sshd_config', str(self.config))
         return functions + r'''
 fail() { echo "$*" >&2; exit 1; }
 warn() { echo "$*" >&2; }
 sshd() { "$SSHD_BIN" -f "$TEST_DIR/sshd_config" "$@"; }
 SSH_PORT=12345
+SSH_ROOT_HOME="$TEST_DIR"
 DISABLE_PWD=y
 SSH_CONNECTION='198.51.100.3 20000 192.0.2.1 22'
 '''
@@ -217,8 +223,9 @@ exec(compile(sys.stdin.read(), '<ssh-dns-helper>', 'exec'))
         bin_dir = self.path / 'bin'
         bin_dir.mkdir(exist_ok=True)
         shim = bin_dir / 'python3'
-        shim.write_text('#!/bin/bash\nexec ' + shlex.quote(sys.executable) +
-                        ' -I "$DNS_DRIVER" "$@"\n')
+        shim.write_text('#!/bin/bash\nif [[ "$1" != -I ]]; then exec ' +
+                        shlex.quote(sys.executable) + ' "$@"; fi\nexec ' +
+                        shlex.quote(sys.executable) + ' -I "$DNS_DRIVER" "$@"\n')
         shim.chmod(0o700)
         (self.path / 'socket.py').write_text('''
 import os
@@ -259,8 +266,13 @@ def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
                 'DNS_MODE': mode, 'DNS_ADDRESS': address, 'SSHD_BIN': self.sshd}
 
     def validation_block(self):
-        return INIT.split('# 验证配置语法 (防止重启失败导致失联)\n', 1)[1].split(
-            'SSH_SERVICE="sshd"', 1)[0].replace('/etc/ssh/sshd_config', str(self.config))
+        block = INIT.split('# 验证配置语法 (防止重启失败导致失联)\n', 1)[1].split(
+            '\nactivate_ssh_settings\n', 1)[0].replace('/etc/ssh/sshd_config', str(self.config))
+        return '''
+SSH_BACKUP_DIR="$TEST_DIR"
+SSH_TX_ACTIVE=1
+trap 'ssh_transaction_exit $?' EXIT
+''' + block + '\nSSH_TX_ACTIVE=0\ntrap - EXIT\n'
 
     def apply_settings(self):
         return '''
@@ -285,14 +297,39 @@ sshd_set PubkeyAuthentication yes
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.config.read_text().count('PasswordAuthentication no'), 1)
 
+    def test_batch_updates_write_once_and_preserve_include_and_match(self):
+        cloud = self.path / 'cloud.conf'
+        cloud.write_text('PasswordAuthentication yes\nKbdInteractiveAuthentication yes\n')
+        match = 'Match User nobody\n PubkeyAuthentication no\n'
+        with self.config.open('a') as config:
+            config.write(f'Include {cloud}\nPort 22\n{match}')
+        code = self.ssh_code() + '''
+mv() { echo replaced >> "$TEST_DIR/writes"; command mv "$@"; }
+sshd_set Port "$SSH_PORT" PermitRootLogin yes PubkeyAuthentication yes PasswordAuthentication no KbdInteractiveAuthentication no ChallengeResponseAuthentication no
+sshd -t && validate_sshd_settings
+'''
+        self.assert_ok(self.shell(code, SSHD_BIN=self.sshd))
+        self.assertEqual((self.path / 'writes').read_text(), 'replaced\n')
+        self.assertIn(f'Include {cloud}', self.config.read_text())
+        self.assertIn(match, self.config.read_text())
+
+    def test_batch_generation_failure_keeps_original_config(self):
+        original = self.config.read_bytes()
+        code = self.ssh_code() + '''
+awk() { printf 'partial configuration\\n'; return 1; }
+sshd_set Port "$SSH_PORT" PermitRootLogin yes PubkeyAuthentication yes
+'''
+        result = self.shell(code, SSHD_BIN=self.sshd)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), original)
+
     def test_match_override_is_preserved_but_rejected_and_rolled_back(self):
         with self.config.open('a') as f:
             f.write('Match User root\n    PasswordAuthentication yes\n')
         original = self.config.read_bytes()
         backup = self.path / 'backup'
         backup.write_bytes(original)
-        validation = INIT.split('# 验证配置语法 (防止重启失败导致失联)\n', 1)[1].split('SSH_SERVICE="sshd"', 1)[0]
-        validation = validation.replace('/etc/ssh/sshd_config', str(self.config))
+        validation = self.validation_block()
         code = self.ssh_code() + f'\nSSHD_BACKUP="{backup}"\n' + self.apply_settings()
         code += validation + '\necho RELOAD_REACHED'
         result = self.shell(code, SSHD_BIN=self.sshd)
@@ -360,7 +397,7 @@ validate_sshd_settings
         with self.config.open('a') as config:
             config.write('UseDNS no\nMatch Host client.example.org\n PasswordAuthentication yes\n')
         code = self.ssh_code() + self.apply_settings() + '''
-python3() { echo UNEXPECTED_DNS_LOOKUP >&2; return 1; }
+resolve_ssh_client_host() { echo UNEXPECTED_DNS_LOOKUP >&2; return 1; }
 validate_sshd_settings
 '''
         result = self.shell(code, SSHD_BIN=self.sshd)
@@ -518,8 +555,7 @@ validate_sshd_settings && sshd -T -C user=nobody,host=198.51.100.3,addr=198.51.1
     def test_parser_failure_restores_backup_without_reload(self):
         original = self.config.read_bytes()
         (self.path / 'backup').write_bytes(original)
-        validation = INIT.split('# 验证配置语法 (防止重启失败导致失联)\n', 1)[1].split('SSH_SERVICE="sshd"', 1)[0]
-        validation = validation.replace('/etc/ssh/sshd_config', str(self.config))
+        validation = self.validation_block()
         code = self.ssh_code() + '\nSSHD_BACKUP="$TEST_DIR/backup"\n'
         code += 'echo InvalidDirective yes >> "$TEST_DIR/sshd_config"\n' + validation
         code += '\necho RELOAD_REACHED'
@@ -527,6 +563,38 @@ validate_sshd_settings && sshd -T -C user=nobody,host=198.51.100.3,addr=198.51.1
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('RELOAD_REACHED', result.stdout)
         self.assertEqual(self.config.read_bytes(), original)
+
+    def test_root_access_rules_and_disabled_key_files_are_rejected(self):
+        for policy in ('AuthorizedKeysFile none', 'AuthorizedKeysFile /no/such/keys',
+                       'AllowUsers another-user', 'DenyUsers root', 'AllowGroups no-such-group',
+                       'ForceCommand internal-sftp', 'ChrootDirectory /srv/jail',
+                       'AuthenticationMethods publickey,publickey'):
+            with self.subTest(policy=policy):
+                self.config.write_text(f'HostKey {self.path}/hostkey\nUseDNS no\n{policy}\n')
+                result = self.shell(self.ssh_code() + self.apply_settings() + '\nvalidate_sshd_settings', SSHD_BIN=self.sshd)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_root_allow_rule_with_matching_address_is_supported(self):
+        with self.config.open('a') as config:
+            config.write('UseDNS no\nAllowUsers root@198.51.100.0/24\n')
+        self.assert_ok(self.shell(self.ssh_code() + self.apply_settings() + '\nvalidate_sshd_settings', SSHD_BIN=self.sshd))
+
+    def test_imported_path_must_be_used_and_insecure_permissions_are_rejected(self):
+        code = self.ssh_code() + self.apply_settings() + '\nSSH_EXPECTED_KEY_FILE="$TEST_DIR/not-used"\nvalidate_sshd_settings'
+        self.assertNotEqual(self.shell(code, SSHD_BIN=self.sshd).returncode, 0)
+        (self.path / '.ssh/authorized_keys').chmod(0o666)
+        result = self.shell(self.ssh_code() + self.apply_settings() + '\nvalidate_sshd_settings', SSHD_BIN=self.sshd)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('权限不安全', result.stderr)
+
+    def test_invalid_and_restricted_keys_do_not_justify_disabling_password(self):
+        target = self.path / '.ssh/authorized_keys'
+        key = (self.path / 'hostkey.pub').read_text()
+        for contents in ('invalid\n', 'from="192.0.2.99" ' + key):
+            with self.subTest(contents=contents):
+                target.write_text(contents)
+                result = self.shell(self.ssh_code() + self.apply_settings() + '\nvalidate_sshd_settings', SSHD_BIN=self.sshd)
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == '__main__':
