@@ -218,7 +218,12 @@ service_stop() {
 service_disable() {
   case "$(detect_service_manager)" in
     systemd) systemctl disable sing-box >/dev/null 2>&1 ;;
-    openrc)  rc-update del sing-box default >/dev/null 2>&1 ;;
+    openrc)
+      # 已禁用自启也算完成，允许用户手动禁用后卸载或在清理失败后重试。
+      if [[ -e /etc/runlevels/default/sing-box || -L /etc/runlevels/default/sing-box ]]; then
+        rc-update del sing-box default >/dev/null 2>&1
+      fi
+      ;;
     *)       return 1 ;;
   esac
 }
@@ -226,7 +231,7 @@ service_disable() {
 remove_service_definition() {
   local manager
   manager=$(detect_service_manager)
-  if [[ -e "$SYSTEMD_FILE" || -e "$OPENRC_FILE" ]]; then
+  if [[ -e "$SYSTEMD_FILE" || -e "$OPENRC_FILE" || "$manager" == openrc ]]; then
     service_disable || return 1
   fi
   rm -f "$SYSTEMD_FILE" "$OPENRC_FILE" /run/sing-box.pid || return 1
@@ -1455,6 +1460,7 @@ delete_node() {
     echo -e "${GREEN}删除完成。${PLAIN}"
   else
     rm -f "$tmp"
+    return 1
   fi
 }
 

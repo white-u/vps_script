@@ -455,7 +455,9 @@ nuke_all() {
             fi
             if [[ "$sb_manager" == systemd && -e /etc/systemd/system/sing-box.service ]]; then
                 systemctl disable sing-box || { cleanup_warn "sing-box 取消开机启动失败"; sb_cleanup_ok=false; }
-            elif [[ "$sb_manager" == openrc && -e /etc/init.d/sing-box ]]; then
+            elif [[ "$sb_manager" == openrc ]] \
+                && [[ -e /etc/runlevels/default/sing-box || -L /etc/runlevels/default/sing-box ]]; then
+                # 已禁用时无需再次删除；真实取消失败仍阻止后续文件清理。
                 rc-update del sing-box default || { cleanup_warn "sing-box 取消开机启动失败"; sb_cleanup_ok=false; }
             fi
             if [[ "$sb_cleanup_ok" == true ]]; then

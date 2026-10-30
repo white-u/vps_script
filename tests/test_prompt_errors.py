@@ -269,6 +269,125 @@ nuke_all
                 self.assertTrue(config.exists())
 
 
+@unittest.skipUnless(BASH4, 'Cleanup managers require Bash 4+')
+class OpenRCUninstallTests(ShellCase):
+    """Exercise confirmed user uninstall flows, including a second invocation."""
+
+    def setup_install(self, enabled=True):
+        self.write('usr/local/bin/sing-box', 'core')
+        self.write('usr/local/bin/sb', 'manager')
+        self.write('usr/local/bin/vt', 'toolbox')
+        self.write('usr/local/etc/sing-box/config.json', '{"inbounds":[]}')
+        service = self.write('etc/init.d/sing-box', 'service')
+        link = self.path / 'etc/runlevels/default/sing-box'
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if enabled:
+            link.symlink_to(service)
+
+    def uninstall(self, module, failure='none', stdin='yes\nn\n'):
+        names = ('strip_cr', 'service_stop', 'service_disable',
+                 'remove_service_definition', 'uninstall_all') if module == 'sb' else (
+                     'strip_cr', 'cleanup_warn', 'nuke_all')
+        code = functions(module, *names)
+        code = re.sub(r'(?<![A-Za-z0-9_])/(?:usr/local|etc|var|run)(?=/|\b)',
+                      lambda m: '@TEST_DIR@' + m[0], code)
+        code += r'''
+SYSTEMD_FILE="$TEST_DIR/etc/systemd/system/sing-box.service"
+OPENRC_FILE="$TEST_DIR/etc/init.d/sing-box"
+SB_CONF_FILE="$TEST_DIR/usr/local/etc/sing-box/config.json"
+SB_CONF_DIR="$TEST_DIR/usr/local/etc/sing-box"; WORK_DIR="$TEST_DIR/var/lib/sing-box"
+SB_BIN="$TEST_DIR/usr/local/bin/sing-box"; INSTALL_PATH="$TEST_DIR/usr/local/bin/sb"
+OPENRC_LOG_FILE="$TEST_DIR/var/log/sing-box.log"; VT_INSTALL_PATH="$TEST_DIR/usr/local/bin/vt"
+detect_service_manager() { echo openrc; }
+cleanup_snell() { :; }; cleanup_pm() { :; }; close_port() { :; }
+sb_installed() { [[ -f "$SB_BIN" ]]; }; fw_installed() { return 1; }
+rc-service() {
+    echo "$*" >> "$TEST_DIR/service.calls"
+    [[ "$FAILURE" != stop ]] || return 1
+}
+rc-update() {
+    echo "$*" >> "$TEST_DIR/disable.calls"
+    [[ "$FAILURE" != disable ]] || return 1
+    local link="$TEST_DIR/etc/runlevels/default/sing-box"
+    # OpenRC returns failure if the service was already absent from the runlevel.
+    [[ -e "$link" || -L "$link" ]] || return 1
+    command rm "$link"
+}
+eval "$(declare -f rm | sed 's/^rm ()/safe_rm ()/')"
+rm() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$FAILURE" == remove && "$arg" == "$OPENRC_FILE" ]]; then return 1; fi
+    done
+    safe_rm "$@"
+}
+'''
+        code += '\nuninstall_all\n' if module == 'sb' else '\nnuke_all\n'
+        return self.run_shell(code, stdin=stdin, FAILURE=failure)
+
+    def assert_removed(self, result, module):
+        self.assert_ok(result)
+        self.assertIn('卸载完成' if module == 'sb' else '全部清除完成', result.stdout)
+        for name in ('usr/local/bin/sing-box', 'usr/local/bin/sb',
+                     'usr/local/etc/sing-box', 'etc/init.d/sing-box'):
+            self.assertFalse((self.path / name).exists(), name)
+        self.assertFalse((self.path / 'etc/runlevels/default/sing-box').is_symlink())
+        self.assertTrue((self.path / 'usr/local/bin/vt').exists())
+
+    def test_user_can_uninstall_with_autostart_enabled_or_already_disabled(self):
+        for module in ('sb', 'vt'):
+            for enabled in (True, False):
+                with self.subTest(module=module, enabled=enabled):
+                    self.setup_install(enabled)
+                    (self.path / 'disable.calls').unlink(missing_ok=True)
+                    self.assert_removed(self.uninstall(module), module)
+                    self.assertEqual((self.path / 'disable.calls').exists(), enabled)
+
+    def test_user_can_retry_after_autostart_was_removed_but_file_cleanup_failed(self):
+        for module in ('sb', 'vt'):
+            with self.subTest(module=module):
+                self.setup_install()
+                result = self.uninstall(module, failure='remove')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('卸载完成', result.stdout)
+                self.assertNotIn('全部清除完成', result.stdout)
+                self.assertTrue((self.path / 'usr/local/etc/sing-box/config.json').exists())
+                self.assertTrue((self.path / 'etc/init.d/sing-box').exists())
+                self.assertFalse((self.path / 'etc/runlevels/default/sing-box').is_symlink())
+                self.assert_removed(self.uninstall(module), module)
+
+    def test_real_stop_or_disable_failure_preserves_files_for_user_retry(self):
+        for module in ('sb', 'vt'):
+            for failure in ('stop', 'disable'):
+                with self.subTest(module=module, failure=failure):
+                    self.setup_install()
+                    result = self.uninstall(module, failure=failure)
+                    self.assertNotEqual(result.returncode, 0)
+                    for name in ('usr/local/bin/sing-box', 'usr/local/bin/sb',
+                                 'usr/local/etc/sing-box/config.json', 'etc/init.d/sing-box'):
+                        self.assertTrue((self.path / name).exists(), name)
+                    self.assertTrue((self.path / 'etc/runlevels/default/sing-box').is_symlink())
+                    self.assert_removed(self.uninstall(module), module)
+
+    def test_cancelled_confirmation_keeps_installation_and_does_not_disable(self):
+        for module in ('sb', 'vt'):
+            with self.subTest(module=module):
+                self.setup_install()
+                (self.path / 'disable.calls').unlink(missing_ok=True)
+                self.uninstall(module, stdin='no\n')
+                self.assertTrue((self.path / 'usr/local/bin/sing-box').exists())
+                self.assertTrue((self.path / 'etc/runlevels/default/sing-box').is_symlink())
+                self.assertFalse((self.path / 'disable.calls').exists())
+                self.assert_removed(self.uninstall(module), module)
+
+    def test_partial_install_with_dangling_autostart_link_is_cleaned(self):
+        for module in ('sb', 'vt'):
+            with self.subTest(module=module):
+                self.setup_install()
+                (self.path / 'etc/init.d/sing-box').unlink()
+                self.assert_removed(self.uninstall(module), module)
+
+
 class FirewallErrorTests(ShellCase):
     def test_failed_rule_query_is_not_treated_as_successful_cleanup(self):
         for module in ('x-sb', 'sb', 'vt'):

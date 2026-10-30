@@ -116,6 +116,8 @@ DNS 验证用例还需要 GNU `timeout`；原生解析阻塞回归需要 C 编�
 
 提示和错误处理回归位于 `tests/test_prompt_errors.py`，覆盖配置保存、重启及恢复失败、卸载残留、输入结束、状态未知、BBR 运行验证和不完整网络测量。这些用例通过临时文件及故障注入验证失败路径，不会操作宿主机真实服务或内核参数。
 
+`tests/test_user_flows.py` 从用户输入验证 PM 新增、分组修改、删除与取消，以及 sing-box/Xray 节点新增、删除和失败提示；检查保存结果、其他节点和已有流量是否保持正确。`tests/test_worker_flows.py` 调用 Worker 的真实请求入口，使用内存数据库和模拟 Telegram 请求验证签名上报、查询权限隔离、管理员授权与重复事件处理，不向真实用户发送消息。
+
 PM 的实际 Linux 集成验证需在有 systemd、Cron、nftables、TC 和网络命名空间支持的测试 VPS 上以 root 单独执行：
 
 ```bash
@@ -123,6 +125,14 @@ python3 tests/integration_pm.py
 ```
 
 它使用临时目录、独立网络空间、临时 systemd 单元和 `/etc/cron.d/pm-baseline-*` 条目，不编辑 root 的任务表；验证真实 TCP 计数、50 Mbps TC 分类与映射、规则恢复、文件锁、混合状态保护及 Cron 调度，结束或正常中断后清理本次资源。Cron 验证最多等待 75 秒。它不测试公网限速吞吐，也不向真实 Telegram 或 Cloudflare 发送消息。
+
+FW 的实际用户流程验证可在 Linux/systemd 测试机以 root 单独执行：
+
+```bash
+python3 tests/integration_fw.py
+```
+
+它通过当前安装函数下载并校验固定版本 Realm，使用 `/opt` 下独立临时目录和唯一命名的 systemd 服务；仅在回环地址监听，不修改防火墙。验证新增规则的输入纠错、真实 TCP/UDP 转发、重复端口拒绝、取消删除/重装/卸载、删除最后一条规则后停服及确认卸载。测试结束或可捕获中断后清理自身资源；若停服或清理失败，会报错并保留恢复文件及路径。需要访问官方核心下载地址，不验证公网防火墙与连通性。
 
 ---
 
