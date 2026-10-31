@@ -1121,7 +1121,7 @@ read_config_value() {
 }
 
 format_client_config() {
-    local port=$1 ip=$2
+    local port=$1 ip=$2 display=${3:-surge}
     local conf="${SNELL_CONF_DIR}/${port}.conf"
     local key snell_ver obfs extra=""
     key=$(read_config_value "$conf" psk)
@@ -1148,6 +1148,15 @@ format_client_config() {
         esac
     fi
 
+    if [[ "$display" == details ]]; then
+        printf '地址: %s\n端口: %s\nPSK : %s\n' "$ip" "$port" "$key"
+        if [[ "$snell_ver" == 6 ]]; then
+            printf 'Mode: %s\n' "${mode:-default}"
+        else
+            printf 'Obfs: %s\n' "${obfs:-off}"
+        fi
+        printf '\n完整配置:\n'
+    fi
     printf 'snell-%s = snell, %s, %s, psk=%s, version=%s, tfo=true, reuse=true%s\n' \
         "$port" "$ip" "$port" "$key" "$snell_ver" "$extra"
 }
@@ -1177,14 +1186,13 @@ show_all_configs() {
         status=$(get_instance_status "$p")
 
         echo -e " ${GREEN}▶ 端口: $p${PLAIN}  状态: $status"
-        local client_config
-        if client_config=$(format_client_config "$p" "$ip"); then
-            echo -e "   ${DIM}${client_config}${PLAIN}"
+        if format_client_config "$p" "$ip" details; then
+            echo
         fi
         echo -e " ────────────────────────────────────────────────────────────────"
     done
-    [[ "$ip" == "YOUR_IP" ]] && warn "未能获取公网 IPv4，请手动替换配置中的 YOUR_IP。"
-    echo -e " ${DIM}提示: 上方格式严格按 Surge 官方 Snell 配置生成。${PLAIN}"
+    [[ "$ip" == "YOUR_IP" ]] && warn "未能获取公网 IPv4，请自行确认服务器地址。"
+    return 0
 }
 
 show_single_config() {
@@ -1195,15 +1203,10 @@ show_single_config() {
 
     echo -e " ────────────────────────────────────────────────────────────────"
     echo -e " ${GREEN}▶ 端口 ${port} 客户端配置:${PLAIN}"
-    local client_config
-    if client_config=$(format_client_config "$port" "$ip"); then
-        echo -e "   ${client_config}"
-    else
-        return 1
-    fi
+    format_client_config "$port" "$ip" details || return 1
     echo -e " ────────────────────────────────────────────────────────────────"
     if [[ "$ip" == "YOUR_IP" ]]; then
-        warn "未能获取公网 IPv4，请手动替换 YOUR_IP。"
+        warn "未能获取公网 IPv4，请自行确认服务器地址。"
     fi
     return 0
 }
