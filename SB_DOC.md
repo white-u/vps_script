@@ -40,6 +40,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/
 
 脚本在 Alpine 上自动安装其余依赖并使用 OpenRC 管理服务；在 systemd 系统上保持原有管理方式。
 
+首次交互运行时（包括从 `vt` 进入），若核心尚未安装，会先自动安装，再显示菜单；已有核心不自动更新，仍可通过菜单 1 检查更新。安装失败会停止本次进入，修复原因后重新运行即可重试。
+
 安装后运行：
 
 ```bash

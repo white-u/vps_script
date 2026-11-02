@@ -122,6 +122,41 @@ VT_URL="$SCRIPT_URL"
                         self.assertEqual((self.root / "installed").read_text(), original)
                         self.assertNotIn("\nUPDATED\n", result.stdout)
 
+    def test_shortcut_install_downloads_use_same_progress_and_preserve_failed_candidates(self):
+        for module, install in (("vt", "install_self"), ("snell", "sync_script"),
+                                ("sb", "install_shortcut_cmd"), ("pm", "install_shortcut"),
+                                ("fw", "sync_script")):
+            source = (ROOT / f"{module}.sh").read_text()
+            key = "VT_VERSION" if module == "vt" else "SCRIPT_VERSION"
+            version = re.search(r'^' + key + r'="([^\"]+)"', source, re.M)[1]
+            validate = "validate_script_file" if module == "vt" else "validate_script_candidate"
+            code = self.wrapper() + f'{key}="{version}"\nVT_SHORTCUT=vt\nSHORTCUT_NAME={module}\n'
+            code += function(source, validate) + function(source, "version_is_older")
+            code += function(source, install) + install + " ''\n"
+            for mode in ("ok", "http-error", "invalid"):
+                with self.subTest(module=module, mode=mode):
+                    (self.root / "curl.args").unlink(missing_ok=True)
+                    original = "original script\n"
+                    (self.root / "installed").write_text(original)
+                    payload = (f'#!/bin/bash\n{key}="{version}"\necho INSTALLED\n' + "# pad\n" * 5000)
+                    if mode == "invalid":
+                        payload = "bad script\n"
+                    result = self.run_http(code, payload.encode(), 503 if mode == "http-error" else 200)
+                    args = (self.root / "curl.args").read_text().splitlines()
+                    self.assertIn("--progress-bar", args)
+                    self.assertIn("--connect-timeout", args)
+                    self.assertIn("--max-time", args)
+                    self.assertNotIn("-s", args)
+                    if mode == "ok":
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertRegex(result.stderr, r"100(?:\.0)?%")
+                        self.assertEqual((self.root / "installed").read_text(), payload)
+                    else:
+                        self.assertEqual((self.root / "installed").read_text(), original)
+                        self.assertNotIn("\nINSTALLED\n", result.stdout)
+                        diagnostic = "无法安装快捷指令" if module == "pm" else "失败"
+                        self.assertIn(diagnostic, result.stdout + result.stderr)
+
     def test_snell_core_download_has_progress_and_keeps_existing_files_on_failure(self):
         source = (ROOT / "snell.sh").read_text()
         code = self.wrapper() + r'''
@@ -181,7 +216,7 @@ if ! command -v sha256sum >/dev/null 2>&1; then sha256sum() { shasum -a 256 "$@"
                     self.assertFalse((self.root / "child").exists())
                     self.assertNotIn("CHILD_RAN", result.stdout)
 
-    def test_singbox_both_download_attempts_keep_meter_timeout_and_failure_message(self):
+    def test_singbox_both_download_attempts_keep_progress_bar_timeout_and_failure_message(self):
         source = (ROOT / "sb.sh").read_text()
         code = self.wrapper() + r'''
 SB_BIN="$TEST_DIR/core"
@@ -192,9 +227,9 @@ map_arch_sb() { echo amd64; }
 get_current_sb_ver() { echo 1.13.0; }
 get_release_asset_name() { echo sing-box-1.14.0-linux-amd64-musl.tar.gz; }
 '''
-        code += function(source, "version_is_older") + function(source, "install_singbox") + "install_singbox\n"
+        code += function(source, "version_is_older") + function(source, "install_singbox")
         (self.root / "core").write_text("old core")
-        result = self.run_http(code, b"error", 404)
+        result = self.run_http(code + "install_singbox\n", b"error", 404)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "core").read_text(), "old core")
         self.assertIn("尝试旧版通用静态构建", result.stdout)
@@ -202,8 +237,17 @@ get_release_asset_name() { echo sing-box-1.14.0-linux-amd64-musl.tar.gz; }
         args = (self.root / "curl.args").read_text().splitlines()
         self.assertEqual(args.count("--connect-timeout"), 2)
         self.assertEqual(args.count("--max-time"), 2)
+        self.assertEqual(args.count("--progress-bar"), 2)
         self.assertNotIn("-s", args)
         self.assertNotIn("--silent", args)
+        (self.root / "curl.args").unlink()
+        code += 'get_release_asset_digest() { printf "%064d\\n" 0; }\ninstall_singbox\n'
+        result = self.run_http(code, b"incorrect archive" * 10000)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r"100(?:\.0)?%")
+        self.assertIn("SHA-256 校验失败", result.stderr)
+        self.assertEqual((self.root / "core").read_text(), "old core")
+        self.assertEqual((self.root / "curl.args").read_text().splitlines().count("--progress-bar"), 1)
 
 
 if __name__ == "__main__":

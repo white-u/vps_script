@@ -260,7 +260,7 @@ sync_script() {
     if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
         cp "$0" "$tmp_script" 2>/dev/null || true
     else
-        curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
+        curl -fL --progress-bar -o "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
     fi
 
     local candidate_ver installed_ver=""
@@ -1568,6 +1568,14 @@ if [[ $# -gt 0 ]]; then
         *)         warn "未知命令: $1（使用 snell help 查看帮助）"; exit 1 ;;
     esac
 else
+    if [[ ! -x "$SNELL_BIN" ]]; then
+        info "未检测到 Snell 核心，正在自动安装..."
+        install_core || exit $?
+        if [[ ! -x "$SNELL_BIN" ]]; then
+            warn "Snell 核心尚未安装，本次进入已停止；请重新运行 snell 完成安装。"
+            exit 1
+        fi
+    fi
     while true; do
         menu
     done

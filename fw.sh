@@ -141,7 +141,7 @@ sync_script() {
     if [[ -f "$0" ]] && [[ "$(basename "$0")" != "bash" ]] && [[ "$(basename "$0")" != "sh" ]]; then
         cp "$0" "$tmp_script" 2>/dev/null || true
     else
-        curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
+        curl -fL --progress-bar -o "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" || true
     fi
 
     local candidate_ver installed_ver=""
@@ -1281,6 +1281,10 @@ if [[ $# -gt 0 ]]; then
         *) err "未知命令: $1 ($0 help 查看帮助)" ;;
     esac
 else
+    if ! realm_installed; then
+        info "未检测到 Realm 核心，正在自动安装..."
+        install_realm
+    fi
     while true; do
         menu
     done

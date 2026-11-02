@@ -383,7 +383,7 @@ install_shortcut() {
     }
     
     # 校验下载文件的格式、版本字段和 Bash 语法。
-    if curl -fsSLo "$tmp_dl" --connect-timeout 8 --max-time 15 "$(fresh_script_url)" \
+    if curl -fL --progress-bar -o "$tmp_dl" --connect-timeout 8 --max-time 15 "$(fresh_script_url)" \
         && validate_script_candidate "$tmp_dl"; then
         if ! chmod 755 "$tmp_dl" || ! mv -f "$tmp_dl" "$INSTALL_PATH"; then
             echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2

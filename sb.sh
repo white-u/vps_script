@@ -721,7 +721,7 @@ install_shortcut_cmd() {
     return 1
   }
   _CLEANUP_FILES+=("$tmp_script")
-  if curl -fsSLo "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" \
+  if curl -fL --progress-bar -o "$tmp_script" --connect-timeout 8 --max-time 20 "$(fresh_script_url)" \
       && validate_script_candidate "$tmp_script"; then
     remote_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" | head -1 | cut -d'"' -f2)
     if ! version_is_older "$remote_ver" "$SCRIPT_VERSION"; then
@@ -810,13 +810,13 @@ install_singbox() {
   tmp_dir=$(mktemp -d /tmp/sb.dir.XXXXXX) || return 1
   _CLEANUP_FILES+=("$tmp_dir")
 
-  if ! curl -fL --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+  if ! curl -fL --progress-bar --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
     # 旧版 sing-box 尚未单列 musl 资产，当时的通用 Linux 构建为静态链接。
     if [[ "$asset_name" == *-musl.tar.gz ]]; then
       asset_name="sing-box-${latest_ver}-linux-${arch}.tar.gz"
       url="https://github.com/SagerNet/sing-box/releases/download/${latest_tag}/${asset_name}"
       echo -e "${YELLOW}该版本没有独立 musl 文件，尝试旧版通用静态构建...${PLAIN}"
-      if ! curl -fL --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
+      if ! curl -fL --progress-bar --connect-timeout 15 --max-time 120 "${url}?t=$(date +%s)" -o "$tmp_tgz"; then
         echo -e "${RED}下载失败：${url}${PLAIN}"
         return 1
       fi
@@ -1542,7 +1542,10 @@ main_menu() {
   check_deps
   require_service_manager || exit 1
   init_meta_if_missing || exit 1
-  if [[ -x "$SB_BIN" ]]; then
+  if [[ ! -x "$SB_BIN" ]]; then
+    echo -e "${YELLOW}未检测到 sing-box 核心，正在自动安装...${PLAIN}"
+    install_singbox || exit 1
+  else
     migrate_config_if_needed || {
       echo -e "${RED}配置迁移失败，现有配置未被静默覆盖。${PLAIN}" >&2
       pause_to_menu

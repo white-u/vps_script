@@ -26,7 +26,7 @@ Shell 语法检查同样应使用 Bash 4+。不要以 root 在开发机直接执
 
 | 范围 | 测试文件 | 重点 |
 | --- | --- | --- |
-| 工具箱菜单、下载、统一卸载 | `test_vt.py`、`test_vt_cleanup.py`、`test_downloads.py` | EOF、子进程失败、残留保护、重试、脚本候选校验 |
+| 工具箱菜单、下载、统一卸载 | `test_vt.py`、`test_vt_cleanup.py`、`test_downloads.py`、`test_module_startup.py` | EOF、子进程失败、残留保护、重试、脚本候选校验、模块首次自动安装与命令行隔离 |
 | PM | `test_pm.py`、`test_user_flows.py`、`test_performance.py` | 格式拒绝、计数基线、规则恢复、分组编辑、告警重试、批量查询 |
 | Realm / FW | `test_fw.py` | 规则校验、监听、事务回滚、中断与卸载 |
 | Snell | `test_snell.py` | 版本发现、多实例迁移、回滚、客户端导出 |

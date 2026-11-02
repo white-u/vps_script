@@ -137,7 +137,7 @@ install_self() {
         echo -e "${RED}无法在 /usr/local/bin 创建更新临时文件。${PLAIN}" >&2
         return 1
     }
-    if curl -fsSLo "$tmp" --connect-timeout 8 --max-time 15 "$(fresh_url "$VT_URL")" \
+    if curl -fL --progress-bar -o "$tmp" --connect-timeout 8 --max-time 15 "$(fresh_url "$VT_URL")" \
         && validate_script_file "$tmp" "VT_VERSION"; then
         if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$VT_INSTALL_PATH"; then
             echo -e "${RED}快捷命令安装失败，现有文件未被覆盖。${PLAIN}" >&2
