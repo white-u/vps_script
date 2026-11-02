@@ -3,7 +3,14 @@
 set -euo pipefail
 umask 077
 
-SOURCE_URL='https://raw.githubusercontent.com/white-u/vps_script/main/traffic_balance.py'
+# Keep the executable payload identical across download channels.
+SOURCE_REF='traffic-balance-v1.0.1'
+SOURCE_SHA256='94572dbe661f25640c8ed70a3cbd55f967df293b3705a934e1c690609855d0c3'
+SOURCE_URLS=(
+    "https://raw.githubusercontent.com/white-u/vps_script/$SOURCE_REF/traffic_balance.py"
+    "https://api.github.com/repos/white-u/vps_script/contents/traffic_balance.py?ref=$SOURCE_REF"
+    "https://cdn.jsdelivr.net/gh/white-u/vps_script@$SOURCE_REF/traffic_balance.py"
+)
 TASK_TMP=''
 
 cleanup() {
@@ -49,18 +56,24 @@ ensure_dependencies() {
 }
 
 download_script() {
-    local target=$1
-    if ! curl -q --fail --show-error --location --progress-bar \
-        --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 60 \
-        --output "$target" "$SOURCE_URL"; then
-        echo 'GitHub 脚本下载失败；未修改已有任务，请检查网络后重新运行。' >&2
-        return 1
-    fi
-    if [[ ! -s "$target" ]] || ! python3 -c \
-        'import pathlib,sys; p=pathlib.Path(sys.argv[1]); compile(p.read_text(),str(p),"exec")' "$target"; then
-        echo '下载内容为空或 Python 校验失败；未执行脚本，请重新下载。' >&2
-        return 1
-    fi
+    local target=$1 url attempt=0
+    for url in "${SOURCE_URLS[@]}"; do
+        attempt=$((attempt+1))
+        printf '正在尝试下载通道 %d/%d……\n' "$attempt" "${#SOURCE_URLS[@]}"
+        : > "$target"
+        if curl -q --fail --show-error --location --progress-bar \
+            --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 \
+            --header 'Accept: application/vnd.github.raw+json' \
+            --output "$target" "$url" && [[ -s "$target" ]] && python3 -c \
+            'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); data=p.read_bytes();
+if hashlib.sha256(data).hexdigest()!=sys.argv[2]: sys.exit("脚本摘要不匹配")
+compile(data,str(p),"exec")' "$target" "$SOURCE_SHA256"; then
+            return 0
+        fi
+        echo '当前通道下载或校验未成功，尝试下一通道。' >&2
+    done
+    echo '所有通道均下载失败或校验不通过；未执行脚本，请更换网络或手动上传。' >&2
+    return 1
 }
 
 main() {

@@ -58,6 +58,13 @@ class PersistenceError(Error):
     pass
 
 
+class StatsNotReady(Error):
+    """A valid database is still collecting its first complete daily sample."""
+    def __init__(self, message, short_reason=None):
+        super().__init__(message)
+        self.short_reason = short_reason or message
+
+
 class DownloadNotStarted(Error):
     pass
 
@@ -66,18 +73,22 @@ class Cancelled(Exception):
     pass
 
 
-def run(*args, timeout=30):
+def run(*args, timeout=30, live=False):
     if args[0] == 'vnstat':
         args = (args[0], '--config', str(VNSTAT_CONFIG), *args[1:])
     try:
-        p = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout, check=False,
-                           env={**os.environ, 'LC_ALL': 'C', 'HOME': '/root'})
+        env = {**os.environ, 'LC_ALL': 'C', 'HOME': '/root'}
+        if live and args[0] == 'apt-get':
+            env['DEBIAN_FRONTEND'] = 'noninteractive'
+        p = subprocess.run(args, text=True, stdout=None if live else subprocess.PIPE,
+                           stderr=None if live else subprocess.PIPE, timeout=timeout, check=False,
+                           env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f'{args[0]} 执行失败：{e}') from e
     if p.returncode:
-        raise Error(f'{args[0]} 返回 {p.returncode}：{(p.stderr.strip() or p.stdout.strip())[:500]}')
-    return p.stdout
+        detail = ((p.stderr or '').strip() or (p.stdout or '').strip())[:500] or '请查看上方命令输出'
+        raise Error(f'{args[0]} 返回 {p.returncode}：{detail}')
+    return p.stdout or ''
 
 
 def load_json(path):
@@ -281,27 +292,47 @@ def parse_stats(raw, interface, settings, now):
         updated = vn_timestamp(i['updated'], settings, updated=True)
         created = vn_timestamp(i['created'], settings)
         today = date_now(settings, now)
-        entries = [d for d in i['traffic']['day']
-                   if '%04d-%02d-%02d' % (d['date']['year'], d['date']['month'], d['date']['day']) == today]
-        if len(entries) != 1:
-            raise ValueError('当天统计尚未就绪')
-        d = entries[0]
+        age = now-updated
+        if age < 0 or age > settings['SaveInterval']*60+120:
+            raise ValueError('统计时间在未来或已过旧')
+        if date_now(settings, updated) != today or created > updated:
+            raise ValueError('统计日期未切换或创建时间异常')
+        first_day = date_now(settings, created) == today
         total = i['traffic']['total']
+        for n in (total['rx'], total['tx']):
+            number(n, 0, 10**18, 'vnStat 累计计数', True)
+        days = i['traffic']['day']
+        if not isinstance(days, list):
+            raise ValueError('每日记录格式无效')
+        entries = []
+        for d in days:
+            for field, low, high in (('year', 1, 9999), ('month', 1, 12), ('day', 1, 31)):
+                number(d['date'][field], low, high, '统计日期 '+field, True)
+            record_date = dt.date(d['date']['year'], d['date']['month'], d['date']['day']).isoformat()
+            for n in (d['rx'], d['tx']):
+                number(n, 0, 10**18, 'vnStat 当日计数', True)
+            if record_date == today:
+                entries.append(d)
+        first_day_reason = 'vnStat 首日统计尚未完整：网卡数据库今天才建立，等待下一个完整统计日；本轮不补量，程序会自动检查，无需操作'
+        first_day_short = '首日统计不完整，下一统计日再补量'
+        if not entries:
+            raise StatsNotReady(first_day_reason if first_day else
+                                'vnStat 当天记录尚未产生；本轮不补量，将在下次检查自动重试，如持续出现请检查 vnStat 服务',
+                                first_day_short if first_day else '等待 vnStat 生成当天记录，暂不补量')
+        if len(entries) != 1:
+            raise ValueError('当天统计记录重复')
+        d = entries[0]
         v = dict(updated=updated, rx=d['rx'], tx=d['tx'], total_rx=total['rx'],
                  total_tx=total['tx'], created=created)
         for n in v.values():
             number(n, 0, 10**18, 'vnStat 计数', True)
-        age = now - updated
-        if age < 0 or age > settings['SaveInterval'] * 60 + 120:
-            raise ValueError('统计时间在未来或已过旧')
-        if date_now(settings, updated) != today or created > updated:
-            raise ValueError('统计日期未切换或创建时间异常')
-        created_date = date_now(settings, created)
-        if created_date >= today:
-            raise ValueError('网卡数据库今天才建立，首日统计不完整，等待下一个完整日期')
         if total['rx'] < d['rx'] or total['tx'] < d['tx']:
             raise ValueError('累计计数小于当天计数')
+        if first_day:
+            raise StatsNotReady(first_day_reason, first_day_short)
         return today, v
+    except StatsNotReady:
+        raise
     except (ValueError, TypeError, KeyError, Error) as e:
         raise Error(f'vnStat 统计异常：{e}；暂停本轮，将在下次检查重试，请检查 vnstat 服务与网卡') from e
 
@@ -726,7 +757,7 @@ def daemon():
             reason = '启动统计检查通过；先随机等待，不集中补跑'
         except Error as e:
             reason = str(e)
-            logger.warning(reason)
+            logger.log(logging.INFO if isinstance(e, StatsNotReady) else logging.WARNING, reason)
         schedule(c, s, reason)
         while not STOP.wait(1):
             if s['mode'] != 'running' or time.time() < s['next_check']:
@@ -744,7 +775,7 @@ def daemon():
                 if s['pending'] is not None or isinstance(e, PersistenceError):
                     raise
                 s['reason'] = str(e)
-                logger.warning(s['reason'])
+                logger.log(logging.INFO if isinstance(e, StatsNotReady) else logging.WARNING, s['reason'])
             schedule(c, s)
 
 
@@ -778,9 +809,29 @@ WantedBy=multi-user.target
 '''
 
 
+def missing_packages():
+    packages = []
+    for package, commands in (('curl', ('curl',)), ('vnstat', ('vnstat', 'vnstatd')),
+                              ('python3', ('python3',)), ('iproute2', ('ip',))):
+        if any(not any(os.access(Path(folder)/command, os.X_OK) for folder in os.get_exec_path())
+               for command in commands):
+            packages.append(package)
+    certificate = Path('/etc/ssl/certs/ca-certificates.crt')
+    if not certificate.is_file() or not certificate.stat().st_size:
+        packages.append('ca-certificates')
+    return packages
+
+
 def install():
-    run('apt-get', 'update', timeout=300)
-    run('apt-get', 'install', '-y', 'curl', 'vnstat', 'ca-certificates', 'python3', 'iproute2', timeout=300)
+    print('正在检查所需依赖……', flush=True)
+    packages = missing_packages()
+    if packages:
+        print('正在安装依赖：'+', '.join(packages)+'。首次安装可能需要一些时间，下面显示实时进度。', flush=True)
+        run('apt-get', 'update', timeout=300, live=True)
+        run('apt-get', 'install', '-y', *packages, timeout=300, live=True)
+    else:
+        print('所需依赖已就绪，跳过 APT 下载。', flush=True)
+    print('正在启用 vnStat 并创建后台服务……', flush=True)
     run('systemctl', 'enable', '--now', 'vnstat.service')
     BASE.mkdir(mode=0o700, exist_ok=True)
     os.chmod(BASE, 0o700)
@@ -858,7 +909,7 @@ def ask_number(label, default, low, high, integer=False, suffix=''):
         except ValueError as e:
             raise Error('请输入整数' if integer else '请输入数字，例如 4 或 0.5') from e
         return number(value, low, high, label, integer)
-    return ask_valid(f'{label}（{low}～{high}）', default, parse)
+    return ask_valid(label, default, parse)
 
 
 def ask_amount(label, default, low, high):
@@ -867,7 +918,7 @@ def ask_amount(label, default, low, high):
             text += ' MiB'
         return number(amount_input(text), low, high, label + ' MiB')
     shown = f'{default/1024:g} GiB' if default >= 1024 else f'{default:g}'
-    return ask_valid(f'{label}（MiB，{low}～{high}；也可输入 0.5 GiB）', shown, parse)
+    return ask_valid(f'{label}（MiB/GiB）', shown, parse)
 
 
 def ask_interval(old):
@@ -882,7 +933,7 @@ def ask_interval(old):
         if not 1 <= low <= high <= 1440:
             raise Error('间隔须在 1～1440 分钟内，前一个值不能大于后一个值')
         return low, high
-    return ask_valid('多久检查一次？（随机分钟范围）', f"{old['interval_min']}-{old['interval_max']}", parse)
+    return ask_valid('检查间隔（随机分钟）', f"{old['interval_min']}-{old['interval_max']}", parse)
 
 
 def ask_ratio(default):
@@ -891,7 +942,7 @@ def ask_ratio(default):
         if not match:
             raise Error('请输入 2～5 之间的出站/入站比例，例如 2.1 或 2.1:1')
         return number(float(match[1]), 2, 5, '出站/入站比例')
-    return ask_valid('出站:入站目标（2～5，支持小数）', f'{default:g}:1', parse)
+    return ask_valid('目标比例（出站:入站，2～5）', f'{default:g}:1', parse)
 
 
 def detect_interface():
@@ -945,26 +996,19 @@ def verify_interface(c):
 
 
 def format_amount(amount):
-    return f'{amount / (1024*MIB):.2f} GiB' if amount >= 1024*MIB else f'{amount/MIB:.2f} MiB'
+    return (f'{short_number(amount/(1024*MIB))} GiB' if amount >= 1024*MIB else
+            f'{short_number(amount/MIB)} MiB')
 
 
 def config_summary(c, start_after=False):
-    print('\n请核对本次设置：')
-    print(f"  公网网卡：{c['interface']}（自动识别）\n  目标比例：出站 : 入站 = {c['ratio']:g} : 1")
-    print(f"  每日最多补：{format_amount(c['daily_mib']*MIB)}；每轮最多 {format_amount(c['round_mib']*MIB)}")
-    print(f"  每隔 {c['interval_min']}～{c['interval_max']} 分钟随机检查；限速 {c['speed_mbps']:g} Mbps")
-    print(f"  出站达到 {format_amount(c['min_tx_mib']*MIB)} 才考虑补量；每日最多 {c['max_attempts']} 次请求（失败也计次）")
-    print(f"  服务器带宽：{c['bandwidth_mbps']:g} Mbps；补下载最多使用 {c['download_percent']:g}%")
-    print(f"  实际下载最高速度：{effective_speed(c):g} Mbps（用户限速与带宽占比取较小值）")
-    print('  启动条件：当前网卡占用低于服务器带宽的 40%，预计入站和当前出站均不超过 80%。')
+    print('\n确认设置：')
+    print(f"  出站:入站 {c['ratio']:g}:1；服务器带宽 {c['bandwidth_mbps']:g} Mbps")
+    print(f"  每日 {format_amount(c['daily_mib']*MIB)}；每轮 {format_amount(c['round_mib']*MIB)}；每日 {c['max_attempts']} 次")
+    print(f"  检查 {c['interval_min']}～{c['interval_max']} 分钟；实际限速 {effective_speed(c):g} Mbps（用户上限 {c['speed_mbps']:g}，带宽占比 {c['download_percent']:g}%）")
+    print(f"  起补出站 {format_amount(c['min_tx_mib']*MIB)}；每核负载阈值 {c['load_per_cpu']:g}")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
         print('  提示：下载速度已超过 80% 带宽保护线，当前设置会跳过下载；请调低下载限速或补下载带宽占比。')
-    print(f"  负载保护：1 分钟负载 ÷ CPU 数 > {c['load_per_cpu']:g}")
-    print('  CPU 超过 70% 或带宽超过 80% 时保护；下载前观察 5 秒，每秒检查；下载期间每 3 秒检查。')
-    print('  上述额度和次数都是安全上限，不是每天必须完成的任务量。')
-    print('  出站/入站比例超过目标才补下载；按真实缺口补量，达标后停止补量。')
-    print('  保存后将启动任务，先检查统计再随机等待。' if start_after else '  保存后任务保持停止；在菜单选择 2 启动。')
-    print('  已有的当天额度和次数会保留。')
+    print('  保存后将启动任务；保留当日记录。' if start_after else '  保存后保持停止；选择 2 启动，保留当日记录。')
 
 
 def ensure_interface(interface):
@@ -990,28 +1034,22 @@ def ensure_interface(interface):
 
 def configure(start_after=False):
     old = config_for_edit()
-    print('\n配置向导：入站是服务器收到的流量，出站是服务器发出的流量。')
-    print('回车使用方括号内的值；任何一项输入 q 都可取消，保存前不会修改任务。')
+    print('\n配置任务（回车保留，q 取消；不带单位的下载量按 MiB）')
     c = old.copy()
     c['interface'] = detect_interface()
-    print(f"第 1 步：已自动识别公网网卡 {c['interface']}，无需选择。")
-    print('\n第 2 步：设置出站:入站目标比例。支持小数，例如 2.1:1 表示出站 2.1 GiB 对应入站 1 GiB。')
-    print('可输入 2.1 或 2.1:1；出站相对入站过多时才补下载，入站已足够时不补。')
+    print(f"网卡：{c['interface']}（自动识别）")
     c['ratio'] = ask_ratio(old['ratio'])
     c['bandwidth_mbps'] = ask_number('服务器带宽 Mbps（必填）', old['bandwidth_mbps'] or None,
                                      .001, 1000000, suffix='Mbps')
-    print('\n第 3 步：设置每日额度、检查间隔和速度。不确定时可回车保留默认值。')
-    c['daily_mib'] = ask_amount('每天最多额外下载多少', old['daily_mib'], 1, 1048576)
+    c['daily_mib'] = ask_amount('每日补量上限', old['daily_mib'], 1, 1048576)
     c['interval_min'], c['interval_max'] = ask_interval(old)
-    print('速度使用 Mbps；实际速度还受高级设置的补下载带宽占比限制，默认 40%。')
     c['speed_mbps'] = ask_number('下载限速 Mbps', old['speed_mbps'], .001, 10000, suffix='Mbps')
-    advanced = ask_valid('是否修改高级设置？普通使用可直接回车（y/n）', 'n', yes_no)
+    advanced = ask_valid('修改高级设置？（y/n）', 'n', yes_no)
     if advanced:
         c['download_percent'] = ask_number('补下载带宽占比 %', old['download_percent'], 1, 100)
         c['max_attempts'] = ask_number('每日最多下载请求数（失败、备用源请求也计次）', old['max_attempts'], 1, 10000, True)
         c['round_mib'] = ask_amount('每轮最多补下载多少', old['round_mib'], .001, 102400)
         c['min_tx_mib'] = ask_amount('当天出站达到多少才开始考虑补量', old['min_tx_mib'], 0, 1048576)
-        print('负载保护：使用 1 分钟系统负载 ÷ CPU 数，超过阈值时优先保护业务。')
         c['load_per_cpu'] = ask_number('负载保护阈值', old['load_per_cpu'], .01, 100)
     validate_config(c)
     config_summary(c, start_after=start_after)
@@ -1019,13 +1057,15 @@ def configure(start_after=False):
         print('已取消保存，原任务保持不变。')
         return False
     validate_config(c)
+    print('正在确认出口网卡，随后安装依赖并保存设置……', flush=True)
     verify_interface(c)
     # 所有输入确认有效后才安装、停服、保存；无效输入不会改动任务。
     if not UNIT.exists():
         install()
     else:
+        print('正在停止本任务后台服务，以便保存设置……', flush=True)
         run('systemctl', 'stop', SERVICE)
-    print('服务已停止；后续保存失败时也保持停止，请修复后手动启动。')
+    print('正在保存配置和额度记录；任务保持停止……', flush=True)
     with locked():
         s = validate_state(load_json(STATE))
         recover(s)
@@ -1039,7 +1079,6 @@ def configure(start_after=False):
         atomic_json(CONFIG, c)
         ensure_shortcut()
     print('配置已保存。' if start_after else '配置已保存。下一步：在主菜单选择 2「启动任务」。')
-    print('如果这是首次建立流量统计，今天会先收集数据，下一个完整统计日再补量。')
     if start_after:
         control('running')
     return True
@@ -1085,9 +1124,9 @@ def control(mode):
         if mode == 'running':
             run('systemctl', 'start', SERVICE)
             run('systemctl', 'is-active', SERVICE)
-    print({'running': '任务已启动。先检查统计，再随机等待；不会立即集中下载。退出菜单或 SSH 后仍会继续。',
-           'paused': '任务已暂停，不再补下载；重启服务器后也保持暂停。选择 3 可继续，已用额度不会清零。',
-           'stopped': '任务已停止，已关闭开机启动；配置和已用额度保留。选择 2 可重新启动。'}[mode])
+    print({'running': '任务已启动，先检查统计并随机等待。',
+           'paused': '任务已暂停；选择 3 继续，保留当日记录。',
+           'stopped': '任务已停止并关闭开机启动；保留配置与当日记录。'}[mode])
 
 
 def recent_logs(count):
@@ -1106,76 +1145,80 @@ def recent_logs(count):
 def diagnostics():
     print('\n详细运行检查：')
     try:
+        c = validate_config(load_json(CONFIG))
+        print(f"网卡 {c['interface']}；目标出站:入站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
+        print(f"固定保护：CPU {CPU_LIMIT}%，启动占用低于 {START_BANDWIDTH_PERCENT}%，带宽 {BANDWIDTH_LIMIT_PERCENT}%；每核负载 {c['load_per_cpu']:g}")
+        print('预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，单轮最多 5 分钟。')
+    except Error as e:
+        print(f'配置无法读取：{e}')
+    try:
         print(run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result'))
     except Error as e:
         print(f'无法查询后台服务：{e}；请检查系统服务管理器。')
+    try:
+        print('vnStat 服务：\n'+run('systemctl', 'show', 'vnstat.service', '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result'))
+    except Error as e:
+        print(f'vnStat 服务状态无法确认：{e}；请检查 vnStat。')
     recent_logs(25)
     print(f'配置文件：{CONFIG}\n状态文件：{STATE}\n完整日志：{LOG}')
     print('若服务启动失败，可运行：sudo journalctl -u traffic-balance.service -n 50 --no-pager')
 
 
 def status():
-    print('\n── 任务概况 ──')
     active = None
     try:
         active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
         if active not in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading', 'maintenance'):
             raise Error(f'后台状态无法识别：{active!r}')
     except Error as e:
-        print(f'后台服务：无法确认（{e}）；请查看详细运行检查。')
+        print(f'后台状态待确认：{e}')
         active = None
     try:
         c = validate_config(load_json(CONFIG))
         s = validate_state(load_json(STATE))
     except Error as e:
         print(f'配置或记录暂不可用：{e}')
-        print('需要处理：若任务仍在运行，请先选 4「停止任务」，再检查或恢复文件。')
-        recent_logs(5)
+        print('请先停止任务，再选详细检查；不会清零记录。')
         return
     if s['mode'] == 'paused':
-        label, action = '已暂停', '选择 3「继续任务」后恢复；今天的已用额度会保留。'
+        label = '已暂停，选 3 继续'
     elif s['mode'] == 'stopped':
-        label, action = '已停止', '选择 2「启动任务」后开始检查。'
+        label = '已停止，选 2 启动'
     elif active == 'active':
-        label = '正在补下载' if s['pending'] else '后台运行中'
-        action = '无需操作。脚本会按计划检查，满足条件才下载。'
+        label = '下载中' if s['pending'] else '运行中'
     else:
-        label, action = '后台尚未运行' if active else '后台状态待确认', '请查看详细运行检查；排除错误后选择 2「启动任务」。'
-    print(f'当前状态：{label}\n最近情况：{s["reason"]}\n操作提示：{action}')
-    print(f"本轮固定限速上限：{effective_speed(c):g} Mbps（用户上限 {c['speed_mbps']:g} Mbps）")
-    print(f"\n目标：出站 : 入站 = {c['ratio']:g} : 1；出站/入站超过目标才补下载。")
+        label = '后台尚未运行，请查看详细检查' if active else '后台状态待确认'
+    print(f'状态：{label}')
+    print(f"目标：出站:入站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
+    stats_issue = False
     try:
-        day, v = stats(c, vn_settings())
-        print(f"今日流量（{day}，网卡 {c['interface']}）：")
-        print(f"  入站 / 收到：{format_amount(v['rx'])}\n  出站 / 发出：{format_amount(v['tx'])}")
-        if v['rx']:
-            ratio = v['tx']/v['rx']
-            meaning = ('已达标或入站已足够，无需补下载' if target_reached(c, v['rx'], v['tx']) else
-                       '超过目标，满足额度和保护条件时才会补下载')
-            print(f'  当前比例：出站 : 入站 = {ratio:.3f} : 1（{meaning}）')
-        elif v['tx']:
-            print('  当前比例：暂无入站，无法计算；出站达到门槛且保护允许时按目标缺口补量。')
+        _, v = stats(c, vn_settings())
+        ratio = f"{v['tx']/v['rx']:.3f}:1" if v['rx'] else '暂无入站'
+        if v['tx'] < c['min_tx_mib']*MIB or not v['tx']:
+            meaning = '未到起补门槛'
         else:
-            print('  当前比例：暂无流量，暂不能计算，不补下载。')
+            meaning = '无需补量' if target_reached(c, v['rx'], v['tx']) else '超过目标，待补量'
+        print(f"今日：入站 {format_amount(v['rx'])}，出站 {format_amount(v['tx'])}；比例 {ratio}（{meaning}）")
+    except StatsNotReady as e:
+        stats_issue = True
+        print('统计：'+e.short_reason)
     except Error as e:
-        print(f'今日流量：暂不可用，未按零流量处理。\n  {e}')
+        stats_issue = True
+        print(f'统计暂不可用：{e}')
     remaining = max(0, int(c['daily_mib']*MIB)-s['used'])
-    print(f"\n补下载记录（记账日 {s['date'] or '尚未开始'}）：")
-    print(f"  已用 {format_amount(s['used'])} / 上限 {format_amount(c['daily_mib']*MIB)}；剩余 {format_amount(remaining)}")
-    if s['pending']:
-        print('  已用额度包含当前下载预留；完成后按实际量结算。')
-    print(f"  请求次数：{s['attempts']} / {c['max_attempts']}（失败、切换备用源也计次）")
-    when = s['next_check']
+    reserve_note = '（含预留）' if s['pending'] else ''
+    print(f"补量：{format_amount(s['used'])}{reserve_note} / {format_amount(c['daily_mib']*MIB)}，剩余 {format_amount(remaining)}；请求 {s['attempts']}/{c['max_attempts']}")
     if s['mode'] == 'running' and active == 'active':
-        if when > time.time():
-            stamp = dt.datetime.fromtimestamp(when).astimezone().strftime('%m-%d %H:%M:%S %Z')
-            minutes = max(1, math.ceil((when-time.time())/60))
-            print(f'下次检查：{stamp}（约 {minutes} 分钟后；检查不一定下载）')
+        if s['next_check'] > time.time():
+            stamp = dt.datetime.fromtimestamp(s['next_check']).astimezone().strftime('%m-%d %H:%M')
+            minutes = max(1, math.ceil((s['next_check']-time.time())/60))
+            print(f'下次检查：{stamp}（约 {minutes} 分钟）')
         else:
-            print('下次检查：正在检查或等待服务完成启动。')
+            print('下次检查：检查中')
+        if not stats_issue:
+            print('最近：'+s['reason'])
     else:
-        print('下次检查：暂无，任务恢复运行后才会安排。')
-    recent_logs(5)
+        print('下次检查：—')
 
 
 def uninstall():
@@ -1196,28 +1239,25 @@ def uninstall():
 
 
 def menu():
-    print('每日流量调节：只在入站比例偏低时，限速、限额补下载。')
-    print('首次使用可直接选 2，完成必要设置后保存并启动；选 1 只配置。默认每 20～60 分钟检查一次。')
-    print('按当天比例缺口决定补多少；额度是上限，比例达标就不再发起下载。')
-    print('业务繁忙时会让路；应用层限速可能短时突发，不能保证避免服务商 QoS。')
+    print('每日流量调节｜首次选 2 配置并启动')
     while True:
         try:
-            pause_label = '暂停 / 继续任务'
+            pause_label = '暂停/继续'
             task_status = '尚未配置'
             try:
                 mode = validate_state(load_json(STATE))['mode']
                 if mode == 'running':
                     active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
-                    task_status = '后台运行中' if active == 'active' else '后台尚未运行，请查看状态与日志'
-                    pause_label = '暂停任务（稍后可继续）'
+                    task_status = '运行中' if active == 'active' else '后台未运行，选 5 检查'
+                    pause_label = '暂停'
                 else:
                     task_status = '已暂停' if mode == 'paused' else '已停止'
-                    pause_label = '继续任务（保留今天额度）' if mode == 'paused' else '暂停 / 继续任务（启动后可用）'
+                    pause_label = '继续' if mode == 'paused' else '暂停/继续'
             except Error as e:
                 if STATE.exists() or CONFIG.exists():
                     task_status = '配置或记录需要检查'
                     print(f'任务记录需要检查：{e}；可选 4 先停止任务，选 5 查看诊断。')
-            choice = input(f'\n当前状态：{task_status}\n1. 配置任务（首次设置 / 修改）\n2. 启动任务\n3. {pause_label}\n4. 停止任务（关闭开机启动，保留配置）\n5. 查看状态、日志与运行检查\n6. 卸载（删除本任务配置和记录）\n7. 退出菜单（不影响后台任务）\n选择: ').strip()
+            choice = input(f'\n状态：{task_status}\n1 配置  2 启动  3 {pause_label}\n4 停止  5 状态/日志  6 卸载\n0 退出\n选择: ').strip()
             if choice == '1':
                 configure()
             elif choice == '2':
@@ -1242,15 +1282,21 @@ def menu():
                     print('尚未配置任务。先选择 1「配置任务」，保存后再选择 2 启动。')
                 else:
                     status()
-                    if ask('输入 1 查看详细运行检查，直接回车返回菜单') == '1':
+                    detail = ask('1 日志  2 详细检查（回车返回）')
+                    if detail == '1':
+                        recent_logs(10)
+                    elif detail == '2':
                         diagnostics()
+                    elif detail:
+                        print('请输入 1 或 2；已返回菜单。')
             elif choice == '6':
                 if uninstall():
                     return
-            elif choice == '7':
+            elif choice in ('0', '7'):
+                print('已退出菜单，后台任务保持原状态。')
                 return
             else:
-                print('无效选项，请输入 1～7；未修改任务。')
+                print('无效选项，请输入 0～6；未修改任务。')
         except Cancelled:
             print('已取消当前操作，尚未保存设置；原任务保持不变。')
         except (Error, ValueError, OSError) as e:

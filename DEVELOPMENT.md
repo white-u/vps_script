@@ -63,3 +63,8 @@ PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计
 - 涉及安装资源时同步检查 vt 统一卸载、独立卸载和重试。
 - 涉及提示时同时检查无效输入、取消、EOF 和非交互入口。
 - 更新组件手册与索引；仅文档变更回读内容、检查链接和差异即可，无需运行系统集成测试。
+
+
+## 流量调节器发行
+
+`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.1`。不要覆盖已发布的发行标签。

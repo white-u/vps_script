@@ -24,6 +24,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/tb.sh)
 ```
 
+如果无法连接 GitHub Raw，可用备用入口：
+
+```bash
+bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.1')
+```
+
 选 **2 启动任务**，填写服务器带宽并确认保存。保存配置后使用短命令 **`tb`** 调起菜单，也保留 `traffic-balance`。不接入 `vt`；安装、参数及验证边界见 [流量调节手册](TRAFFIC_BALANCE_DOC.md)。精简系统缺少 curl 时先运行 `apt-get update && apt-get install -y curl ca-certificates`。
 
 首次选择 Snell、sing-box 或 FW 时，会下载缺少的管理脚本，并在进入模块菜单前自动安装缺少的核心，无需再次选择安装；已有核心时直接进入菜单，不自动更新。核心安装失败会停止本次进入并显示错误，可再次选择模块重试。PM 没有独立核心，启动时自动安装依赖并初始化。直接运行 `snell`、`sb`、`fw` 也采用相同的首次安装流程。

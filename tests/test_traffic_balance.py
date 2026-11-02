@@ -231,6 +231,58 @@ class AccountingTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(b.Error):
                 b.parse_stats(json.dumps(f), 'eth0', SETTINGS, NOW)
 
+    def test_reported_new_database_waits_without_claiming_source_download_failure(self):
+        stamp = 1793627020
+        f = fixture(rx=16682581, tx=15284164, updated=stamp)
+        f['interfaces'][0].update(name='ens5', created=dict(timestamp=1793626701))
+        for missing in (False, True):
+            current = copy.deepcopy(f)
+            if missing:
+                current['interfaces'][0]['traffic']['day'] = []
+            with self.subTest(missing=missing), self.assertRaises(b.StatsNotReady) as raised:
+                b.parse_stats(json.dumps(current), 'ens5', SETTINGS, stamp+1)
+            self.assertIn('首日统计尚未完整', str(raised.exception))
+            self.assertIn('无需操作', str(raised.exception))
+            self.assertNotIn('统计异常', str(raised.exception))
+
+    def test_first_day_does_not_hide_stale_future_or_negative_statistics(self):
+        for change in ('stale', 'future', 'negative'):
+            f = fixture()
+            i = f['interfaces'][0]
+            i['created'] = dict(timestamp=NOW-10)
+            if change == 'stale': i['updated']['timestamp'] = NOW-421
+            if change == 'future': i['updated']['timestamp'] = NOW+1
+            if change == 'negative': i['traffic']['day'][0]['rx'] = -1
+            with self.subTest(change=change), self.assertRaises(b.Error) as raised:
+                b.parse_stats(json.dumps(f), 'eth0', SETTINGS, NOW)
+            self.assertNotIsInstance(raised.exception, b.StatsNotReady)
+
+    def test_invalid_history_date_or_counter_is_not_normal_waiting(self):
+        for field, value in (('month', 13), ('day', 32), ('rx', -1)):
+            f = fixture()
+            row = f['interfaces'][0]['traffic']['day'][0]
+            if field == 'rx':
+                row[field] = value
+                row['date']['day'] = 1
+            else:
+                row['date'][field] = value
+            with self.subTest(field=field), self.assertRaises(b.Error) as raised:
+                b.parse_stats(json.dumps(f), 'eth0', SETTINGS, NOW)
+            self.assertNotIsInstance(raised.exception, b.StatsNotReady)
+
+    def test_normal_initial_statistics_wait_is_logged_as_info_and_spends_nothing(self):
+        s = dict(copy.deepcopy(self.s), mode='running')
+        with patch.object(b, 'locked', contextlib.nullcontext), \
+             patch.object(b, 'load_json', side_effect=[self.c, s]), patch.object(b, 'atomic_json'), \
+             patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', side_effect=b.StatsNotReady('首日统计等待，无需操作')), \
+             patch.object(b.STOP, 'wait', return_value=True), patch.object(b, 'download') as download, \
+             self.assertLogs(b.logger, level='INFO') as logs:
+            b.daemon()
+        self.assertTrue(all(record.levelno == b.logging.INFO for record in logs.records))
+        self.assertEqual((s['used'], s['attempts']), (self.s['used'], self.s['attempts']))
+        download.assert_not_called()
+
     def test_utc_date_and_local_date(self):
         self.assertEqual(b.date_now(SETTINGS, NOW), '2026-11-02')
         stamp = NOW-13*3600
@@ -990,8 +1042,37 @@ class UserInterfaceTests(unittest.TestCase):
         self.assertIn('后台尚未运行', text)
         self.assertIn('超过目标', text)
         self.assertIn('剩余 9.98 GiB', text)
-        self.assertIn('暂无，任务恢复运行后', text)
+        self.assertIn('下次检查：—', text)
         self.assertNotIn('ActiveState=', text)
+
+    def test_compact_status_does_not_repeat_initial_wait_or_dump_logs(self):
+        b.atomic_json(b.CONFIG, config())
+        b.atomic_json(b.STATE, dict(b.initial_state(), mode='running', reason='旧的首日等待原因'))
+        with patch.object(b, 'run', return_value='active'), patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', side_effect=b.StatsNotReady('详细的首日等待原因', '首日统计不完整，暂不补量')), \
+             patch.object(b, 'recent_logs') as logs:
+            b.status()
+        text = self.out.getvalue()
+        self.assertEqual(text.count('首日'), 1)
+        self.assertNotIn('旧的', text)
+        self.assertLessEqual(len(text.strip().splitlines()), 6)
+        logs.assert_not_called()
+
+    def test_zero_and_legacy_seven_exit_without_changing_task(self):
+        for value in ('0', '7'):
+            with patch('builtins.input', return_value=value) as prompt, patch.object(b, 'control') as control:
+                b.menu()
+            self.assertIn('0 退出', prompt.call_args.args[0])
+            control.assert_not_called()
+
+    def test_logs_and_details_are_explicit_choices_after_status(self):
+        b.atomic_json(b.STATE, b.initial_state())
+        for choice in ('', '1', '2'):
+            with patch('builtins.input', side_effect=['5', choice, '0']), patch.object(b, 'status'), \
+                 patch.object(b, 'recent_logs') as logs, patch.object(b, 'diagnostics') as diagnostics:
+                b.menu()
+            self.assertEqual(logs.call_count, int(choice == '1'))
+            self.assertEqual(diagnostics.call_count, int(choice == '2'))
 
     def test_status_and_diagnostics_remain_available_for_corrupt_state(self):
         b.atomic_json(b.CONFIG, config())
@@ -1084,6 +1165,58 @@ class UserInterfaceTests(unittest.TestCase):
             with self.assertRaisesRegex(b.Error, '任务已运行'):
                 b.start_task()
         configure.assert_not_called()
+
+
+class InstallationFeedbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        paths = dict(BASE=root/'data', CONFIG=root/'data'/'config.json', STATE=root/'data'/'state.json',
+                     SCRIPT=root/'program', UNIT=root/'task.service')
+        for key, value in paths.items():
+            patcher = patch.object(b, key, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(b, 'locked', contextlib.nullcontext)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_ready_dependencies_skip_apt_and_still_show_installation_stage(self):
+        with patch.object(b, 'missing_packages', return_value=[]), patch.object(b, 'run') as run, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            b.install()
+        self.assertFalse(any(call.args[0] == 'apt-get' for call in run.call_args_list))
+        self.assertIn('跳过 APT 下载', output.getvalue())
+        self.assertIn('正在启用 vnStat', output.getvalue())
+        self.assertTrue(b.SCRIPT.exists())
+
+    def test_missing_packages_install_with_live_output(self):
+        with patch.object(b, 'missing_packages', return_value=['vnstat']), patch.object(b, 'run') as run, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            b.install()
+        self.assertIn(unittest.mock.call('apt-get', 'update', timeout=300, live=True), run.call_args_list)
+        self.assertIn(unittest.mock.call('apt-get', 'install', '-y', 'vnstat', timeout=300, live=True), run.call_args_list)
+        self.assertIn('下面显示实时进度', output.getvalue())
+
+    def test_dependency_failure_does_not_save_or_start_task(self):
+        with patch.object(b, 'missing_packages', return_value=['vnstat']), \
+             patch.object(b, 'run', side_effect=b.Error('APT timeout')), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(b.Error):
+                b.install()
+        self.assertFalse(b.STATE.exists())
+        self.assertFalse(b.SCRIPT.exists())
+        self.assertFalse(b.CONFIG.exists())
+
+    def test_live_command_output_is_not_captured_and_failure_is_not_hidden(self):
+        failed = b.subprocess.CompletedProcess(['apt-get'], 1, stdout=None, stderr=None)
+        with patch.object(b.subprocess, 'run', return_value=failed) as run:
+            with self.assertRaisesRegex(b.Error, '请查看上方命令输出'):
+                b.run('apt-get', 'update', live=True)
+        self.assertIsNone(run.call_args.kwargs['stdout'])
+        self.assertIsNone(run.call_args.kwargs['stderr'])
+        self.assertEqual(run.call_args.kwargs['env']['DEBIAN_FRONTEND'], 'noninteractive')
 
 
 class ShortcutTests(unittest.TestCase):
