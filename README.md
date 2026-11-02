@@ -18,6 +18,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.s
 
 运行后，输入 `vt` 即可唤出主菜单。
 
+每日流量调节器独立安装，使用 root 执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/tb.sh)
+```
+
+选 **2 启动任务**，填写服务器带宽并确认保存。保存配置后使用短命令 **`tb`** 调起菜单，也保留 `traffic-balance`。不接入 `vt`；安装、参数及验证边界见 [流量调节手册](TRAFFIC_BALANCE_DOC.md)。精简系统缺少 curl 时先运行 `apt-get update && apt-get install -y curl ca-certificates`。
+
 首次选择 Snell、sing-box 或 FW 时，会下载缺少的管理脚本，并在进入模块菜单前自动安装缺少的核心，无需再次选择安装；已有核心时直接进入菜单，不自动更新。核心安装失败会停止本次进入并显示错误，可再次选择模块重试。PM 没有独立核心，启动时自动安装依赖并初始化。直接运行 `snell`、`sb`、`fw` 也采用相同的首次安装流程。
 
 首版基线：`vt v1.0.0`；配套 Snell `v1.0.0`、sing-box 管理脚本 `v1.0.0`、PM `v1.0.0`、FW `v1.0.0`。自有管理脚本与 Worker 统一从 `v1.0.0` 起算，辅助脚本 `init.sh`、`network_audit.sh` 也使用该版本标识；第三方核心版本沿用各组件的版本策略。
@@ -45,6 +53,7 @@ PM 新安装直接生成当前完整配置，不再执行历史配置或端口�
 | 脚本 | 功能 | 快捷命令 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **[vt.sh](vt.sh)** | **总控工具箱** | `vt` | 统一管理入口，查看组件状态，一键清理环境。 |
+| **[traffic_balance.py](TRAFFIC_BALANCE_DOC.md)** | **每日流量调节** | `tb` / `traffic-balance` | 通过 [tb.sh](tb.sh) 下载进入；独立脚本，按 vnStat 当天比例限额补下载，Debian/Ubuntu + systemd，不由 `vt` 管理。 |
 | **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**固定突发限速**、分级 IP 接入告警、用户到期提醒、Telegram 通知。 |
 | **[snell.sh](SNELL_DOC.md)** | **Snell 管理** | `snell` | 专为 Snell 协议设计，支持 **Systemd 模板化多实例**。 |
 | **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 独立脚本，不再由 `vt` 调度或统一卸载。 |

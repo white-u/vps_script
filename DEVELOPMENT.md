@@ -27,6 +27,7 @@ Shell 语法检查同样应使用 Bash 4+。不要以 root 在开发机直接执
 | 范围 | 测试文件 | 重点 |
 | --- | --- | --- |
 | 工具箱菜单、下载、统一卸载 | `test_vt.py`、`test_vt_cleanup.py`、`test_downloads.py`、`test_module_startup.py` | EOF、子进程失败、残留保护、重试、脚本候选校验、模块首次自动安装与命令行隔离 |
+| 每日流量调节 | `test_traffic_balance.py`、`test_traffic_balance_cleanup.py`、`test_traffic_balance_bootstrap.py` | HTTPS 下载入口/短命令、自动网卡、直接启动向导与旧配置转换、新鲜统计、预检/每3秒保护、双向带宽边界、共享时限与部分结算、达标停止、隔离清理、统计屏障、跨日/损坏/暂停恢复、单实例、限流及本地真实 curl |
 | PM | `test_pm.py`、`test_user_flows.py`、`test_performance.py` | 格式拒绝、计数基线、规则恢复、分组编辑、告警重试、批量查询 |
 | Realm / FW | `test_fw.py` | 规则校验、监听、事务回滚、中断与卸载 |
 | Snell | `test_snell.py` | 版本发现、多实例迁移、回滚、客户端导出 |
@@ -46,9 +47,12 @@ SSH 生效配置测试额外需要 `sshd`、`ssh-keygen`；DNS 超时测试需�
 ```bash
 python3 tests/integration_pm.py
 python3 tests/integration_fw.py
+python3 tests/integration_traffic_balance.py
 ```
 
 PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计数、分类映射、规则恢复、锁与 Cron。FW 下载并校验 Realm，使用独立目录、唯一 systemd 服务和回环地址验证 TCP/UDP 转发及交互流程。两者清理自身资源，清理失败应保留恢复线索并停止进一步破坏。
+
+每日补量集成需要 `vnstat`、`vnstatd`、curl、Python、systemd 和网络空间/veth 权限。使用私有数据库、唯一服务和隔离网卡；默认只跑私有流量，不访问公网，测试服务只依赖私有 vnStat 单元，不启动生产 vnStat。可选 `--public-interface ens3` 以 1 Mbps 对三家各测最多 1 MiB，遇限流立即结束公网部分、不切源绕过。已有子网冲突时拒绝创建网络；停服、禁用、归属核查失败时保留资源并报恢复目录。可用解包到独立目录的 vnStat 包，通过 PATH 指定工具，避免安装全局服务。
 
 这些测试不等于公网吞吐、云安全组、真实 Telegram / D1 或完整发行验收。SSH 的真实新连接确认也不能用静态解析测试代替。完整边界见 [README 回归测试](README.md#回归测试)。
 

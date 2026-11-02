@@ -4,9 +4,9 @@
 
 ## 运行模型
 
-本项目没有常驻 Web 面板，也没有统一的配置数据库。各 Bash 管理脚本独立安装、生成服务配置并管理自己的文件。`vt` 是交互调度入口：首次下载缺少的组件脚本，校验后执行，展示状态并提供统一卸载。Snell、sing-box、FW 在交互入口自动安装缺少的核心，成功后显示菜单；已有核心不自动更新，安装失败停止本次进入。PM 没有独立核心，沿用启动时的依赖安装和初始化。
+本项目没有常驻 Web 面板，也没有统一的配置数据库。各管理脚本独立安装、生成服务配置并管理自己的文件。`vt` 是交互调度入口：首次下载缺少的组件脚本，校验后执行，展示状态并提供统一卸载。Snell、sing-box、FW 在交互入口自动安装缺少的核心，成功后显示菜单；已有核心不自动更新，安装失败停止本次进入。PM 没有独立核心，沿用启动时的依赖安装和初始化。
 
-`vt` 调度 Snell、sing-box、PM、FW。`x-sb.sh`、`init.sh`、`network_audit.sh` 独立运行，不属于工具箱统一管理与卸载范围。不要直接 source 管理脚本做库调用：脚本包含安装、检查及菜单入口。
+`vt` 调度 Snell、sing-box、PM、FW。`x-sb.sh`、`init.sh`、`network_audit.sh`、`traffic_balance.py` 独立运行，不属于工具箱统一管理与卸载范围。不要直接 source 管理脚本做库调用：脚本包含安装、检查及菜单入口。
 
 典型流程是先初始化 VPS，再按需安装代理或转发服务；PM 可扫描已有服务，也可手动指定端口监控。PM 的云端推送是可选能力，未部署 Worker 不影响本地配额管理。
 
@@ -20,6 +20,7 @@
 | [x-sb.sh](x-sb.sh) | 独立 Xray 节点和链式代理 | `/usr/local/etc/xray/`、`/usr/local/share/xray/`、`xray.service` |
 | [fw.sh](fw.sh) | Realm 转发、规则元数据、监听检查、失败恢复 | `/etc/realm/config.toml`、`/etc/realm/fw.json`、`realm.service` |
 | [pm.sh](pm.sh) | 端口计数、配额、分组、TC、Cron、通知和推送 | `/etc/port_monitor/`、`/var/log/port_monitor.log` |
+| [traffic_balance.py](traffic_balance.py) / [tb.sh](tb.sh) | HTTPS 下载入口、短命令 tb、vnStat 每日比例、限额补下载、保护及恢复 | `/etc/traffic-balance/`、`traffic-balance.service`、`/var/log/traffic-balance.log` |
 | [worker.js](worker.js) | 签名接收、Telegram 查询授权和写操作去重 | Cloudflare D1：`nodes`、`users`、`telegram_updates` |
 | [init.sh](init.sh) | APT、时区和校时、地址优先级、BBR、SSH 事务 | `/etc/gai.conf`、`/etc/sysctl.d/99-vps-init-bbr.conf`、SSH 配置与备份 |
 | [network_audit.sh](network_audit.sh) | 地址查询、延迟和大包检测、iperf3 双向带宽与重传、回程命令 | 交互诊断脚本；下载外部工具前校验输入和脚本 |

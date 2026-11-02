@@ -11,6 +11,7 @@
 | sing-box 节点、路由、Alpine 支持 | [sing-box 手册](SB_DOC.md) | [sb.sh](sb.sh) |
 | 独立 Xray 与链式代理 | [Xray 手册](X-SB_DOC.md) | [x-sb.sh](x-sb.sh) |
 | 端口流量、配额、突发限速、接入与到期告警 | [PM 手册](PM_DOC.md) | [pm.sh](pm.sh) |
+| 每日入站/出站比例、限额补下载 | [流量调节手册](TRAFFIC_BALANCE_DOC.md) | [traffic_balance.py](traffic_balance.py) |
 | TCP/UDP 转发、连通性与回滚 | [FW 手册](FW_DOC.md) | [fw.sh](fw.sh) |
 | Cloudflare D1、Worker、Telegram 权限 | [中控部署](部署教程.md) | [worker.js](worker.js) |
 | 初始化、时间、BBR、SSH 安全边界 | [README 中的初始化说明](README.md) | [init.sh](init.sh) |
