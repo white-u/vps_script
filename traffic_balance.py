@@ -44,7 +44,7 @@ START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
 ROUND_SECONDS = 300
-DEFAULT = dict(version=3, interface='', ratio=2.1,
+DEFAULT = dict(version=4, interface='', ratio=2.1,
                daily_mib=10240, interval_min=20, interval_max=60, speed_mbps=80,
                max_attempts=100, round_mib=512, min_tx_mib=200,
                bandwidth_mbps=0, download_percent=40, load_per_cpu=0.8)
@@ -152,32 +152,21 @@ def number(value, low, high, name, integer=False):
     return value
 
 
-def validate_config(c, legacy=False):
+def validate_config(c):
     version = c.get('version')
-    if not legacy and version in (1, 2):
-        raise Error('旧版配置需要确认新设置；请选 1「配置任务」或 2「启动任务」进入向导，当天额度保留')
-    keys = set(DEFAULT)
-    if legacy:
-        keys = (keys-{'download_percent'}) | {'bandwidth_percent'}
-        if version == 1:
-            keys = (keys-{'ratio'}) | {'ratio_low', 'ratio_high'}
-    if set(c) != keys or version not in ((1, 2) if legacy else (3,)):
-        raise Error('配置字段缺失或版本不支持；未使用默认值补齐，请检查 config.json')
+    if version in (1, 2, 3):
+        raise Error('检测到旧版配置，请先选 6 卸载，再重新运行安装入口')
+    if set(c) != set(DEFAULT) or version != DEFAULT['version']:
+        raise Error('配置字段缺失或版本不支持，请检查 config.json')
     if not isinstance(c['interface'], str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}', c['interface']):
         raise Error('自动识别的公网网卡名称无效；请重新配置并检查服务器网络')
-    if legacy and version == 1:
-        number(c['ratio_low'], .01, 1000, '旧比例下限')
-        number(c['ratio_high'], .01, 1000, '旧比例上限')
-        if c['ratio_low'] >= c['ratio_high']:
-            raise Error('旧配置比例区间无效；请检查 config.json')
-    else:
-        number(c['ratio'], 2, 5, '出站:入站目标比例')
+    number(c['ratio'], 2, 5, '入站:出站目标比例')
     for key, lo, hi, integer in [
         ('daily_mib', 1, 1048576, False), ('interval_min', 1, 1440, True),
         ('interval_max', 1, 1440, True), ('speed_mbps', .001, 10000, False),
         ('max_attempts', 1, 10000, True), ('round_mib', .001, 102400, False),
-        ('min_tx_mib', 0, 1048576, False), ('bandwidth_mbps', 0 if legacy and version == 1 else .001, 1000000, False),
-        ('bandwidth_percent' if legacy else 'download_percent', 1, 100, False),
+        ('min_tx_mib', 0, 1048576, False), ('bandwidth_mbps', .001, 1000000, False),
+        ('download_percent', 1, 100, False),
         ('load_per_cpu', .01, 100, False),
     ]:
         number(c[key], lo, hi, key, integer)
@@ -193,14 +182,7 @@ def config_for_edit():
             if state['date'] or state['last'] or state['pending']:
                 raise Error('配置文件丢失但已有流量账本；拒绝重新识别并覆盖配置，请先停止任务并恢复可信 config.json，额度未清零')
         return DEFAULT.copy()
-    old = load_json(CONFIG)
-    if old.get('version') not in (1, 2):
-        return validate_config(old)
-    validate_config(old, legacy=True)
-    if old['version'] == 1:
-        print(f"旧设置使用入站/出站区间 {old['ratio_low']:g}～{old['ratio_high']:g}，请确认新的出站:入站目标。")
-    print('新版补下载带宽占比默认 40%，总带宽保护线固定 80%；请核对汇总，保存前不转换，当天额度和次数保留。')
-    return dict(DEFAULT, **{k: v for k, v in old.items() if k in DEFAULT and k != 'version'})
+    return validate_config(load_json(CONFIG))
 
 
 def initial_state():
@@ -370,8 +352,13 @@ def recover(s):
         logger.warning(s['reason'])
 
 
+def required_inbound(c, tx):
+    numerator, denominator = decimal.Decimal(str(c['ratio'])).as_integer_ratio()
+    return (tx * numerator + denominator - 1) // denominator
+
+
 def target_reached(c, rx, tx):
-    return decimal.Decimal(rx)*decimal.Decimal(str(c['ratio'])) >= tx
+    return rx >= required_inbound(c, tx)
 
 
 def plan(c, s, v):
@@ -383,11 +370,10 @@ def plan(c, s, v):
         return 0, '已达每日额度或次数限制，等待下一统计日'
     if v['tx'] < c['min_tx_mib'] * MIB or v['tx'] == 0:
         return 0, '出站流量未达到起补门槛'
-    if target_reached(c, v['rx'], v['tx']):
-        return 0, '出站/入站比例未超过目标，无需补量'
-    required_rx = (decimal.Decimal(v['tx'])/decimal.Decimal(str(c['ratio']))).to_integral_value(
-        rounding=decimal.ROUND_CEILING)
-    amount = min(int(required_rx)-v['rx'], int(c['round_mib'] * MIB),
+    gap = required_inbound(c, v['tx']) - v['rx']
+    if gap <= 0:
+        return 0, '入站/出站比例已达标，无需补量'
+    amount = min(gap, int(c['round_mib'] * MIB),
                  int(c['daily_mib'] * MIB) - s['used'])
     return amount, '准备按比例缺口补量'
 
@@ -940,9 +926,9 @@ def ask_ratio(default):
     def parse(text):
         match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(?:[:：]\s*1)?', text.strip())
         if not match:
-            raise Error('请输入 2～5 之间的出站/入站比例，例如 2.1 或 2.1:1')
-        return number(float(match[1]), 2, 5, '出站/入站比例')
-    return ask_valid('目标比例（出站:入站，2～5）', f'{default:g}:1', parse)
+            raise Error('请输入 2～5 之间的入站/出站比例，例如 2.1 或 2.1:1')
+        return number(float(match[1]), 2, 5, '入站/出站比例')
+    return ask_valid('目标比例（入站:出站，2～5）', f'{default:g}:1', parse)
 
 
 def detect_interface():
@@ -1002,7 +988,7 @@ def format_amount(amount):
 
 def config_summary(c, start_after=False):
     print('\n确认设置：')
-    print(f"  出站:入站 {c['ratio']:g}:1；服务器带宽 {c['bandwidth_mbps']:g} Mbps")
+    print(f"  入站:出站 {c['ratio']:g}:1；服务器带宽 {c['bandwidth_mbps']:g} Mbps")
     print(f"  每日 {format_amount(c['daily_mib']*MIB)}；每轮 {format_amount(c['round_mib']*MIB)}；每日 {c['max_attempts']} 次")
     print(f"  检查 {c['interval_min']}～{c['interval_max']} 分钟；实际限速 {effective_speed(c):g} Mbps（用户上限 {c['speed_mbps']:g}，带宽占比 {c['download_percent']:g}%）")
     print(f"  起补出站 {format_amount(c['min_tx_mib']*MIB)}；每核负载阈值 {c['load_per_cpu']:g}")
@@ -1086,17 +1072,13 @@ def configure(start_after=False):
 
 def start_task():
     if CONFIG.exists():
-        c = load_json(CONFIG)
-        if c.get('version') == DEFAULT['version']:
-            control('running')
-            return
-        # Only a fully valid old configuration can enter the conversion wizard.
-        validate_config(c, legacy=True)
+        control('running')
+        return
     if STATE.exists():
         s = validate_state(load_json(STATE))
         if s['mode'] == 'running' and run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() == 'active':
             raise Error('任务已运行；阻止重复启动，无需操作')
-    print('首次使用或旧配置需要确认设置；完成向导后可直接保存并启动。')
+    print('首次使用请完成配置，确认保存后启动。')
     configure(start_after=True)
 
 
@@ -1146,7 +1128,7 @@ def diagnostics():
     print('\n详细运行检查：')
     try:
         c = validate_config(load_json(CONFIG))
-        print(f"网卡 {c['interface']}；目标出站:入站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
+        print(f"网卡 {c['interface']}；目标入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
         print(f"固定保护：CPU {CPU_LIMIT}%，启动占用低于 {START_BANDWIDTH_PERCENT}%，带宽 {BANDWIDTH_LIMIT_PERCENT}%；每核负载 {c['load_per_cpu']:g}")
         print('预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，单轮最多 5 分钟。')
     except Error as e:
@@ -1189,15 +1171,15 @@ def status():
     else:
         label = '后台尚未运行，请查看详细检查' if active else '后台状态待确认'
     print(f'状态：{label}')
-    print(f"目标：出站:入站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
+    print(f"目标：入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
     stats_issue = False
     try:
         _, v = stats(c, vn_settings())
-        ratio = f"{v['tx']/v['rx']:.3f}:1" if v['rx'] else '暂无入站'
+        ratio = f"{v['rx']/v['tx']:.3f}:1" if v['tx'] else '暂无出站'
         if v['tx'] < c['min_tx_mib']*MIB or not v['tx']:
             meaning = '未到起补门槛'
         else:
-            meaning = '无需补量' if target_reached(c, v['rx'], v['tx']) else '超过目标，待补量'
+            meaning = '已达标，无需补量' if target_reached(c, v['rx'], v['tx']) else '低于目标，待补量'
         print(f"今日：入站 {format_amount(v['rx'])}，出站 {format_amount(v['tx'])}；比例 {ratio}（{meaning}）")
     except StatsNotReady as e:
         stats_issue = True
@@ -1225,14 +1207,25 @@ def uninstall():
     if ask('卸载将删除本任务配置、额度状态和日志；保留 vnStat 及其数据库。输入 DELETE 确认') != 'DELETE':
         print('未卸载，任务状态保持。')
         return False
-    run('systemctl', 'disable', '--now', SERVICE)
+    service_state = run('systemctl', 'show', SERVICE, '-p', 'LoadState', '-p', 'ActiveState').splitlines()
+    if UNIT.exists() or not {'LoadState=not-found', 'ActiveState=inactive'}.issubset(service_state):
+        run('systemctl', 'disable', '--now', SERVICE)
     with locked():
+        active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
+        if active not in ('inactive', 'failed'):
+            raise Error('无法确认服务已停止，请检查服务状态后重试卸载')
         if owns_shortcut():
             SHORTCUT.unlink()
         for path in (CONFIG, STATE, SCRIPT, UNIT, LOG, Path(str(LOG) + '.1'), Path(str(LOG) + '.2')):
             path.unlink(missing_ok=True)
+        for path in Path(HEADER_DIR).glob('traffic-balance-header-*'):
+            if path.is_file() or path.is_symlink():
+                path.unlink(missing_ok=True)
         if BASE.exists():
-            BASE.rmdir()
+            if any(BASE.iterdir()):
+                print(f'配置目录 {BASE} 有其他文件，已保留目录。')
+            else:
+                BASE.rmdir()
     run('systemctl', 'daemon-reload')
     print('已卸载本任务；vnStat 及其数据库保留。')
     return True

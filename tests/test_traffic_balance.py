@@ -27,7 +27,7 @@ def config(**kw):
     return dict(dict(b.DEFAULT, interface='eth0', bandwidth_mbps=20), **kw)
 
 
-def fixture(rx=100*b.MIB, tx=840*b.MIB, updated=NOW):
+def fixture(rx=120*b.MIB, tx=200*b.MIB, updated=NOW):
     return dict(jsonversion='2', vnstatversion='2.13', interfaces=[dict(
         name='eth0', created=dict(timestamp=NOW-2*86400), updated=dict(timestamp=updated),
         traffic=dict(total=dict(rx=rx+1000, tx=tx+1000), day=[dict(
@@ -66,9 +66,9 @@ class AccountingTests(unittest.TestCase):
 
     def test_gap_bounds_daily_and_attempt_limits(self):
         self.assertEqual(b.plan(self.c, self.s, self.v)[0], 300*b.MIB)
-        v = dict(self.v, rx=359*b.MIB, tx=840*b.MIB)
+        v = dict(self.v, rx=379*b.MIB, tx=200*b.MIB)
         self.assertEqual(b.plan(dict(self.c, round_mib=100), self.s, v)[0], 41*b.MIB)
-        for v in (dict(self.v, rx=400*b.MIB), dict(self.v, rx=500*b.MIB),
+        for v in (dict(self.v, rx=420*b.MIB), dict(self.v, rx=500*b.MIB),
                   dict(self.v, tx=199*b.MIB), dict(self.v, tx=0)):
             self.assertEqual(b.plan(self.c, self.s, v)[0], 0)
         self.s['used'] = 10239*b.MIB
@@ -76,24 +76,24 @@ class AccountingTests(unittest.TestCase):
         self.s['attempts'] = 100
         self.assertEqual(b.plan(self.c, self.s, self.v)[0], 0)
 
-    def test_outbound_inbound_direction_decimals_and_last_byte(self):
-        # 2.1 GiB out / 1 GiB in is already enough; 1:1 needs no download.
-        for rx, tx in ((10*b.MIB, 21*b.MIB), (5*1024*b.MIB, 5*1024*b.MIB)):
+    def test_inbound_outbound_direction_decimals_and_last_byte(self):
+        # Exact and above-target inbound ratios need no download.
+        for rx, tx in ((21*b.MIB, 10*b.MIB), (22*b.MIB, 10*b.MIB)):
             self.assertTrue(b.target_reached(self.c, rx, tx))
             self.assertEqual(b.plan(dict(self.c, min_tx_mib=0), self.s,
                                     dict(self.v, rx=rx, tx=tx))[0], 0)
         c = dict(self.c, min_tx_mib=0)
-        v = dict(self.v, rx=95, tx=201)
+        v = dict(self.v, rx=422, tx=201)
         self.assertEqual(b.plan(c, self.s, v)[0], 1)
-        self.assertFalse(b.target_reached(c, 95, 201))
-        self.assertTrue(b.target_reached(c, 96, 201))
+        self.assertFalse(b.target_reached(c, 422, 201))
+        self.assertTrue(b.target_reached(c, 423, 201))
         self.assertGreater(b.plan(self.c, self.s, dict(self.v, rx=0))[0], 0)
 
     def test_large_daily_budget_still_stops_after_real_gap_is_filled(self):
         s = b.initial_state()
         c = dict(self.c, ratio=2)
-        v = dict(self.v, rx=1024*b.MIB, tx=4096*b.MIB,
-                 total_rx=2048*b.MIB, total_tx=8192*b.MIB)
+        v = dict(self.v, rx=1024*b.MIB, tx=1024*b.MIB,
+                 total_rx=2048*b.MIB, total_tx=2048*b.MIB)
         b.observe(s, self.day, v)
         # Only 1 GiB is needed for a 2:1 target, even though the budget is 10 GiB.
         for _ in range(2):
@@ -110,11 +110,18 @@ class AccountingTests(unittest.TestCase):
         self.assertIn('无需补量', reason)
         self.assertEqual((s['used'], s['attempts']), (1024*b.MIB, 2))
 
+    def test_reported_near_equal_traffic_needs_inbound_download(self):
+        # User's example: 591.81 MiB received, 613.64 MiB sent.
+        v = dict(self.v, rx=59181*b.MIB//100, tx=61364*b.MIB//100)
+        self.assertEqual(b.plan(self.c, self.s, v)[0], 512*b.MIB)
+        self.assertAlmostEqual((b.required_inbound(self.c, v['tx']) - v['rx']) / b.MIB,
+                               696.834, places=3)
+
     def test_multiple_rounds_stop_at_target_without_using_entire_daily_budget(self):
         s = b.initial_state()
         c = dict(self.c, ratio=2)
-        v = dict(self.v, rx=5*1024*b.MIB, tx=18*1024*b.MIB,
-                 total_rx=6*1024*b.MIB, total_tx=20*1024*b.MIB)
+        v = dict(self.v, rx=5*1024*b.MIB, tx=4608*b.MIB,
+                 total_rx=6*1024*b.MIB, total_tx=5*1024*b.MIB)
         b.observe(s, self.day, v)
         for _ in range(8):
             amount, _ = b.plan(c, s, v)
@@ -127,20 +134,20 @@ class AccountingTests(unittest.TestCase):
             b.observe(s, self.day, v)
         self.assertEqual(b.plan(c, s, v)[0], 0)
         self.assertEqual((s['used'], s['attempts']), (4*1024*b.MIB, 8))
-        self.assertEqual(v['rx']*2, v['tx'])
+        self.assertEqual(v['rx'], v['tx']*2)
 
     def test_large_gap_is_capped_per_round_but_small_gap_is_not_padded(self):
         large = dict(self.v, rx=1024*b.MIB, tx=10*1024*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, large)[0], 512*b.MIB)
-        near = dict(self.v, rx=1790*b.MIB, tx=4200*b.MIB)
+        near = dict(self.v, rx=1890*b.MIB, tx=1000*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, near)[0], 210*b.MIB)
-        # Reaching the single outbound/inbound target stops future rounds.
-        self.assertEqual(b.plan(self.c, self.s, dict(near, rx=2000*b.MIB))[0], 0)
+        # Reaching the inbound/outbound target stops future rounds.
+        self.assertEqual(b.plan(self.c, self.s, dict(near, rx=2100*b.MIB))[0], 0)
 
     def test_in_range_daemon_does_not_request_a_download_or_spend_budget(self):
         s = copy.deepcopy(self.s)
         s['mode'] = 'running'
-        v = dict(self.v, rx=400*b.MIB, total_rx=self.v['total_rx']+300*b.MIB)
+        v = dict(self.v, rx=420*b.MIB, total_rx=self.v['total_rx']+300*b.MIB)
         def scheduled(_c, state, reason=None):
             state['next_check'] = 0
             if reason: state['reason'] = reason
@@ -509,7 +516,7 @@ class AccountingTests(unittest.TestCase):
                 self.assertEqual(s['attempts'], 0)
 
     def test_preflight_stops_if_business_rx_already_reaches_lower_bound(self):
-        self.s['last'] = dict(self.v, rx=399*b.MIB)
+        self.s['last'] = dict(self.v, rx=419*b.MIB)
         with patch.object(b, 'preflight', return_value=SimpleNamespace(received=2*b.MIB)), \
              patch.object(b, 'download') as dl:
             b.round_download(self.c, self.s, 41*b.MIB, SETTINGS, b.date_now(SETTINGS), lambda *_: None)
@@ -518,7 +525,7 @@ class AccountingTests(unittest.TestCase):
         self.assertIn('比例达标', self.s['reason'])
 
     def test_partial_failed_download_does_not_switch_sources_after_recovery(self):
-        self.s['last'] = dict(self.v, rx=399*b.MIB)
+        self.s['last'] = dict(self.v, rx=419*b.MIB)
         with patch.object(b, 'download', return_value=(2*b.MIB, False, 0, '下载失败')) as dl:
             b.round_download(self.c, self.s, 41*b.MIB, SETTINGS, b.date_now(SETTINGS), lambda *_: None)
         self.assertEqual(dl.call_count, 1)
@@ -872,44 +879,19 @@ class UserInterfaceTests(unittest.TestCase):
         with self.assertRaises(b.Error):
             b.validate_config(config(bandwidth_mbps=0))
 
-    def legacy_config(self, bandwidth=30):
-        c = config(bandwidth_mbps=bandwidth)
-        c.pop('ratio')
-        c.pop('download_percent')
-        c['bandwidth_percent'] = 70
-        c.update(version=1, ratio_low=1.8, ratio_high=2.2)
-        return c
-
-    def test_legacy_ratio_is_only_converted_after_confirmation_and_keeps_accounting(self):
-        b.atomic_json(b.CONFIG, self.legacy_config())
-        s = b.initial_state()
-        day, v = sample()
-        b.observe(s, day, v)
-        s.update(used=1234, attempts=3)
-        b.atomic_json(b.STATE, s)
-        b.UNIT.write_text('existing service')
-        with self.assertRaisesRegex(b.Error, '旧版配置'):
-            b.validate_config(b.load_json(b.CONFIG))
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'run'), \
-             patch.object(b, 'ensure_interface'), patch.object(b, 'locked', contextlib.nullcontext), \
-             patch('builtins.input', side_effect=['']*7):
-            b.configure()
-        c = b.validate_config(b.load_json(b.CONFIG))
-        self.assertEqual((c['version'], c['ratio'], c['bandwidth_mbps']), (3, 2.1, 30))
-        saved = b.load_json(b.STATE)
-        self.assertEqual((saved['used'], saved['attempts'], saved['date']), (1234, 3, '2026-11-02'))
-        self.assertNotIn('ratio_low', c)
-
-    def test_legacy_unset_bandwidth_and_cancel_leave_original_files(self):
-        b.atomic_json(b.CONFIG, self.legacy_config(bandwidth=0))
-        b.atomic_json(b.STATE, b.initial_state())
-        before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'run') as run, \
-             patch('builtins.input', side_effect=['', '', '0', 'q']):
-            with self.assertRaises(b.Cancelled):
-                b.configure()
-        self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
-        run.assert_not_called()
+    def test_old_configs_require_uninstall_before_configuring_or_starting(self):
+        for version in (1, 2, 3):
+            with self.subTest(version=version):
+                b.atomic_json(b.CONFIG, config(version=version))
+                b.atomic_json(b.STATE, b.initial_state())
+                before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
+                with patch.object(b, 'run') as run, patch.object(b, 'detect_interface') as detect:
+                    for action in (b.configure, b.start_task):
+                        with self.assertRaisesRegex(b.Error, '选 6 卸载'):
+                            action()
+                run.assert_not_called()
+                detect.assert_not_called()
+                self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
 
     def test_detection_failure_never_installs_or_stops_existing_task(self):
         with patch.object(b, 'detect_interface', side_effect=b.Error('没有唯一出口')), \
@@ -937,12 +919,6 @@ class UserInterfaceTests(unittest.TestCase):
         register.assert_not_called()
         self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
 
-    def test_corrupt_legacy_config_cannot_be_migrated_using_defaults(self):
-        old = self.legacy_config()
-        old.pop('daily_mib')
-        b.atomic_json(b.CONFIG, old)
-        with self.assertRaises(b.Error):
-            b.config_for_edit()
 
     def test_missing_config_with_existing_accounting_cannot_switch_interface(self):
         s = b.initial_state()
@@ -1040,7 +1016,7 @@ class UserInterfaceTests(unittest.TestCase):
             b.status()
         text = self.out.getvalue()
         self.assertIn('后台尚未运行', text)
-        self.assertIn('超过目标', text)
+        self.assertIn('低于目标', text)
         self.assertIn('剩余 9.98 GiB', text)
         self.assertIn('下次检查：—', text)
         self.assertNotIn('ActiveState=', text)
@@ -1141,30 +1117,14 @@ class UserInterfaceTests(unittest.TestCase):
     def test_direct_start_corrupt_config_or_state_never_uses_defaults(self):
         for target in (b.CONFIG, b.STATE):
             target.write_text('{broken')
-            with patch.object(b, 'configure') as configure, patch.object(b, 'control') as control:
+            with patch.object(b, 'configure') as configure, patch.object(b, 'run') as run:
                 with self.assertRaises(b.Error):
                     b.start_task()
             configure.assert_not_called()
-            control.assert_not_called()
+            run.assert_not_called()
             target.unlink()
 
-    def test_version_two_conversion_preserves_ratio_and_other_user_settings(self):
-        old = config(ratio=3.4, daily_mib=2048)
-        old.pop('download_percent')
-        old.update(version=2, bandwidth_percent=60)
-        b.atomic_json(b.CONFIG, old)
-        converted = b.config_for_edit()
-        self.assertEqual((converted['ratio'], converted['daily_mib'], converted['download_percent']), (3.4, 2048, 40))
-        self.assertNotIn('bandwidth_percent', converted)
-        self.assertEqual(b.load_json(b.CONFIG), old)
 
-    def test_already_running_legacy_task_never_reconfigures_on_repeat_start(self):
-        b.atomic_json(b.CONFIG, self.legacy_config())
-        b.atomic_json(b.STATE, dict(b.initial_state(), mode='running'))
-        with patch.object(b, 'run', return_value='active'), patch.object(b, 'configure') as configure:
-            with self.assertRaisesRegex(b.Error, '任务已运行'):
-                b.start_task()
-        configure.assert_not_called()
 
 
 class InstallationFeedbackTests(unittest.TestCase):
@@ -1230,7 +1190,7 @@ class ShortcutTests(unittest.TestCase):
         binary.mkdir()
         paths = dict(BASE=self.base, CONFIG=self.base/'config.json', STATE=self.base/'state.json',
                      SCRIPT=binary/'traffic-balance', SHORTCUT=binary/'tb',
-                     LOG=self.root/'task.log', UNIT=self.root/'task.service')
+                     LOG=self.root/'task.log', UNIT=self.root/'task.service', HEADER_DIR=self.root)
         for key, value in paths.items():
             patcher = patch.object(b, key, value)
             patcher.start()
@@ -1265,7 +1225,7 @@ class ShortcutTests(unittest.TestCase):
             other = self.root/'other-command'
             other.write_text('other app')
             b.SHORTCUT.symlink_to(b.SCRIPT if owned else other)
-            with patch.object(b, 'ask', return_value='DELETE'), patch.object(b, 'run'), \
+            with patch.object(b, 'ask', return_value='DELETE'), patch.object(b, 'run', return_value='inactive'), \
                  patch.object(b, 'locked', contextlib.nullcontext), contextlib.redirect_stdout(io.StringIO()):
                 self.assertTrue(b.uninstall())
             self.assertFalse(b.SCRIPT.exists())
@@ -1275,13 +1235,38 @@ class ShortcutTests(unittest.TestCase):
                 self.assertEqual(b.SHORTCUT.read_text(), 'other app')
                 b.SHORTCUT.unlink()
 
+    def test_uninstall_cleans_leftovers_with_missing_unit_and_preserves_other_files(self):
+        b.CONFIG.write_text('old config')
+        b.STATE.write_text('old state')
+        extra = self.base/'notes.txt'
+        extra.write_text('keep')
+        header = self.root/'traffic-balance-header-abcd1234'
+        header.touch()
+        with patch.object(b, 'ask', return_value='DELETE'), \
+             patch.object(b, 'run', side_effect=['LoadState=not-found\nActiveState=inactive\n', 'inactive', '']) as run, \
+             patch.object(b, 'locked', contextlib.nullcontext), contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(b.uninstall())
+        self.assertFalse(any('disable' in call.args for call in run.call_args_list))
+        self.assertEqual(run.call_args.args, ('systemctl', 'daemon-reload'))
+        for path in (b.CONFIG, b.STATE, b.SCRIPT, header):
+            self.assertFalse(path.exists())
+        self.assertEqual(extra.read_text(), 'keep')
+
+    def test_uninstall_keeps_files_when_service_is_still_running(self):
+        with patch.object(b, 'ask', return_value='DELETE'), \
+             patch.object(b, 'run', side_effect=['LoadState=loaded\nActiveState=active\n', '', 'active']), \
+             patch.object(b, 'locked', contextlib.nullcontext):
+            with self.assertRaisesRegex(b.Error, '无法确认服务已停止'):
+                b.uninstall()
+        self.assertTrue(b.SCRIPT.exists())
+
     def test_cyclic_foreign_shortcut_does_not_break_configuration_or_uninstall(self):
         b.SHORTCUT.symlink_to(b.SHORTCUT)
         with patch.object(Path, 'resolve', side_effect=RuntimeError('Symlink loop')), \
              contextlib.redirect_stdout(io.StringIO()) as output:
             b.ensure_shortcut()
             self.assertIn('已被其他程序使用', output.getvalue())
-            with patch.object(b, 'ask', return_value='DELETE'), patch.object(b, 'run'), \
+            with patch.object(b, 'ask', return_value='DELETE'), patch.object(b, 'run', return_value='inactive'), \
                  patch.object(b, 'locked', contextlib.nullcontext):
                 self.assertTrue(b.uninstall())
         self.assertTrue(b.SHORTCUT.is_symlink())

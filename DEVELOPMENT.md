@@ -27,7 +27,7 @@ Shell 语法检查同样应使用 Bash 4+。不要以 root 在开发机直接执
 | 范围 | 测试文件 | 重点 |
 | --- | --- | --- |
 | 工具箱菜单、下载、统一卸载 | `test_vt.py`、`test_vt_cleanup.py`、`test_downloads.py`、`test_module_startup.py` | EOF、子进程失败、残留保护、重试、脚本候选校验、模块首次自动安装与命令行隔离 |
-| 每日流量调节 | `test_traffic_balance.py`、`test_traffic_balance_cleanup.py`、`test_traffic_balance_bootstrap.py` | HTTPS 下载入口/短命令、自动网卡、直接启动向导与旧配置转换、新鲜统计、预检/每3秒保护、双向带宽边界、共享时限与部分结算、达标停止、隔离清理、统计屏障、跨日/损坏/暂停恢复、单实例、限流及本地真实 curl |
+| 每日流量调节 | `test_traffic_balance.py`、`test_traffic_balance_cleanup.py`、`test_traffic_balance_bootstrap.py` | HTTPS 下载入口/短命令、自动网卡、直接启动向导、旧版配置拒绝与卸载清理、新鲜统计、预检/每3秒保护、双向带宽边界、共享时限与部分结算、达标停止、隔离清理、统计屏障、跨日/损坏/暂停恢复、单实例、限流及本地真实 curl |
 | PM | `test_pm.py`、`test_user_flows.py`、`test_performance.py` | 格式拒绝、计数基线、规则恢复、分组编辑、告警重试、批量查询 |
 | Realm / FW | `test_fw.py` | 规则校验、监听、事务回滚、中断与卸载 |
 | Snell | `test_snell.py` | 版本发现、多实例迁移、回滚、客户端导出 |
@@ -67,4 +67,4 @@ PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计
 
 ## 流量调节器发行
 
-`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.1`。不要覆盖已发布的发行标签。
+`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.2`。不要覆盖已发布的发行标签。

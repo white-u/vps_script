@@ -4,8 +4,8 @@ set -euo pipefail
 umask 077
 
 # Keep the executable payload identical across download channels.
-SOURCE_REF='traffic-balance-v1.0.1'
-SOURCE_SHA256='94572dbe661f25640c8ed70a3cbd55f967df293b3705a934e1c690609855d0c3'
+SOURCE_REF='traffic-balance-v1.0.2'
+SOURCE_SHA256='7f10b206dcfafa60c6e14ede3b308a68679815f4f187632f748cc444511d269c'
 SOURCE_URLS=(
     "https://raw.githubusercontent.com/white-u/vps_script/$SOURCE_REF/traffic_balance.py"
     "https://api.github.com/repos/white-u/vps_script/contents/traffic_balance.py?ref=$SOURCE_REF"
