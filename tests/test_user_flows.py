@@ -216,10 +216,15 @@ show_node_info() { echo "share:$1"; }
         if module == 'sb':
             return functions('sb', 'strip_cr', 'is_port_available', 'prompt_node_port',
                              'ensure_private_reject_rule', 'atomic_replace_file', 'safe_save_config',
+                             'begin_sb_transaction', 'rollback_sb_transaction', 'run_sb_transaction',
+                             'apply_sb_config', 'set_sb_signal_traps',
                              'add_ss2022', 'list_nodes', 'get_node_tag_by_id', 'delete_node',
                              'network_mode_for_type') + r'''
 SB_CONF_FILE="$TEST_DIR/config/config.json"; SB_BIN="$TEST_DIR/core"
+SB_CONF_DIR="$TEST_DIR/config"; _SB_TX_ACTIVE=false
 SS2022_METHOD=2022-blake3-aes-128-gcm; SS2022_KEY_BYTES=16
+detect_service_manager() { echo systemd; }
+service_stop() { systemctl stop sing-box; }
 restart_singbox_checked() { systemctl restart sing-box && systemctl is-active --quiet sing-box; }
 service_log_hint() { echo test-log; }
 meta_del_tag() { echo "$1" >> "$TEST_DIR/meta.calls"; }

@@ -43,8 +43,35 @@ SNI_LIST=(
 )
 
 _CLEANUP_FILES=()
-cleanup() { for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do rm -rf "$f" 2>/dev/null; done; }
-trap cleanup EXIT INT TERM
+_SB_TX_DIR=""
+_SB_TX_ACTIVE=false
+_SB_TX_FILES=()
+
+cleanup() {
+  local f
+  for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+    [[ "$_SB_TX_ACTIVE" == true && "$f" == "$_SB_TX_DIR" ]] && continue
+    rm -rf -- "$f" 2>/dev/null
+  done
+}
+
+interrupt_sb() {
+  trap '' INT TERM HUP
+  echo "sing-box 操作已中断。" >&2
+  if [[ "$_SB_TX_ACTIVE" == true ]]; then
+    rollback_sb_transaction || true
+  fi
+  exit "$1"
+}
+
+set_sb_signal_traps() {
+  trap 'interrupt_sb 130' INT
+  trap 'interrupt_sb 143' TERM
+  trap 'interrupt_sb 129' HUP
+}
+
+trap cleanup EXIT
+set_sb_signal_traps
 
 strip_cr() { echo "${1//$'\r'/}"; }
 
@@ -460,6 +487,10 @@ EOF
     echo -e "${RED}systemd 配置重载失败。${PLAIN}" >&2
     return 1
   fi
+  # 已启用的服务保留原目标链接，避免更新单元后额外创建自启入口。
+  if [[ "$_SB_TX_ACTIVE" == true && "$_SB_TX_BOOT" =~ ^enabled(-runtime)?$ ]]; then
+    return 0
+  fi
   if ! systemctl enable sing-box >/dev/null 2>&1; then
     echo -e "${RED}sing-box 开机启动设置失败。${PLAIN}" >&2
     return 1
@@ -529,6 +560,129 @@ atomic_replace_file() {
   cp "$source" "$stage" || return 1
   chmod "$mode" "$stage" || return 1
   mv -f "$stage" "$destination"
+}
+
+begin_sb_transaction() {
+  local kind=$1 state path i
+  _SB_TX_FILES=("$SB_CONF_FILE")
+  _SB_TX_MANAGER=""
+  _SB_TX_UNIT=""
+  _SB_TX_BOOT=""
+  _SB_TX_RUNNING=false
+  if [[ "$kind" != file ]]; then
+    _SB_TX_MANAGER=$(detect_service_manager)
+    case "$_SB_TX_MANAGER" in
+      systemd)
+        state=$(systemctl show sing-box -p LoadState -p ActiveState) || return 1
+        case $'\n'"$state"$'\n' in
+          *$'\nActiveState=active\n'*) _SB_TX_RUNNING=true ;;
+          *$'\nActiveState=inactive\n'*|*$'\nActiveState=failed\n'*) ;;
+          *) echo "无法确认 sing-box 原运行状态，请在服务稳定后重试。" >&2; return 1 ;;
+        esac
+        if [[ "$kind" == core ]]; then
+          _SB_TX_UNIT=$SYSTEMD_FILE
+          if [[ "$state" == *LoadState=not-found* ]]; then
+            _SB_TX_BOOT=disabled
+          else
+            _SB_TX_BOOT=$(systemctl is-enabled sing-box 2>/dev/null)
+            case "$_SB_TX_BOOT" in
+              enabled|enabled-runtime|disabled|static) ;;
+              *) echo "无法保留 sing-box 原开机启动状态，已停止安装。" >&2; return 1 ;;
+            esac
+          fi
+        fi ;;
+      openrc)
+        # 即使核心正在等待重试，原本已启动的 supervisor 也必须恢复。
+        rc-service sing-box status >/dev/null 2>&1 && _SB_TX_RUNNING=true
+        if [[ "$kind" == core ]]; then
+          _SB_TX_UNIT=$OPENRC_FILE
+          _SB_TX_BOOT=disabled
+          if [[ -e /etc/runlevels/default/sing-box || -L /etc/runlevels/default/sing-box ]]; then
+            _SB_TX_BOOT=enabled
+          fi
+        fi ;;
+      *) echo "未检测到可用的服务管理器，无法保存原运行状态。" >&2; return 1 ;;
+    esac
+  fi
+  if [[ "$kind" == core ]]; then
+    _SB_TX_FILES+=("$SB_BIN" "$_SB_TX_UNIT" "$INSTALL_PATH")
+  fi
+  _SB_TX_DIR=$(mktemp -d "${SB_CONF_DIR}/.sb-recovery.XXXXXX") || return 1
+  _CLEANUP_FILES+=("$_SB_TX_DIR")
+  for i in "${!_SB_TX_FILES[@]}"; do
+    path=${_SB_TX_FILES[i]}
+    printf '%s\t%s\n' "$i" "$path" >> "$_SB_TX_DIR/paths.tsv" || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+      if [[ -d "$path" ]] || ! cp -a -- "$path" "$_SB_TX_DIR/$i"; then
+        echo "无法备份 ${path}，原文件保持不变。" >&2
+        return 1
+      fi
+    fi
+  done
+  _SB_TX_ACTIVE=true
+}
+
+rollback_sb_transaction() {
+  local i path saved stage failed=false
+  echo "正在恢复 sing-box 原文件和服务状态..." >&2
+  if [[ -n "$_SB_TX_MANAGER" ]] && ! service_stop; then
+    echo "无法停止 sing-box，已保留当前文件和 ${_SB_TX_DIR} 中的备份。请检查 $(service_log_hint)。" >&2
+    return 1
+  fi
+  if [[ -n "$_SB_TX_UNIT" && ! "$_SB_TX_BOOT" =~ ^enabled(-runtime)?$ ]] \
+      && [[ -e "$_SB_TX_UNIT" || -L "$_SB_TX_UNIT" ]]; then
+    service_disable || failed=true
+  fi
+  for i in "${!_SB_TX_FILES[@]}"; do
+    path=${_SB_TX_FILES[i]}
+    saved="$_SB_TX_DIR/$i"
+    if [[ -e "$saved" || -L "$saved" ]]; then
+      if [[ -d "$path" ]] || ! stage=$(mktemp -d "${path}.restore.XXXXXX"); then
+        failed=true
+        continue
+      fi
+      if ! cp -a -- "$saved" "$stage/original" || ! mv -f -- "$stage/original" "$path"; then
+        failed=true
+      fi
+      rm -rf -- "$stage"
+    else
+      rm -f -- "$path" || failed=true
+    fi
+  done
+  if [[ -n "$_SB_TX_UNIT" && "$_SB_TX_MANAGER" == systemd ]]; then
+    systemctl daemon-reload || failed=true
+  fi
+  if [[ "$failed" == false && "$_SB_TX_RUNNING" == true ]]; then
+    restart_singbox_checked || failed=true
+  fi
+  if [[ "$failed" == true ]]; then
+    echo "sing-box 回滚未完成，备份已保留在 ${_SB_TX_DIR}。请检查 $(service_log_hint)。" >&2
+    return 1
+  fi
+  _SB_TX_ACTIVE=false
+  rm -rf -- "$_SB_TX_DIR"
+  echo "已恢复 sing-box 原文件和服务状态。" >&2
+  return 0
+}
+
+run_sb_transaction() {
+  local kind=$1
+  shift
+  # 核心升级中的配置迁移复用外层备份，任一步骤失败都由外层恢复。
+  if [[ "$_SB_TX_ACTIVE" == true ]]; then
+    "$@"
+    return $?
+  fi
+  begin_sb_transaction "$kind" || return 1
+  if "$@"; then
+    _SB_TX_ACTIVE=false
+    rm -rf -- "$_SB_TX_DIR"
+    return 0
+  fi
+  trap '' INT TERM HUP
+  rollback_sb_transaction || exit 1
+  set_sb_signal_traps
+  return 1
 }
 
 show_service_logs() {
@@ -656,7 +810,7 @@ migrate_config_if_needed() {
     echo "$out" | tail -12
     return 1
   }
-  atomic_replace_file "$tmp" "$SB_CONF_FILE" 640 || return 1
+  run_sb_transaction file atomic_replace_file "$tmp" "$SB_CONF_FILE" 640 || return 1
   if [[ "$has_removed_exit" -eq 1 ]]; then
     echo -e "${GREEN}旧跨机出口配置已在服务停止状态下清理，普通节点保持不变。${PLAIN}"
   else
@@ -682,35 +836,19 @@ safe_save_config() {
     fi
   fi
 
-  local backup=""
-  if [[ -f "$SB_CONF_FILE" ]] && [[ -s "$SB_CONF_FILE" ]]; then
-    backup=$(mktemp "${SB_CONF_FILE}.bak.XXXXXX") || return 1
-    _CLEANUP_FILES+=("$backup")
-    cp -p "$SB_CONF_FILE" "$backup" || return 1
-  fi
-
-  if ! atomic_replace_file "$tmp_json" "$SB_CONF_FILE" 640; then
-    echo -e "${RED}配置文件原子替换失败，现有配置未改动。${PLAIN}" >&2
-    return 1
-  fi
-
-  if restart_singbox_checked; then
+  if run_sb_transaction config apply_sb_config "$tmp_json"; then
     echo -e "${GREEN}配置已应用，服务已重启。${PLAIN}"
-    [[ -n "$backup" ]] && rm -f "$backup"
     return 0
   fi
-
-  echo -e "${RED}sing-box 启动失败! 正在回滚...${PLAIN}"
-
-  if [[ -n "$backup" && -f "$backup" ]]; then
-    if atomic_replace_file "$backup" "$SB_CONF_FILE" 640 && restart_singbox_checked; then
-      echo -e "${YELLOW}已回滚到上一份有效配置，服务已恢复。${PLAIN}"
-    else
-      echo -e "${RED}回滚后仍无法启动，请手动检查: $(service_log_hint)${PLAIN}"
-    fi
-    rm -f "$backup"
-  fi
   return 1
+}
+
+apply_sb_config() {
+  if ! atomic_replace_file "$1" "$SB_CONF_FILE" 640; then
+    echo -e "${RED}配置文件原子替换失败。${PLAIN}" >&2
+    return 1
+  fi
+  restart_singbox_checked
 }
 
 install_shortcut_cmd() {
@@ -793,11 +931,8 @@ install_singbox() {
       echo "$current_check" | tail -20
       return 1
     }
-    write_service || return 1
-    restart_singbox_checked || return 1
-    migrate_config_if_needed || return 1
-    install_shortcut_cmd || return 1
-    return
+    run_sb_transaction core apply_sb_core ""
+    return $?
   fi
 
   echo -e "${YELLOW}正在下载 sing-box ${latest_ver} (${arch})...${PLAIN}"
@@ -874,43 +1009,19 @@ install_singbox() {
     return 1
   }
 
-  local old_binary=""
-  if [[ -x "$SB_BIN" ]]; then
-    old_binary=$(mktemp "${SB_BIN}.bak.XXXXXX") || return 1
-    _CLEANUP_FILES+=("$old_binary")
-    cp -p "$SB_BIN" "$old_binary" || return 1
-  fi
-
-  if ! atomic_replace_file "$extracted" "$SB_BIN" 755; then
-    echo -e "${RED}核心文件原子替换失败，旧核心保持不变。${PLAIN}" >&2
-    return 1
-  fi
-
-  if write_service && restart_singbox_checked; then
+  if run_sb_transaction core apply_sb_core "$extracted"; then
     echo -e "${GREEN}sing-box 已更新到 ${latest_ver} 并启动成功。${PLAIN}"
-    [[ -n "$old_binary" ]] && rm -f "$old_binary"
-    migrate_config_if_needed || return 1
-    install_shortcut_cmd || return 1
-    return
-  fi
-
-  echo -e "${RED}新核心启动失败，正在回滚核心...${PLAIN}" >&2
-  if [[ -n "$old_binary" && -f "$old_binary" ]]; then
-    if atomic_replace_file "$old_binary" "$SB_BIN" 755 && restart_singbox_checked; then
-      echo -e "${YELLOW}已恢复 sing-box ${curr_ver}，服务重新运行。${PLAIN}"
-    else
-      echo -e "${RED}旧核心恢复失败，请立即检查: $(service_log_hint)${PLAIN}" >&2
-    fi
-  else
-    if ! service_stop; then
-      echo -e "${RED}首次安装失败且服务无法停止，已保留文件，请检查: $(service_log_hint)${PLAIN}" >&2
-      return 1
-    fi
-    rm -f "$SB_BIN"
-    remove_service_definition
-    echo -e "${RED}首次安装失败，已移除不可用核心。${PLAIN}" >&2
+    return 0
   fi
   return 1
+}
+
+apply_sb_core() {
+  if [[ -n "$1" ]] && ! atomic_replace_file "$1" "$SB_BIN" 755; then
+    echo -e "${RED}核心文件原子替换失败。${PLAIN}" >&2
+    return 1
+  fi
+  write_service && restart_singbox_checked && migrate_config_if_needed && install_shortcut_cmd
 }
 
 gen_uuid() {
