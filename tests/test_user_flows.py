@@ -205,31 +205,34 @@ mv() {
 }
 configure_notifications
 echo RETURNED
-''', '1\n1\ntoken-fixture\n-1234\nhttps://tg.example.test\n30,75,100\ny\n0\n0\n'
-     '2\n1\nhttps://worker.example.test/api/push\n\\/back\nNODE-01\ny\n0\n0\n0\n')
+''', '1\n1\ntoken-fixture\n-1234\nhttps://tg.example.test\n30,75,100\n0\n0\n'
+     '2\n1\nhttps://worker.example.test/api/push\nsecret-fixture\nNODE-01\n\n0\n0\n')
         self.assert_ok(result)
         self.assertIn('RETURNED', result.stdout)
+        self.assertIn('Telegram 参数已保存，通知已开启。', result.stdout)
+        self.assertIn('Cloudflare 参数已保存，推送已开启。', result.stdout)
         self.assertNotIn('token-fixture', result.stdout + result.stderr)
+        self.assertNotIn('secret-fixture', result.stdout + result.stderr)
         config = self.read_config()
         self.assertEqual(config['telegram'], {
-            'enable': False, 'bot_token': 'token-fixture', 'chat_id': '-1234',
+            'enable': True, 'bot_token': 'token-fixture', 'chat_id': '-1234',
             'api_url': 'https://tg.example.test', 'thresholds': [30, 75, 100],
         })
         self.assertEqual(config['push'], {
-            'enable': False, 'worker_url': 'https://worker.example.test/api/push',
-            'secret': '/back', 'node_key': 'node-01',
+            'enable': True, 'worker_url': 'https://worker.example.test/api/push',
+            'secret': 'secret-fixture', 'node_key': 'node-01',
         })
         self.assertEqual((self.path / 'config-saves').read_text().splitlines(), ['saved', 'saved'])
         self.assertFalse((self.path / 'edit.lock').exists())
 
     def test_notification_blank_fields_preserve_values_and_back_returns_directly(self):
         self.assert_ok(self.run_pm('edit_telegram_settings',
-                                   'existing-token\n-1234\nhttps://tg.example.test\n50,100\ny\n'))
-        result = self.run_pm('configure_telegram\necho RETURNED', '1\n\n\n\n70,100\ny\n0\n1\nunsaved\n/back\n0\n')
+                                   'existing-token\n-1234\nhttps://tg.example.test\n50,100\n'))
+        result = self.run_pm('configure_telegram\necho RETURNED', '1\n\n\n\n70,100\n0\n1\nunsaved\n0\n0\n')
         self.assert_ok(result)
         self.assertIn('RETURNED', result.stdout)
         self.assertEqual(self.read_config()['telegram'], {
-            'enable': False, 'bot_token': 'existing-token', 'chat_id': '-1234',
+            'enable': True, 'bot_token': 'existing-token', 'chat_id': '-1234',
             'api_url': 'https://tg.example.test', 'thresholds': [70, 100],
         })
 
@@ -237,16 +240,50 @@ echo RETURNED
         self.assert_ok(self.run_pm(''))
         before = self.config.read_bytes()
         for action, data, expected in (
-            ('edit_telegram_settings', 'new-token\n123\n\n\n0\n', 2),
+            ('edit_telegram_settings', '0\n', 2),
+            ('edit_telegram_settings', 'new-token\n0\n', 2),
+            ('edit_telegram_settings', 'new-token\n123\n0\n', 2),
+            ('edit_telegram_settings', 'new-token\n123\n\n0\n', 2),
             ('edit_telegram_settings', 'new-token\n123\n\nbad\n', 1),
-            ('edit_push_settings', 'https://worker.example.test/api/push\n/back\n', 2),
+            ('edit_push_settings', '0\n', 2),
+            ('edit_push_settings', 'https://worker.example.test/api/push\n0\n', 2),
+            ('edit_push_settings', 'https://worker.example.test/api/push\nsecret\n0\n', 2),
             ('edit_push_settings', 'https://worker.example.test/api/push\nsecret\ninvalid key\n', 1),
         ):
-            with self.subTest(action=action, expected=expected):
+            with self.subTest(action=action, data=data, expected=expected):
                 result = self.run_pm('start_edit_lock() { echo UNEXPECTED_LOCK >&2; return 1; }\n' + action, data)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertNotIn('UNEXPECTED_LOCK', result.stderr)
                 self.assertEqual(self.config.read_bytes(), before)
+
+    def test_incomplete_notification_credentials_do_not_save_or_enable(self):
+        self.assert_ok(self.run_pm(''))
+        before = self.config.read_bytes()
+        for action, data, error in (
+            ('edit_telegram_settings', 'new-token\n\n\n\n', 'Bot Token 和 Chat ID 必须同时配置'),
+            ('edit_push_settings', 'https://worker.example.test/api/push\n\n\n',
+             '请同时配置 Worker URL、Secret 和 Node Key'),
+            ('edit_push_settings', 'https://worker.example.test\nsecret\nnode-01\n',
+             'Worker URL 必须指向 /api/push 接口'),
+        ):
+            with self.subTest(action=action):
+                result = self.run_pm(action, data)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(error, result.stderr)
+                self.assertNotIn('已开启', result.stdout)
+                self.assertEqual(self.config.read_bytes(), before)
+
+    def test_cloudflare_blank_fields_preserve_values_and_enable_push(self):
+        result = self.run_pm(
+            'edit_push_settings && toggle_notification push && configure_push\necho RETURNED',
+            'https://worker.example.test/api/push\nsecret-fixture\nold-key\n'
+            '1\n\n\nNEW-KEY\n\n1\nhttps://unsaved.example.test/api/push\n0\n0\n')
+        self.assert_ok(result)
+        self.assertIn('RETURNED', result.stdout)
+        self.assertEqual(self.read_config()['push'], {
+            'enable': True, 'worker_url': 'https://worker.example.test/api/push',
+            'secret': 'secret-fixture', 'node_key': 'new-key',
+        })
 
 
 @unittest.skipUnless(BASH4 and shutil.which('jq'), 'Requires Bash 4+ and jq')

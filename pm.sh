@@ -18,6 +18,7 @@ TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
 LOCK_FILE="/var/run/pm.lock"
 CRON_LOCK_FILE="/var/run/pm_cron.lock"
 LOG_FILE="/var/log/port_monitor.log"
+WORKER_PUSH_URL_PATTERN='^https?://[^/?#]+/api/push([?#].*)?$'
 SCRIPT_VERSION="1.0.0"
 # 首版支持的配置结构；保留原编号，防止把旧数据误认成当前格式。
 CURRENT_CONFIG_VERSION=6
@@ -177,17 +178,23 @@ read_prompt() {
 strip_cr() { echo "${1//$'\r'/}"; }
 
 read_pm_field() {
-    local field_name=$1 field_prompt=$2 field_value
+    local field_name=$1 field_prompt=$2 field_value back=/back
     shift 2
-    read_prompt -r "$@" -p "${field_prompt} [/back 返回]: " field_value
+    if [[ "${1:-}" == --return-zero ]]; then
+        back=0
+        field_prompt+=" [回车保留，0 返回]"
+        shift
+    else
+        field_prompt+=" [/back 返回]"
+    fi
+    read_prompt -r "$@" -p "${field_prompt}: " field_value
     [ "${1:-}" != -s ] || echo
     field_value=${field_value//$'\r'/}
-    case "$field_value" in
-        /back) return 1 ;;
-        */back)
-            local prefix=${field_value%/back}
-            [[ -n "${prefix//\\/}" ]] || field_value=${field_value#\\} ;;
-    esac
+    [[ "$field_value" != "$back" ]] || return 1
+    if [[ "$back" == /back && "$field_value" == */back ]]; then
+        local prefix=${field_value%/back}
+        [[ -n "${prefix//\\/}" ]] || field_value=${field_value#\\}
+    fi
     printf -v "$field_name" '%s' "$field_value"
 }
 
@@ -1291,7 +1298,7 @@ push_to_worker() {
         pm_error "Worker 推送配置不完整，请配置 Worker URL、Secret 和 Node Key"
         return 1
     fi
-    if [[ ! "$worker_url" =~ ^https?://[^/?#]+/api/push([?#].*)?$ ]]; then
+    if [[ ! "$worker_url" =~ $WORKER_PUSH_URL_PATTERN ]]; then
         pm_error "Worker URL 必须指向 /api/push 接口，例如 https://你的域名/api/push"
         return 1
     fi
@@ -3076,60 +3083,62 @@ show_notification_logs() {
     fi
     echo -e "$UI_SEPARATOR"
     echo " 提示：成功和失败都会记录，请结合记录时间判断最近一次结果，或返回菜单执行测试。"
-    read_prompt -r -p "按回车或输入 0 返回上级菜单: " reply
+    read_prompt -r -p "按回车返回..." reply
 }
 
 save_notification_settings() {
-    local label=$1 config
-    shift
+    local label=$1 success_message=$2 config
+    shift 2
     config=$(jq -e "$@" "$CONFIG_FILE") || {
         echo -e "${RED}${label}无效，原配置保持不变。${PLAIN}" >&2
         return 1
     }
     safe_write_config "$config" || return 1
-    echo -e "${GREEN}${label}已保存。${PLAIN}"
+    echo -e "${GREEN}${success_message}${PLAIN}"
 }
 
 # 返回 2 表示用户取消，调用方直接回到子菜单。
 edit_telegram_settings() {
     local token chat_id api thresholds thresholds_json=null
-    read_pm_field token "Bot Token（留空保留）" -s || return 2
-    read_pm_field chat_id "Chat ID（留空保留）" || return 2
-    read_pm_field api "API 地址（留空保留，default 使用官方 API）" || return 2
-    read_pm_field thresholds "流量阈值（如 50,80,100，留空保留）" || return 2
+    read_pm_field token "Bot Token" --return-zero -s || return 2
+    read_pm_field chat_id "Chat ID" --return-zero || return 2
+    read_pm_field api "API 地址（默认官方 API）" --return-zero || return 2
+    read_pm_field thresholds "流量配额提醒阈值（如 50,80,100）" --return-zero || return 2
     [[ "$api" != default ]] || api="https://api.telegram.org"
     if [[ -n "$thresholds" ]]; then
         if [[ ! "$thresholds" =~ ^[0-9]+(,[0-9]+)*$ ]] \
             || ! thresholds_json=$(jq -cn --arg v "$thresholds" '$v | split(",") | map(tonumber)'); then
-            echo -e "${RED}流量阈值必须是用逗号分隔的数字，配置未保存。${PLAIN}" >&2
+            echo -e "${RED}流量配额提醒阈值必须是用逗号分隔的数字，配置未保存。${PLAIN}" >&2
             return 1
         fi
     fi
-    confirm_yes "保存 Telegram 参数？（0 返回）" || return 2
-    _run_edit_action save_notification_settings "Telegram 参数" \
+    _run_edit_action save_notification_settings "Telegram 参数" "Telegram 参数已保存，通知已开启。" \
         --arg token "$token" --arg chat "$chat_id" --arg api "$api" --argjson thresholds "$thresholds_json" '
         .telegram += ({bot_token:$token, chat_id:$chat, api_url:$api, thresholds:$thresholds}
                       | with_entries(select(.value != "" and .value != null))) |
         if (.telegram.bot_token // "") == "" or (.telegram.chat_id // "") == ""
-        then error("Bot Token 和 Chat ID 必须同时配置") else . end'
+        then error("Bot Token 和 Chat ID 必须同时配置") else .telegram.enable = true end'
 }
 
 edit_push_settings() {
     local url secret node_key
-    read_pm_field url "Worker URL（留空保留）" || return 2
-    read_pm_field secret "Secret（留空保留）" -s || return 2
-    read_pm_field node_key "Node Key（留空保留）" || return 2
+    read_pm_field url "Worker URL" --return-zero || return 2
+    read_pm_field secret "Secret" --return-zero -s || return 2
+    read_pm_field node_key "Node Key" --return-zero || return 2
     node_key=${node_key,,}
     if [[ -n "$node_key" && ! "$node_key" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
         echo -e "${RED}Node Key 必须为 1-64 位小写字母、数字、下划线或连字符，且以字母或数字开头。${PLAIN}" >&2
         return 1
     fi
-    confirm_yes "保存 Cloudflare 参数？（0 返回）" || return 2
-    _run_edit_action save_notification_settings "Cloudflare 参数" \
-        --arg url "$url" --arg secret "$secret" --arg key "$node_key" '
+    _run_edit_action save_notification_settings "Cloudflare 参数" "Cloudflare 参数已保存，推送已开启。" \
+        --arg url "$url" --arg secret "$secret" --arg key "$node_key" \
+        --arg url_pattern "$WORKER_PUSH_URL_PATTERN" '
         .push += ({worker_url:$url, secret:$secret, node_key:$key} | with_entries(select(.value != ""))) |
-        if (.push.worker_url // "") == "" or (.push.secret // "") == "" or (.push.node_key // "") == ""
-        then error("请同时配置 Worker URL、Secret 和 Node Key") else . end'
+        if (.push.worker_url // "") == "" or (.push.secret // "") == "" or (.push.node_key // "") == "" then
+            error("请同时配置 Worker URL、Secret 和 Node Key")
+        elif (.push.worker_url | test($url_pattern) | not) then
+            error("Worker URL 必须指向 /api/push 接口")
+        else .push.enable = true end'
 }
 
 toggle_notification() {
@@ -3139,7 +3148,8 @@ toggle_notification() {
         push) label="Cloudflare 推送"; fields='["worker_url","secret","node_key"]' ;;
         *) return 1 ;;
     esac
-    _run_edit_action save_notification_settings "${label}状态" --arg provider "$provider" --argjson fields "$fields" '
+    _run_edit_action save_notification_settings "${label}状态" "${label}状态已保存。" \
+        --arg provider "$provider" --argjson fields "$fields" '
         .[$provider] |= (
             if .enable == true then .enable = false
             else . as $settings |
@@ -3192,9 +3202,9 @@ configure_telegram() {
         echo -e "$UI_DIVIDER"
         echo "   Telegram 通知"
         echo -e "$UI_DIVIDER"
-        printf ' 状态:      %b\n Bot 配置:  %s\n 流量阈值:  %s%%\n API 地址:  %s\n' "$status" "$bot" "$thresholds" "$api"
+        printf ' 状态:      %b\n Bot 配置:  %s\n 流量配额提醒阈值: %s%%\n API 地址:  %s\n' "$status" "$bot" "$thresholds" "$api"
         echo -e "$UI_SEPARATOR"
-        echo " 1. 配置参数（Token、Chat ID、API 地址、流量阈值）"
+        echo " 1. 配置参数"
         echo " 2. 开启/关闭通知"
         echo " 3. 发送测试消息"
         echo " 4. 查看最近日志"
@@ -3209,7 +3219,7 @@ configure_telegram() {
             0) return 0 ;;
             *) echo "无效选项，请输入 0-4。" >&2 ;;
         esac
-        read_prompt -r -p "按回车或输入 0 返回 Telegram 菜单: " reply
+        read_prompt -r -p "按回车返回..." reply
     done
 }
 
@@ -3227,7 +3237,7 @@ configure_push() {
         echo -e "$UI_DIVIDER"
         printf ' 状态:     %b\n Worker:   %s\n Secret:   %s\n Node Key: %s\n' "$status" "${url:-未配置}" "$secret" "${key:-未配置}"
         echo -e "$UI_SEPARATOR"
-        echo " 1. 配置参数（Worker URL、Secret、Node Key）"
+        echo " 1. 配置参数"
         echo " 2. 开启/关闭推送"
         echo " 3. 立即测试推送"
         echo " 4. 查看最近日志"
@@ -3247,7 +3257,7 @@ configure_push() {
             0) return 0 ;;
             *) echo "无效选项，请输入 0-4。" >&2 ;;
         esac
-        read_prompt -r -p "按回车或输入 0 返回 Cloudflare 菜单: " reply
+        read_prompt -r -p "按回车返回..." reply
     done
 }
 
