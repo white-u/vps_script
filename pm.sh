@@ -176,6 +176,21 @@ read_prompt() {
 
 strip_cr() { echo "${1//$'\r'/}"; }
 
+read_pm_field() {
+    local field_name=$1 field_prompt=$2 field_value
+    shift 2
+    read_prompt -r "$@" -p "${field_prompt} [/back 返回]: " field_value
+    [ "${1:-}" != -s ] || echo
+    field_value=${field_value//$'\r'/}
+    case "$field_value" in
+        /back) return 1 ;;
+        */back)
+            local prefix=${field_value%/back}
+            [[ -n "${prefix//\\/}" ]] || field_value=${field_value#\\} ;;
+    esac
+    printf -v "$field_name" '%s' "$field_value"
+}
+
 confirm_yes() {
     local prompt=$1 answer
     read_prompt -r -p "${prompt} [y/N，默认 N]: " answer
@@ -2531,8 +2546,9 @@ add_port_flow() {
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ -n "${map_ports[$sel]}" ]; then
         target_port=${map_ports[$sel]}
     elif [ "$sel" == "m" ] || [ "$sel" == "M" ]; then
-        read_prompt -r -p "请输入端口号: " target_port
+        read_prompt -r -p "请输入端口号（0 返回主菜单）: " target_port
         target_port=$(strip_cr "$target_port")
+        [ "$target_port" != 0 ] || return 0
     else
         return
     fi
@@ -2547,17 +2563,18 @@ add_port_flow() {
     fi
     echo -e "\n>> 正在配置端口: $target_port"
     
-    read_prompt -r -p "月流量配额（GB，正整数）: " quota
-    quota=$(strip_cr "$quota")
+    read_pm_field quota "月流量配额（GB，正整数）" || return 0
+    [ "$quota" != 0 ] || return 0
     if [[ ! "$quota" =~ ^[0-9]+$ ]] || [ "$quota" -eq 0 ] || [ "$quota" -gt "$MAX_QUOTA_GB" ]; then
         echo -e "${RED}错误: 配额必须是 1-${MAX_QUOTA_GB} 的整数!${PLAIN}"; sleep 2; return
     fi
 
-    echo "计费模式：1. 双向计费  2. 仅出站计费"
-    read_prompt -r -p "选择模式 [1/2，默认 1]: " mode_idx
+    echo "计费模式：1. 双向计费  2. 仅出站计费  0. 返回主菜单"
+    read_prompt -r -p "选择模式 [0/1/2，默认 1]: " mode_idx
     mode_idx=$(strip_cr "$mode_idx")
     local mode
     case "$mode_idx" in
+        0) return 0 ;;
         ""|1) mode="in_out" ;;
         2) mode="out_only" ;;
         *) echo -e "${RED}无效模式，请输入 1 或 2。${PLAIN}"; sleep 1; return ;;
@@ -2565,21 +2582,19 @@ add_port_flow() {
 
     echo -e "突发限速: 出站连续 ${BURST_TRIGGER_MINUTES} 分钟超过 ${BURST_TRIGGER_MBPS} Mbps，"
     echo -e "          临时限制为 ${BURST_LIMIT_MBPS} Mbps，持续 ${BURST_DURATION_MINUTES} 分钟。"
-    local burst_enabled=false
-    confirm_yes "是否接入突发限速？" && burst_enabled=true
+    local burst_enabled=false burst_choice
+    read_pm_field burst_choice "是否接入突发限速 [y/N，默认 N]" || return 0
+    [[ "$burst_choice" =~ ^[Yy]$ ]] && burst_enabled=true
 
-    read_prompt -r -p "每月自动重置日 [0-31，默认 0（不自动重置）]: " reset_day
-    reset_day=$(strip_cr "$reset_day")
+    read_pm_field reset_day "每月自动重置日 [0-31，默认 0（不自动重置）]" || return 0
     [ -z "$reset_day" ] && reset_day=0
     if [[ ! "$reset_day" =~ ^[0-9]+$ ]] || [ "$reset_day" -gt 31 ]; then
         echo -e "${RED}无效重置日，请输入 0-31。${PLAIN}"; sleep 1; return
     fi
 
-    read_prompt -r -p "用户（可留空）: " comment
-    comment=$(strip_cr "$comment")
+    read_pm_field comment "用户（可留空）" || return 0
 
-    read_prompt -r -p "用户到期日期（YYYY-MM-DD，留空为不提醒）: " expiry_date
-    expiry_date=$(strip_cr "$expiry_date")
+    read_pm_field expiry_date "用户到期日期（YYYY-MM-DD，留空为不提醒）" || return 0
     if [ -n "$expiry_date" ] && ! validate_expiry_date "$expiry_date"; then
         echo -e "${RED}错误: 到期日期必须是有效的 YYYY-MM-DD。${PLAIN}"
         sleep 2
@@ -2833,8 +2848,8 @@ config_port_menu() {
                     echo -e "$UI_SEPARATOR"
                 fi
                 
-                read_prompt -r -p "分组 ID（输入名称新建/输入序号选择/留空清除）: " input_val
-                input_val=$(strip_cr "$input_val")
+                read_pm_field input_val "分组 ID（输入名称新建/输入序号选择/留空清除）" \
+                    || { rm -f "$tmp"; continue; }
                 
                 local val=""
                 if [[ "$input_val" =~ ^[0-9]+$ ]] && [ -n "${group_map[$input_val]}" ]; then
@@ -2957,7 +2972,7 @@ configure_burst_limit() {
     echo -e "$UI_SEPARATOR"
     if [ "$enabled" == "true" ]; then action="关闭"; target=false; else action="开启"; target=true; fi
     echo -e " 1. ${action}突发限速"
-    echo -e " 0. 取消"
+    echo -e " 0. 返回端口配置"
     echo -e "$UI_DIVIDER"
     read_prompt -r -p "请选择 [0-1，默认 0]: " choice; choice=$(strip_cr "$choice")
     [ "$choice" != "1" ] && return 0
@@ -3061,209 +3076,178 @@ show_notification_logs() {
     fi
     echo -e "$UI_SEPARATOR"
     echo " 提示：成功和失败都会记录，请结合记录时间判断最近一次结果，或返回菜单执行测试。"
-    read_prompt -r -p "按回车返回..." reply
+    read_prompt -r -p "按回车或输入 0 返回上级菜单: " reply
 }
 
-configure_telegram() {
-    while true; do
-        stop_edit_lock
-        local tg=$(jq '.telegram' "$CONFIG_FILE")
-        local t_enable=$(echo "$tg" | jq -r '.enable // false')
-        local t_token=$(echo "$tg" | jq -r '.bot_token // ""')
-        local t_chatid=$(echo "$tg" | jq -r '.chat_id // ""')
-        local t_api=$(echo "$tg" | jq -r '.api_url // "https://api.telegram.org"')
-        local t_thr=$(echo "$tg" | jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")')
+save_notification_settings() {
+    local label=$1 config
+    shift
+    config=$(jq -e "$@" "$CONFIG_FILE") || {
+        echo -e "${RED}${label}无效，原配置保持不变。${PLAIN}" >&2
+        return 1
+    }
+    safe_write_config "$config" || return 1
+    echo -e "${GREEN}${label}已保存。${PLAIN}"
+}
 
-        local status_str=$(telegram_status_text)
-        local bot_str="${YELLOW}⚠️ 未完成${PLAIN}"
-        [ -n "$t_token" ] && [ -n "$t_chatid" ] && bot_str="${GREEN}✅ 已完成${PLAIN}"
-        local api_str="$t_api"
-        [ "$t_api" == "https://api.telegram.org" ] && api_str="官方 API"
+# 返回 2 表示用户取消，调用方直接回到子菜单。
+edit_telegram_settings() {
+    local token chat_id api thresholds thresholds_json=null
+    read_pm_field token "Bot Token（留空保留）" -s || return 2
+    read_pm_field chat_id "Chat ID（留空保留）" || return 2
+    read_pm_field api "API 地址（留空保留，default 使用官方 API）" || return 2
+    read_pm_field thresholds "流量阈值（如 50,80,100，留空保留）" || return 2
+    [[ "$api" != default ]] || api="https://api.telegram.org"
+    if [[ -n "$thresholds" ]]; then
+        if [[ ! "$thresholds" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+            || ! thresholds_json=$(jq -cn --arg v "$thresholds" '$v | split(",") | map(tonumber)'); then
+            echo -e "${RED}流量阈值必须是用逗号分隔的数字，配置未保存。${PLAIN}" >&2
+            return 1
+        fi
+    fi
+    confirm_yes "保存 Telegram 参数？（0 返回）" || return 2
+    _run_edit_action save_notification_settings "Telegram 参数" \
+        --arg token "$token" --arg chat "$chat_id" --arg api "$api" --argjson thresholds "$thresholds_json" '
+        .telegram += ({bot_token:$token, chat_id:$chat, api_url:$api, thresholds:$thresholds}
+                      | with_entries(select(.value != "" and .value != null))) |
+        if (.telegram.bot_token // "") == "" or (.telegram.chat_id // "") == ""
+        then error("Bot Token 和 Chat ID 必须同时配置") else . end'
+}
 
-        clear
-        echo -e "$UI_DIVIDER"
-        echo -e "   Telegram 通知"
-        echo -e "$UI_DIVIDER"
-        echo -e " 状态:      $status_str"
-        echo -e " Bot 配置:  $bot_str"
-        echo -e " 流量阈值:  ${t_thr}%"
-        echo -e " API 地址:  $api_str"
-        echo -e "$UI_SEPARATOR"
-        echo -e " 1. 配置 Bot（Token + Chat ID）"
-        echo -e " 2. 开启/关闭通知"
-        echo -e " 3. 设置 流量提醒阈值"
-        echo -e " 4. 设置 API 地址"
-        echo -e " 5. 发送测试消息"
-        echo -e " 6. 查看最近日志"
-        echo -e " 0. 返回通知与推送"
-        echo -e "$UI_DIVIDER"
-        read_prompt -r -p "请选择: " c
-        c=$(strip_cr "$c")
-        case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
-        local tmp=$(mktemp)
+edit_push_settings() {
+    local url secret node_key
+    read_pm_field url "Worker URL（留空保留）" || return 2
+    read_pm_field secret "Secret（留空保留）" -s || return 2
+    read_pm_field node_key "Node Key（留空保留）" || return 2
+    node_key=${node_key,,}
+    if [[ -n "$node_key" && ! "$node_key" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+        echo -e "${RED}Node Key 必须为 1-64 位小写字母、数字、下划线或连字符，且以字母或数字开头。${PLAIN}" >&2
+        return 1
+    fi
+    confirm_yes "保存 Cloudflare 参数？（0 返回）" || return 2
+    _run_edit_action save_notification_settings "Cloudflare 参数" \
+        --arg url "$url" --arg secret "$secret" --arg key "$node_key" '
+        .push += ({worker_url:$url, secret:$secret, node_key:$key} | with_entries(select(.value != ""))) |
+        if (.push.worker_url // "") == "" or (.push.secret // "") == "" or (.push.node_key // "") == ""
+        then error("请同时配置 Worker URL、Secret 和 Node Key") else . end'
+}
 
-        case $c in
-            1)
-                local new_token new_chatid
-                read_prompt -r -s -p "Bot Token（留空保留当前值）: " new_token; echo
-                new_token=$(strip_cr "$new_token")
-                read_prompt -r -p "Chat ID（留空保留当前值）: " new_chatid
-                new_chatid=$(strip_cr "$new_chatid")
-                [ -z "$new_token" ] && new_token="$t_token"
-                [ -z "$new_chatid" ] && new_chatid="$t_chatid"
-                if [ -z "$new_token" ] || [ -z "$new_chatid" ]; then
-                    echo -e "${RED}Bot Token 和 Chat ID 必须同时配置。${PLAIN}"
-                    sleep 1
-                elif jq --arg token "$new_token" --arg chat_id "$new_chatid" \
-                    '.telegram.bot_token=$token | .telegram.chat_id=$chat_id' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "Bot 配置已更新。" "Bot 配置写入失败"; then
-                    sleep 0.5
-                else sleep 1; fi ;;
-            2)
-                local nv="true"; [ "$t_enable" == "true" ] && nv="false"
-                if [ "$nv" == "true" ] && { [ -z "$t_token" ] || [ -z "$t_chatid" ]; }; then
-                    echo -e "${RED}请先完成 Bot Token 和 Chat ID 配置。${PLAIN}"
-                    sleep 1
-                elif jq --argjson v "$nv" '.telegram.enable=$v' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。" "Telegram 状态写入失败"; then
-                    sleep 0.5
-                else sleep 1; fi ;;
-            3)
-                echo -e "当前阈值: ${t_thr}%"
-                read_prompt -r -p "新阈值（逗号分隔，如 50,80,100；留空取消）: " val
-                val=$(strip_cr "$val")
-                if [[ "$val" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-                    local arr_json=$(echo "$val" | tr ',' '\n' | jq -s '.')
-                    if jq --argjson v "$arr_json" '.telegram.thresholds=$v' "$CONFIG_FILE" > "$tmp" \
-                        && commit_generated_config "$tmp" "阈值已更新。" "通知阈值写入失败"; then sleep 0.5; else sleep 1; fi
-                elif [ -n "$val" ]; then
-                    echo -e "${RED}格式错误，请输入纯数字并用逗号分隔。${PLAIN}"; sleep 1
-                fi ;;
-            4)
-                echo -e "当前 API: $t_api"
-                echo -e "留空恢复默认：https://api.telegram.org"
-                read_prompt -r -p "新 API 地址（留空恢复官方 API）: " val
-                val=$(strip_cr "$val")
-                [ -z "$val" ] && val="https://api.telegram.org"
-                if jq --arg v "$val" '.telegram.api_url=$v' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "API 地址已更新。" "Telegram API 地址写入失败"; then sleep 0.5; else sleep 1; fi ;;
-            5)
-                echo -e "${YELLOW}正在发送测试消息...${PLAIN}"
-                if [ -z "$t_token" ] || [ -z "$t_chatid" ]; then
-                    echo -e "${RED}请先配置 Bot Token 和 Chat ID。${PLAIN}"; sleep 1
-                else
-                    local nid=$(jq -r '.node_id // "unknown"' "$CONFIG_FILE")
-                    local safe_nid=$(echo "$nid" | sed 's/[_*`\[]/\\&/g')
-                    local test_msg="✅ *Telegram 通知测试*
+toggle_notification() {
+    local provider=$1 label fields
+    case "$provider" in
+        telegram) label="Telegram 通知"; fields='["bot_token","chat_id"]' ;;
+        push) label="Cloudflare 推送"; fields='["worker_url","secret","node_key"]' ;;
+        *) return 1 ;;
+    esac
+    _run_edit_action save_notification_settings "${label}状态" --arg provider "$provider" --argjson fields "$fields" '
+        .[$provider] |= (
+            if .enable == true then .enable = false
+            else . as $settings |
+                if all($fields[]; ($settings[.] // "") != "") then .enable = true
+                else error("请先完成参数配置") end
+            end)'
+}
+
+test_telegram_notification() {
+    local config token chat_id api node safe_node message
+    config=$(jq -e '.telegram' "$CONFIG_FILE") || return 1
+    token=$(jq -r '.bot_token // ""' <<< "$config")
+    chat_id=$(jq -r '.chat_id // ""' <<< "$config")
+    api=$(jq -r '.api_url // "https://api.telegram.org"' <<< "$config")
+    if [[ -z "$token" || -z "$chat_id" ]]; then
+        echo -e "${RED}请先配置 Bot Token 和 Chat ID。${PLAIN}" >&2
+        return 1
+    fi
+    node=$(jq -r '.node_id // "unknown"' "$CONFIG_FILE")
+    safe_node=$(printf '%s' "$node" | sed 's/[_*`\[]/\\&/g')
+    message="✅ *Telegram 通知测试*
 ${TG_DIVIDER}
-🖥 节点  ${safe_nid}
+🖥 节点  ${safe_node}
 └ 📡 状态  Bot 通信正常
 ${TG_DIVIDER}
 ℹ️ PM 通知配置已生效"
-                    _TG_LAST_FAILURE_SCOPE=""
-                    _TG_LAST_FAILURE_DETAIL=""
-                    if _tg_send_chunk "$t_token" "$t_chatid" "$t_api" "$test_msg"; then
-                        pm_info "Telegram 测试消息发送成功"
-                        echo -e "${GREEN}发送成功!${PLAIN}"
-                    else
-                        pm_error "Telegram 测试消息发送失败（${_TG_LAST_FAILURE_DETAIL:-原因未明}）"
-                        local err=${_TG_LAST_FAILURE_DETAIL:-未知错误}
-                        echo -e "${RED}发送失败: ${err}${PLAIN}"
-                    fi
-                    sleep 2
-                fi ;;
-            6) show_notification_logs telegram ;;
-            0) rm -f "$tmp"; break ;;
+    echo -e "${YELLOW}正在发送测试消息...${PLAIN}"
+    _TG_LAST_FAILURE_SCOPE=""
+    _TG_LAST_FAILURE_DETAIL=""
+    if _tg_send_chunk "$token" "$chat_id" "$api" "$message"; then
+        pm_info "Telegram 测试消息发送成功"
+        echo -e "${GREEN}发送成功。${PLAIN}"
+    else
+        pm_error "Telegram 测试消息发送失败（${_TG_LAST_FAILURE_DETAIL:-原因未明}）"
+        echo -e "${RED}发送失败: ${_TG_LAST_FAILURE_DETAIL:-未知错误}${PLAIN}" >&2
+        return 1
+    fi
+}
+
+configure_telegram() {
+    local tg status bot api thresholds choice reply
+    while true; do
+        tg=$(jq -e '.telegram' "$CONFIG_FILE") || return 1
+        status=$(telegram_status_text)
+        bot="未配置"
+        jq -e '(.bot_token // "") != "" and (.chat_id // "") != ""' <<< "$tg" >/dev/null && bot="已配置"
+        api=$(jq -r '.api_url // "https://api.telegram.org"' <<< "$tg")
+        thresholds=$(jq -r '.thresholds // [50,80,100] | map(tostring) | join(", ")' <<< "$tg")
+        clear
+        echo -e "$UI_DIVIDER"
+        echo "   Telegram 通知"
+        echo -e "$UI_DIVIDER"
+        printf ' 状态:      %b\n Bot 配置:  %s\n 流量阈值:  %s%%\n API 地址:  %s\n' "$status" "$bot" "$thresholds" "$api"
+        echo -e "$UI_SEPARATOR"
+        echo " 1. 配置参数（Token、Chat ID、API 地址、流量阈值）"
+        echo " 2. 开启/关闭通知"
+        echo " 3. 发送测试消息"
+        echo " 4. 查看最近日志"
+        echo " 0. 返回通知与推送"
+        echo -e "$UI_DIVIDER"
+        read_prompt -r -p "请选择: " choice
+        case "$(strip_cr "$choice")" in
+            1) edit_telegram_settings; [[ $? != 2 ]] || continue ;;
+            2) toggle_notification telegram ;;
+            3) _run_edit_action test_telegram_notification ;;
+            4) show_notification_logs telegram; continue ;;
+            0) return 0 ;;
+            *) echo "无效选项，请输入 0-4。" >&2 ;;
         esac
-        stop_edit_lock
-        rm -f "$tmp"
+        read_prompt -r -p "按回车或输入 0 返回 Telegram 菜单: " reply
     done
 }
 
 configure_push() {
+    local push status url secret key choice reply
     while true; do
-        stop_edit_lock
-        local pc=$(jq '.push // {}' "$CONFIG_FILE")
-        local p_enable=$(echo "$pc" | jq -r '.enable // false')
-        local p_url=$(echo "$pc" | jq -r '.worker_url // ""')
-        local p_secret=$(echo "$pc" | jq -r '.secret // ""')
-        local p_nkey=$(echo "$pc" | jq -r '.node_key // ""')
-
-        local status_str=$(push_status_text)
-        local url_str="${YELLOW}未配置${PLAIN}"
-        [ -n "$p_url" ] && [ "$p_url" != "" ] && url_str="${GREEN}${p_url}${PLAIN}"
-        local secret_str="${YELLOW}未配置${PLAIN}"
-        [ -n "$p_secret" ] && [ "$p_secret" != "" ] && secret_str="${GREEN}已配置${PLAIN} (${p_secret:0:6}...)"
-        local nkey_str="${YELLOW}未配置${PLAIN}"
-        [ -n "$p_nkey" ] && [ "$p_nkey" != "" ] && nkey_str="${GREEN}${p_nkey}${PLAIN}"
-
+        push=$(jq -e '.push' "$CONFIG_FILE") || return 1
+        status=$(push_status_text)
+        url=$(jq -r '.worker_url // ""' <<< "$push")
+        secret=$(jq -r 'if (.secret // "") == "" then "未配置" else "已配置" end' <<< "$push")
+        key=$(jq -r '.node_key // ""' <<< "$push")
         clear
         echo -e "$UI_DIVIDER"
-        echo -e "   Cloudflare Worker 云端推送"
+        echo "   Cloudflare Worker 云端推送"
         echo -e "$UI_DIVIDER"
-        echo -e " 状态:     $status_str"
-        echo -e " Worker:   $url_str"
-        echo -e " Secret:   $secret_str"
-        echo -e " Node Key: $nkey_str"
+        printf ' 状态:     %b\n Worker:   %s\n Secret:   %s\n Node Key: %s\n' "$status" "${url:-未配置}" "$secret" "${key:-未配置}"
         echo -e "$UI_SEPARATOR"
-        echo -e " 1. 开启/关闭推送"
-        echo -e " 2. 配置 Worker URL"
-        echo -e " 3. 配置 Secret"
-        echo -e " 4. 配置 Node Key"
-        echo -e " 5. 立即测试推送"
-        echo -e " 6. 查看最近日志"
-        echo -e " 0. 返回通知与推送"
-        echo -e " 提示：已开启仅表示配置状态；测试会实际上报一次，不改变开关。"
+        echo " 1. 配置参数（Worker URL、Secret、Node Key）"
+        echo " 2. 开启/关闭推送"
+        echo " 3. 立即测试推送"
+        echo " 4. 查看最近日志"
+        echo " 0. 返回通知与推送"
+        echo " 提示：测试会实际上报一次，不改变开关。"
         echo -e "$UI_DIVIDER"
-        read_prompt -r -p "请选择: " c
-        c=$(strip_cr "$c")
-        case "$c" in 1|2|3|4|5) start_edit_lock || return 1 ;; esac
-        local tmp=$(mktemp)
-
-        case $c in
-            1)
-                local nv="true"; [ "$p_enable" == "true" ] && nv="false"
-                if [ "$nv" == "true" ] && { [ -z "$p_url" ] || [ -z "$p_secret" ] || [ -z "$p_nkey" ]; }; then
-                    echo -e "${RED}请先完成 Worker URL、Secret 和 Node Key 配置。${PLAIN}"
-                    sleep 1
-                elif jq --argjson v "$nv" '.push.enable=$v' "$CONFIG_FILE" > "$tmp" \
-                    && commit_generated_config "$tmp" "已$([ "$nv" == "true" ] && echo "开启" || echo "关闭")。" "云端推送状态写入失败"; then
-                    sleep 0.5
-                else sleep 1; fi ;;
-            2)
-                read_prompt -r -p "Worker URL（留空取消）: " val; val=$(strip_cr "$val")
-                if [ -n "$val" ]; then
-                    if jq --arg v "$val" '.push.worker_url=$v' "$CONFIG_FILE" > "$tmp" \
-                        && commit_generated_config "$tmp" "已更新。" "Worker URL 写入失败"; then sleep 0.5; else sleep 1; fi
-                fi ;;
+        read_prompt -r -p "请选择: " choice
+        case "$(strip_cr "$choice")" in
+            1) edit_push_settings; [[ $? != 2 ]] || continue ;;
+            2) toggle_notification push ;;
             3)
-                read_prompt -r -s -p "Secret（留空取消）: " val; echo; val=$(strip_cr "$val")
-                if [ -n "$val" ]; then
-                    if jq --arg v "$val" '.push.secret=$v' "$CONFIG_FILE" > "$tmp" \
-                        && commit_generated_config "$tmp" "已更新。" "Worker Secret 写入失败"; then sleep 0.5; else sleep 1; fi
-                fi ;;
-            4)
-                read_prompt -r -p "Node Key（留空取消）: " val; val=$(strip_cr "$val")
-                [ -z "$val" ] && { rm -f "$tmp"; continue; }
-                val=${val,,}
-                if [[ "$val" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
-                    if jq --arg v "$val" '.push.node_key=$v' "$CONFIG_FILE" > "$tmp" \
-                        && commit_generated_config "$tmp" "已更新。" "Node Key 写入失败"; then sleep 0.5; else sleep 1; fi
-                else
-                    echo -e "${RED}Node Key 必须为 1-64 位小写字母、数字、下划线或连字符，且以字母或数字开头。${PLAIN}"; sleep 1
-                fi ;;
-            5)
                 echo -e "${YELLOW}正在测试推送...${PLAIN}"
-                if ! push_to_worker --test; then
+                if ! _run_edit_action push_to_worker --test; then
                     echo -e "${RED}推送失败，详细原因见上方提示及 ${LOG_FILE}。${PLAIN}"
-                fi
-                stop_edit_lock
-                read_prompt -r -p "按回车返回..." val ;;
-            6) show_notification_logs cloudflare ;;
-            0) rm -f "$tmp"; break ;;
+                fi ;;
+            4) show_notification_logs cloudflare; continue ;;
+            0) return 0 ;;
+            *) echo "无效选项，请输入 0-4。" >&2 ;;
         esac
-        stop_edit_lock
-        rm -f "$tmp"
+        read_prompt -r -p "按回车或输入 0 返回 Cloudflare 菜单: " reply
     done
 }
 

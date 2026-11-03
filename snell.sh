@@ -191,6 +191,7 @@ run_menu_action() {
     shift
     local rc=0
     "$@" || rc=$?
+    [[ "$rc" != 2 || "$1" != add_instance ]] || return 2
     if [[ $rc -ne 0 ]]; then
         echo -e "${RED}❌ ${label}失败（退出码 ${rc}），请查看上方错误信息。${PLAIN}" >&2
     fi
@@ -863,16 +864,14 @@ add_instance() {
         warn "Snell 核心或 systemd 服务未安装，请先选择菜单 1。"
         return 1
     fi
-    ensure_snell_user || return 1
-    secure_config_permissions || { warn "无法确认配置目录权限"; return 1; }
-
     echo -e "${BLUE}>>> 添加新的 Snell 实例${PLAIN}"
 
     # 端口输入与检查
     local port conf existing=false occupied
     while true; do
-        read -rp "请输入端口号 (1-65535): " port || return
+        read -rp "请输入端口号 (1-65535，0 返回): " port || return
         port=$(strip_cr "$port")
+        [[ "$port" != 0 ]] || return 2
         [[ "$port" =~ ^[0-9]+$ ]] || { echo "输入无效"; continue; }
         port=$((10#$port))
         if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then echo "范围无效"; continue; fi
@@ -900,6 +899,9 @@ add_instance() {
             break
         fi
     done
+
+    ensure_snell_user || return 1
+    secure_config_permissions || { warn "无法确认配置目录权限"; return 1; }
 
     # 生成 PSK
     local psk
@@ -1518,7 +1520,7 @@ menu() {
     
     case $choice in
         1) run_menu_action "安装或更新 Snell" install_core; read_prompt -rp " 按回车返回..." ;;
-        2) run_menu_action "添加 Snell 实例" add_instance; read_prompt -rp " 按回车返回..." ;;
+        2) if run_menu_action "添加 Snell 实例" add_instance; then read_prompt -rp " 按回车返回..."; fi ;;
         3) run_menu_action "读取 Snell 状态" show_service_status; read_prompt -rp " 按回车返回..." ;;
         4) run_menu_action "查看客户端配置" show_all_configs; read_prompt -rp " 按回车返回..." ;;
         5) run_menu_action "删除 Snell 实例" del_instance; read_prompt -rp " 按回车返回..." ;;
@@ -1559,7 +1561,7 @@ sync_script
 if [[ $# -gt 0 ]]; then
     case "$1" in
         install)   install_core || exit $? ;;
-        add)       add_instance || exit $? ;;
+        add)       add_instance || { rc=$?; [[ "$rc" == 2 ]] || exit "$rc"; } ;;
         list|ls)   show_all_configs || exit $? ;;
         status)    show_service_status || exit $? ;;
         delete|del|rm) del_instance || exit $? ;;

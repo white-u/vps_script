@@ -106,8 +106,9 @@ init_config || exit 1
     def test_add_cancel_invalid_fields_and_eof_leave_existing_ports_untouched(self):
         self.seed_ports()
         before = self.config.read_bytes()
-        inputs = ('0\n', 'M\n0\n', 'M\n65536\n', 'M\n9000\n0\n',
+        inputs = ('0\n', 'M\n0\n', 'M\n65536\n', 'M\n9000\n0\n', 'M\n9000\n20\n0\n',
                   'M\n9000\n20\n3\n', 'M\n9000\n20\n1\nn\n32\n',
+                  'M\n9000\n20\n1\nn\n/back\n', 'M\n9000\n20\n1\nn\n0\n/back\n',
                   'M\n9000\n20\n1\nn\n0\nNew\n2026-02-30\n',
                   '', 'M\n9000\n20\n1\nn\n0\nNew\n')
         for answer in inputs:
@@ -194,6 +195,58 @@ delete_port_flow 443 8443 9443
         self.assertEqual((self.path / 'config/state/443.txt').read_text(), 'existing-usage\n')
         self.assertIn('原配置与规则已恢复', result.stdout)
         self.assertNotIn('已删除', result.stdout)
+
+
+    def test_notification_menus_save_each_complete_form_once(self):
+        result = self.run_pm(r'''
+mv() {
+    command mv "$@" || return 1
+    if [[ "${@: -1}" == "$CONFIG_FILE" ]]; then echo saved >> "$TEST_DIR/config-saves"; fi
+}
+configure_notifications
+echo RETURNED
+''', '1\n1\ntoken-fixture\n-1234\nhttps://tg.example.test\n30,75,100\ny\n0\n0\n'
+     '2\n1\nhttps://worker.example.test/api/push\n\\/back\nNODE-01\ny\n0\n0\n0\n')
+        self.assert_ok(result)
+        self.assertIn('RETURNED', result.stdout)
+        self.assertNotIn('token-fixture', result.stdout + result.stderr)
+        config = self.read_config()
+        self.assertEqual(config['telegram'], {
+            'enable': False, 'bot_token': 'token-fixture', 'chat_id': '-1234',
+            'api_url': 'https://tg.example.test', 'thresholds': [30, 75, 100],
+        })
+        self.assertEqual(config['push'], {
+            'enable': False, 'worker_url': 'https://worker.example.test/api/push',
+            'secret': '/back', 'node_key': 'node-01',
+        })
+        self.assertEqual((self.path / 'config-saves').read_text().splitlines(), ['saved', 'saved'])
+        self.assertFalse((self.path / 'edit.lock').exists())
+
+    def test_notification_blank_fields_preserve_values_and_back_returns_directly(self):
+        self.assert_ok(self.run_pm('edit_telegram_settings',
+                                   'existing-token\n-1234\nhttps://tg.example.test\n50,100\ny\n'))
+        result = self.run_pm('configure_telegram\necho RETURNED', '1\n\n\n\n70,100\ny\n0\n1\nunsaved\n/back\n0\n')
+        self.assert_ok(result)
+        self.assertIn('RETURNED', result.stdout)
+        self.assertEqual(self.read_config()['telegram'], {
+            'enable': False, 'bot_token': 'existing-token', 'chat_id': '-1234',
+            'api_url': 'https://tg.example.test', 'thresholds': [70, 100],
+        })
+
+    def test_notification_cancel_and_invalid_input_do_not_save(self):
+        self.assert_ok(self.run_pm(''))
+        before = self.config.read_bytes()
+        for action, data, expected in (
+            ('edit_telegram_settings', 'new-token\n123\n\n\n0\n', 2),
+            ('edit_telegram_settings', 'new-token\n123\n\nbad\n', 1),
+            ('edit_push_settings', 'https://worker.example.test/api/push\n/back\n', 2),
+            ('edit_push_settings', 'https://worker.example.test/api/push\nsecret\ninvalid key\n', 1),
+        ):
+            with self.subTest(action=action, expected=expected):
+                result = self.run_pm('start_edit_lock() { echo UNEXPECTED_LOCK >&2; return 1; }\n' + action, data)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertNotIn('UNEXPECTED_LOCK', result.stderr)
+                self.assertEqual(self.config.read_bytes(), before)
 
 
 @unittest.skipUnless(BASH4 and shutil.which('jq'), 'Requires Bash 4+ and jq')

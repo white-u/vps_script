@@ -232,6 +232,26 @@ add_instance
         self.assertNotIn('无需更新', repaired.stdout)
         self.assertIn('snell-server v6.1.0', (self.root / 'core').read_text())
 
+    def test_add_instance_zero_returns_without_creating_instance(self):
+        conf = self.root / 'config'; conf.mkdir()
+        (self.root / 'systemd').mkdir()
+        (self.root / 'systemd/service').touch()
+        core = self.root / 'core'; core.touch(); core.chmod(0o755)
+        result = self.run_shell(['strip_cr', 'add_instance', 'run_menu_action', 'menu'], r'''
+RED=""; GREEN=""; DIM=""; YELLOW=""; SCRIPT_VERSION=1.0.0
+clear() { :; }
+get_installed_full_ver() { echo 6.0.0; }
+ensure_snell_user() { echo UNEXPECTED_USER_PREPARE; return 1; }
+secure_config_permissions() { echo UNEXPECTED_PERMISSIONS; return 1; }
+ss() { echo UNEXPECTED_PORT_CHECK; return 1; }
+read_prompt() { builtin read "$@" || exit 98; }
+while true; do menu; done
+''', '2\n0\n0\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('Snell 多实例管理'), 2)
+        self.assertNotIn('UNEXPECTED_', result.stdout)
+        self.assertEqual(list(conf.iterdir()), [])
+
     def test_config_replacement_is_staged_on_target_filesystem(self):
         self.prepare_install()
         result = self.install(extra=r'''
