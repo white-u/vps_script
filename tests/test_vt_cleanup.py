@@ -77,7 +77,11 @@ close_port() {
     [[ "$MODE" != firewall-failed ]] || return 1
 }
 open_port() { echo "$*" >> "$TEST_DIR/opened"; }
-flock() { echo "$*" >> "$TEST_DIR/flock.calls"; [[ "$MODE" != lock-failed ]]; }
+flock() {
+    echo "$*" >> "$TEST_DIR/flock.calls"
+    [[ "$MODE" != lock-busy ]] || return 75
+    [[ "$MODE" != lock-failed ]]
+}
 crontab() {
     echo "$*" >> "$TEST_DIR/cron.calls"
     if [[ "$1" == -l ]]; then
@@ -299,6 +303,18 @@ class VTCleanupTests(unittest.TestCase):
                 retry = self.run_cleanup()
                 self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
                 self.assertFalse((self.root / "etc/port_monitor").exists())
+
+    def test_pm_lock_timeout_preserves_cron_rules_and_configuration(self):
+        self.pm()
+        result = self.run_cleanup("lock-busy")
+        self.assert_failed(result)
+        self.assertIn("最多等待 30 秒", result.stderr)
+        self.assertIn("等待 PM 后台任务锁超时", result.stderr)
+        self.assertEqual((self.root / "crontab").read_text(), self.cron_original)
+        for name in ("etc/port_monitor/config.json", "usr/local/bin/pm", "nft-table", "tc-root"):
+            self.assertTrue((self.root / name).exists(), name)
+        for name in ("cron.calls", "nft.calls", "tc.calls"):
+            self.assertFalse((self.root / name).exists(), name)
 
     def test_pm_success_uses_recorded_interface_and_preserves_other_cron_jobs(self):
         self.pm()

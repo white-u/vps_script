@@ -367,7 +367,18 @@ cleanup_pm() (
     fi
     # 与后台任务共用锁，等待正在执行的任务结束，避免清理后又重建规则。
     exec 9>/var/run/pm_cron.lock || return 1
-    flock -x 9 || { echo "无法等待 PM 后台任务结束。" >&2; return 1; }
+    local lock_rc=0
+    flock -x -n -E 75 9 || lock_rc=$?
+    if [[ "$lock_rc" -eq 75 ]]; then
+        echo "PM 后台任务锁正由其他进程持有，最多等待 30 秒..." >&2
+        lock_rc=0
+        flock -x -w 30 -E 75 9 || lock_rc=$?
+    fi
+    case "$lock_rc" in
+        0) ;;
+        75) echo "等待 PM 后台任务锁超时，PM 配置和规则已保留，请稍后重试。" >&2; return 1 ;;
+        *) echo "无法获取 PM 后台任务锁（退出码 ${lock_rc}）。" >&2; return 1 ;;
+    esac
     local scratch
     scratch=$(mktemp -d) || return 1
     trap 'rm -rf "$scratch"' EXIT

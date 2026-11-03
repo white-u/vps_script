@@ -112,6 +112,26 @@ class PMBaselineTests(unittest.TestCase):
         self.assert_ok(self.run_pm('source "$TEST_DIR/entry.sh"', "--monitor"))
         self.assertTrue((self.path / "cron-ran").exists())
 
+    def test_busy_monitor_lock_reports_timeout_without_touching_config_or_holder(self):
+        self.initialize()
+        original = self.config.read_bytes()
+        marker = self.path / "edit.lock"
+        marker.write_text("held by another session")
+        for operation in ('source "$TEST_DIR/entry.sh"', 'show_main_menu'):
+            with self.subTest(operation=operation):
+                (self.path / "pm.log").unlink(missing_ok=True)
+                result = self.run_pm(r'''
+install_deps() { :; }
+ensure_runtime_rules() { touch "$TEST_DIR/rules-ran"; }
+flock() { return 75; }
+''' + operation)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("最多等待 30 秒", result.stderr)
+                self.assertIn("等待 PM 后台任务锁超时", (self.path / "pm.log").read_text())
+                self.assertEqual(self.config.read_bytes(), original)
+                self.assertEqual(marker.read_text(), "held by another session")
+                self.assertFalse((self.path / "rules-ran").exists())
+
     def test_incomplete_or_corrupt_config_is_preserved(self):
         config = self.initialize()
         candidates = ["", "{broken", "[]"]
@@ -125,6 +145,67 @@ class PMBaselineTests(unittest.TestCase):
                 self.config.write_text(content)
                 self.assertNotEqual(self.run_pm("init_config").returncode, 0)
                 self.assertEqual(self.config.read_text(), content)
+
+    def test_busy_config_lock_preserves_original_config(self):
+        config = self.initialize()
+        original = self.config.read_bytes()
+        config["node_id"] = "replacement"
+        (self.path / "candidate.json").write_text(json.dumps(config))
+        for operation in ('safe_write_config "$(cat "$TEST_DIR/candidate.json")"',
+                          'safe_write_config_from_file "$TEST_DIR/candidate.json"'):
+            with self.subTest(operation=operation):
+                (self.path / "pm.log").unlink(missing_ok=True)
+                result = self.run_pm('flock() { return 75; }\n' + operation)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("等待 PM 配置写入锁超时", (self.path / "pm.log").read_text())
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_uninstall_preserves_background_lock_inode(self):
+        self.initialize()
+        lock = self.path / "cron.lock"
+        lock.touch()
+        inode = lock.stat().st_ino
+        result = self.run_pm(r'''
+INSTALL_PATH="$TEST_DIR/installed"
+TC_OWNER_FILE="$CONFIG_DIR/tc_root_owned"
+_update_monitor_cron() { [ "$1" = remove ]; }
+nft() { printf '{"nftables":[]}\n'; }
+uninstall_script <<< yes
+''')
+        self.assert_ok(result)
+        self.assertFalse(self.config.exists())
+        self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_startup_rechecks_shortcut_and_registers_cron_before_releasing_lock(self):
+        code = r'''
+INSTALL_PATH="$TEST_DIR/installed"
+install_deps() { :; }
+ensure_runtime_rules() { [ -s "$CONFIG_FILE" ]; }
+flock() {
+    if [ "${REMOVE_SHORTCUT_ON_LOCK:-}" = yes ] && [ "$1" = -x ] && [ "${@: -1}" = 7 ]; then
+        rm -f "$INSTALL_PATH"
+    fi
+    if [ "$*" = "-u 7" ]; then touch "$TEST_DIR/startup-unlocked"; fi
+}
+setup_cron() {
+    [ ! -e "$TEST_DIR/startup-unlocked" ] || return 1
+    touch "$TEST_DIR/cron-registered"
+}
+show_main_menu() { exit 0; }
+source "$TEST_DIR/entry.sh"
+'''
+        shortcut = self.path / "installed"
+        shortcut.touch(mode=0o755)
+        result = self.run_pm("REMOVE_SHORTCUT_ON_LOCK=yes\n" + code)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(shortcut.exists())
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.path / "cron-registered").exists())
+        shortcut.touch(mode=0o755)
+        self.assert_ok(self.run_pm(code))
+        self.assertTrue(self.config.exists())
+        self.assertTrue((self.path / "cron-registered").exists())
+        self.assertTrue((self.path / "startup-unlocked").exists())
 
     def test_failed_initial_write_does_not_create_partial_config(self):
         result = self.run_pm("jq() { return 1; }; init_config")

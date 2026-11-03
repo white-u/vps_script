@@ -454,8 +454,6 @@ install_deps() {
             exit 1
         fi
     fi
-
-    init_config || exit 1
 }
 
 # 直接创建首版完整结构；已有配置只校验，不补字段、不转换历史格式。
@@ -905,10 +903,27 @@ ensure_runtime_rules() {
 # 3. 守护进程 (Writer: Cron)
 # ==============================================================================
 
+wait_for_pm_lock() {
+    local fd=$1 lock_name=$2 rc wait_seconds=30
+    flock -x -n -E 75 "$fd" && return 0
+    rc=$?
+    if [ "$rc" -eq 75 ]; then
+        echo -e "${YELLOW}PM ${lock_name}正由其他进程持有，最多等待 ${wait_seconds} 秒...${PLAIN}" >&2
+        flock -x -w "$wait_seconds" -E 75 "$fd" && return 0
+        rc=$?
+    fi
+    if [ "$rc" -eq 75 ]; then
+        pm_error "等待 PM ${lock_name}超时。请检查其他 PM 会话或查看 ${LOG_FILE}，稍后重试。"
+    else
+        pm_error "无法获取 PM ${lock_name}（退出码 ${rc}）"
+    fi
+    return 1
+}
+
 safe_write_config() {
     local content="$1"
     if ! (
-        flock -x 200 || exit 1
+        wait_for_pm_lock 200 "配置写入锁" || exit 1
         local tmp
         tmp=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX") || exit 1
         printf '%s\n' "$content" > "$tmp"
@@ -934,7 +949,7 @@ safe_write_config_from_file() {
         return 1
     }
     if ! (
-        flock -x 200 || exit 1
+        wait_for_pm_lock 200 "配置写入锁" || exit 1
         local tmp
         tmp=$(mktemp "$CONFIG_DIR/.config.json.tmp.XXXXXX") || exit 1
         cp "$src_file" "$tmp" || { rm -f "$tmp"; exit 1; }
@@ -2238,7 +2253,7 @@ setup_cron() {
 start_edit_lock() {
     [ "$_MENU_LOCK_HELD" == "true" ] && return 0
     exec 8>"$CRON_LOCK_FILE" || { pm_error "无法打开后台任务锁"; return 1; }
-    flock -x 8 || { pm_error "无法等待后台任务结束"; exec 8>&-; return 1; }
+    wait_for_pm_lock 8 "后台任务锁" || { exec 8>&-; return 1; }
     if ! touch "$USER_EDIT_LOCK"; then
         pm_error "无法创建菜单编辑锁"
         flock -u 8 2>/dev/null || true
@@ -3411,8 +3426,8 @@ uninstall_script() {
         return 1
     fi
 
-    # 4. 删除文件
-    if ! rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$CRON_LOCK_FILE" "$USER_EDIT_LOCK" "$LOG_FILE" 2>/dev/null; then
+    # 保留后台锁文件，让已经在等待的进程和重装后的进程继续使用同一 inode。
+    if ! rm -rf "$CONFIG_DIR" "$INSTALL_PATH" "$LOCK_FILE" "$USER_EDIT_LOCK" "$LOG_FILE" 2>/dev/null; then
         echo -e "${RED}卸载未完成: 部分文件无法删除，请检查权限后重试。${PLAIN}"
         return 1
     fi
@@ -3439,15 +3454,20 @@ if [ "${1:-}" == "--monitor" ] || [ "${1:-}" == "--ipl" ]; then
     fi
     mkdir -p "$STATE_DIR"
 else
-    # 首次初始化与规则恢复也与既有 Cron 互斥，避免后台任务并发改写状态。
-    exec 7>"$CRON_LOCK_FILE" || { pm_error "无法打开后台任务锁"; exit 1; }
-    flock -x 7 || { pm_error "无法等待后台任务结束"; exit 1; }
     install_deps
-    ensure_runtime_rules || {
-        flock -u 7 2>/dev/null || true
-        exec 7>&-
+    # 初始化、规则恢复和 Cron 注册共用卸载锁，避免卸载后重新写入任务。
+    exec 7>"$CRON_LOCK_FILE" || { pm_error "无法打开后台任务锁"; exit 1; }
+    wait_for_pm_lock 7 "后台任务锁" || exit 1
+    if [ ! -x "$INSTALL_PATH" ]; then
+        pm_error "PM 快捷命令已不存在或不可执行，已停止初始化，请重新启动安装。"
         exit 1
-    }
+    fi
+    init_config || exit 1
+    ensure_runtime_rules || exit 1
+    case "${1:-}" in
+        update|uninstall) ;;
+        *) setup_cron || exit 1 ;;
+    esac
     flock -u 7 2>/dev/null || true
     exec 7>&-
 fi
@@ -3482,7 +3502,6 @@ elif [ "${1:-}" == "update" ]; then
 elif [ "${1:-}" == "uninstall" ]; then
     uninstall_script
 else
-    setup_cron || exit 1
     _IS_MENU_MODE=true
     while true; do show_main_menu; done
 fi

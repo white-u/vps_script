@@ -182,6 +182,8 @@ IPv6 压缩、展开和大小写写法按同一地址匹配，IPv4 映射地址�
 tail -n 100 /var/log/port_monitor.log
 ```
 
+进入菜单、写入配置或卸载时，如果所需的锁被占用，终端会显示等待提示。每次最多等待 30 秒，超时后停止本次操作。PM 的超时会写入 `/var/log/port_monitor.log`。通过 `vt` 清理 PM 时，超时会保留 PM 的配置和规则。两种卸载方式都保留后台锁文件，使等待中的进程与重装后的进程继续使用同一把锁。
+
 Cloudflare 数据不更新时，先在云端推送菜单执行一次测试。若提示 `HTTP 403: Timestamp expired`，表示 VPS 系统时间与云端相差超过 120 秒；运行 `timedatectl status` 检查，使用 `sudo timedatectl set-ntp true` 启用系统自动校时，并确认同步成功后再测试。修改时区不能修复系统时钟偏差；若系统未提供可用的校时服务，需检查已安装的 NTP/chrony 服务。`Forbidden` 表示签名校验失败，应核对 Secret；HTTP 5xx 则需查看 Worker 日志和 D1 绑定。
 
 **Q: 升级后配置文件会不会丢？**
