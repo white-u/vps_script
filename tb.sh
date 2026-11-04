@@ -4,8 +4,8 @@ set -euo pipefail
 umask 077
 
 # Keep the executable payload identical across download channels.
-SOURCE_REF='traffic-balance-v1.0.6'
-SOURCE_SHA256='7c857e6689c975c5cb36958d3dbaf9ce2538e7b0b65178ee3576d21c3cf9f922'
+SOURCE_REF='traffic-balance-v1.0.0'
+SOURCE_SHA256='86f891c8cd076e9d1e5462aa54ac2e20eda564c67cc05d68c682662ce6da1e06'
 SOURCE_URLS=(
     "https://raw.githubusercontent.com/white-u/vps_script/$SOURCE_REF/traffic_balance.py"
     "https://api.github.com/repos/white-u/vps_script/contents/traffic_balance.py?ref=$SOURCE_REF"
@@ -84,8 +84,12 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     download_script "$TASK_TMP/traffic_balance.py"
-    echo '下载校验通过。进入菜单后选 2，可配置并启动；保存配置后可用 tb 调起。'
-    python3 "$TASK_TMP/traffic_balance.py"
+    if [[ -f /etc/traffic-balance/config.json ]]; then
+        python3 "$TASK_TMP/traffic_balance.py" --apply-update
+    else
+        echo '下载校验通过。选 1 配置并启动，之后可用 tb 调起。'
+        python3 "$TASK_TMP/traffic_balance.py"
+    fi
 }
 
 main "$@"

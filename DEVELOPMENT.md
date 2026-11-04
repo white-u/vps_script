@@ -67,4 +67,6 @@ PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计
 
 ## 流量调节器发行
 
-`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.6`。不要覆盖已发布的发行标签。
+`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前定版标签为 `traffic-balance-v1.0.0`，程序版本为 1.0.0，内部配置格式保持 6。不要覆盖已发布的发行标签。
+
+在线更新测试包含停止/启动、失败回退、信号中断、保留当天账本；`tests/integration_traffic_balance.py` 在隔离服务与私有 vnStat 数据库上验证真实更新和失败恢复，不覆盖正式服务。运行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_traffic_balance*.py' -q`。
