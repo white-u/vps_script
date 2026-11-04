@@ -224,7 +224,7 @@ ExecStart={shutil.which('vnstatd')} --config {b.VNSTAT_CONFIG} --nodaemon
             cmd[-1] = f'http://{peer_ip}:45443/download'
             return cmd
         b.curl_command = local_command
-        amount, ok, _, reason = b.download(c, 'cloudflare', 1024*1024, settings, day, time.monotonic()+15)
+        amount, ok, _, reason = b.download(c, 'wechat', 1024*1024, settings, day, time.monotonic()+15)
         require(ok and amount == 1024*1024, 'Real limited curl failed: '+reason)
         report('real Linux curl payload accounting, interface binding and header cleanup')
         require(not list(base.glob('traffic-balance-header-*')), 'Temporary header was retained')
@@ -245,7 +245,7 @@ ExecStart={shutil.which('vnstatd')} --config {b.VNSTAT_CONFIG} --nodaemon
                 raise AssertionError('Busy network preflight allowed a download')
             report('busy real isolated veth traffic prevents new downloads')
             before = time.monotonic()
-            amount, ok, _, reason = b.download(busy_c, 'cloudflare', 4*b.MIB, settings, day, before+15)
+            amount, ok, _, reason = b.download(busy_c, 'wechat', 4*b.MIB, settings, day, before+15)
             require(not ok and '带宽' in reason and '[下载保护]' in reason and
                     '> 0.8 Mbps' in reason and time.monotonic()-before < 6,
                     'Live protection did not stop promptly: '+reason)
@@ -327,7 +327,7 @@ sys.exit(b.main())
         report('pause/stop persistence and corrupt-state shutdown without clearing accounting')
 
         if args.public_interface:
-            public = dict(c, interface=args.public_interface, speed_mbps=1)
+            public = dict(c, interface=args.public_interface, download_percent=100/c['bandwidth_mbps'])
             b.preflight(public)
             for source in b.SOURCES:
                 try:

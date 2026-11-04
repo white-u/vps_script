@@ -52,7 +52,7 @@ python3 tests/integration_traffic_balance.py
 
 PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计数、分类映射、规则恢复、锁与 Cron。FW 下载并校验 Realm，使用独立目录、唯一 systemd 服务和回环地址验证 TCP/UDP 转发及交互流程。两者清理自身资源，清理失败应保留恢复线索并停止进一步破坏。
 
-每日补量集成需要 `vnstat`、`vnstatd`、curl、Python、systemd 和网络空间/veth 权限。使用私有数据库、唯一服务和隔离网卡；默认只跑私有流量，不访问公网，测试服务只依赖私有 vnStat 单元，不启动生产 vnStat。可选 `--public-interface ens3` 以 1 Mbps 对三家各测最多 1 MiB，遇限流立即结束公网部分、不切源绕过。已有子网冲突时拒绝创建网络；停服、禁用、归属核查失败时保留资源并报恢复目录。可用解包到独立目录的 vnStat 包，通过 PATH 指定工具，避免安装全局服务。
+每日补量集成需要 `vnstat`、`vnstatd`、curl、Python、systemd 和网络空间/veth 权限。使用私有数据库、唯一服务和隔离网卡；默认只跑私有流量，不访问公网，测试服务只依赖私有 vnStat 单元，不启动生产 vnStat。可选 `--public-interface ens3` 以 1 Mbps 对五个文件各测最多 1 MiB，遇限流立即结束公网部分、不切源绕过。已有子网冲突时拒绝创建网络；停服、禁用、归属核查失败时保留资源并报恢复目录。可用解包到独立目录的 vnStat 包，通过 PATH 指定工具，避免安装全局服务。
 
 这些测试不等于公网吞吐、云安全组、真实 Telegram / D1 或完整发行验收。SSH 的真实新连接确认也不能用静态解析测试代替。完整边界见 [README 回归测试](README.md#回归测试)。
 
@@ -67,4 +67,4 @@ PM 需要 systemd、Cron、nftables、TC 和网络命名空间；验证真实计
 
 ## 流量调节器发行
 
-`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.5`。不要覆盖已发布的发行标签。
+`tb.sh` 使用固定的 `SOURCE_REF` 和 `SOURCE_SHA256`，三个下载通道只接受同一份 Python 正文。修改 `traffic_balance.py` 后需同步摘要与新发行标签，并将提交和该标签一同推送；`test_release_digest_matches_the_published_payload_file` 会拦截摘要未同步的发布。当前修复标签为 `traffic-balance-v1.0.6`。不要覆盖已发布的发行标签。

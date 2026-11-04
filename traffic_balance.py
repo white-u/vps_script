@@ -37,7 +37,15 @@ LOG = Path('/var/log/traffic-balance.log')
 # memory-backed on the supported systemd systems. Non-Linux path is for tests.
 HEADER_DIR = '/run' if sys.platform.startswith('linux') else tempfile.gettempdir()
 SERVICE = 'traffic-balance.service'
-SOURCES = ['cloudflare', 'ovh', 'hetzner']
+SOURCE_FILES = {
+    'wechat': 'https://dldir1v6.qq.com/weixin/Universal/Windows/WeChatWin_4.2.0.exe',
+    'qwen': 'https://assets.qwenwork.cn/release/latest/qwenworkcn-setup-x64.exe',
+    'doubao': 'https://bbjhgihbvvhu.jspcdn.cn:20443/lf9-apk.ugapk.cn/package/pc/doubao_client/2034006/doubao_client_webdaoliu_ygpz_popup_guest_small_macos_v2034006_b5e0_1793603938.dmg?v=1793604091&u_disp_type=3&real_host=bGY5LWFway51Z2Fway5jbg',
+    'blender': 'https://download.blender.org/release/Blender4.5/blender-4.5.0-windows-x64.msi',
+    'gimp': 'https://mirror.freedif.org/gimp/pub/gimp/v3.0/windows/gimp-3.0.4-setup.exe',
+}
+SOURCES = list(SOURCE_FILES)
+MAX_SOURCE_BYTES = 1024 * MIB
 STOP = threading.Event()
 logger = logging.getLogger('traffic-balance')
 CPU_LIMIT = 70
@@ -45,9 +53,9 @@ START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
 ROUND_SECONDS = 300
-DEFAULT = dict(version=5, interface='', ratio=3.2,
+DEFAULT = dict(version=6, interface='', ratio=3.2,
                daily_mib=10240, interval_min=20, interval_max=60,
-               max_attempts=100, round_mib=1024, min_tx_mib=200,
+               max_attempts=100, min_tx_mib=200,
                bandwidth_mbps=0, download_percent=40, load_per_cpu=0.8)
 
 
@@ -155,7 +163,7 @@ def number(value, low, high, name, integer=False):
 
 def validate_config(c):
     version = c.get('version')
-    if version in (1, 2, 3, 4):
+    if version in (1, 2, 3, 4, 5):
         raise Error('检测到旧版配置，请先在配置菜单卸载，再重新运行安装入口')
     if set(c) != set(DEFAULT) or version != DEFAULT['version']:
         raise Error('配置字段缺失或版本不支持，请检查 config.json')
@@ -165,7 +173,7 @@ def validate_config(c):
     for key, lo, hi, integer in [
         ('daily_mib', 1, 1048576, False), ('interval_min', 1, 1440, True),
         ('interval_max', 1, 1440, True),
-        ('max_attempts', 1, 10000, True), ('round_mib', .001, 102400, False),
+        ('max_attempts', 1, 10000, True),
         ('min_tx_mib', 0, 1048576, False), ('bandwidth_mbps', .001, 1000000, False),
         ('download_percent', 1, 100, False),
         ('load_per_cpu', .01, 100, False),
@@ -366,7 +374,7 @@ def plan(c, s, v):
     if s['barrier']:
         return 0, '等待 vnStat 采样覆盖上轮下载'
     if time.time() < s['cooldown']:
-        return 0, '测速服务限流，遵守 Retry-After 等待，不切源绕过'
+        return 0, '下载源限流，遵守 Retry-After 等待，不切源绕过'
     if s['used'] >= int(c['daily_mib'] * MIB) or s['attempts'] >= c['max_attempts']:
         return 0, '已达每日额度或次数限制，等待下一统计日'
     if v['tx'] < c['min_tx_mib'] * MIB or v['tx'] == 0:
@@ -374,8 +382,7 @@ def plan(c, s, v):
     gap = required_inbound(c, v['tx']) - v['rx']
     if gap <= 0:
         return 0, '入站/出站比例已达标，无需补量'
-    amount = min(gap, int(c['round_mib'] * MIB),
-                 int(c['daily_mib'] * MIB) - s['used'])
+    amount = min(gap, int(c['daily_mib'] * MIB) - s['used'])
     return amount, '准备按比例缺口补量'
 
 
@@ -539,9 +546,7 @@ def retry_after(headers, now):
 
 
 def curl_command(c, source, amount, seconds):
-    url = {'cloudflare': f'https://speed.cloudflare.com/__down?bytes={amount}',
-           'ovh': 'https://proof.ovh.net/files/1Gb.dat',
-           'hetzner': 'https://fsn1-speed.hetzner.com/1GB.bin'}[source]
+    url = SOURCE_FILES[source]
     return ['curl', '-q', '--silent', '--show-error', '--no-buffer', '--fail', '--noproxy', '*',
             '--proto', '=https', '--http1.1', '--interface', c['interface'],
             '--limit-rate', str(max(1, int(effective_speed(c) * 1000000 / 8))),
@@ -570,6 +575,8 @@ def download(c, source, amount, settings, day, deadline, guard=None):
         except OSError as e:
             raise DownloadNotStarted(f'无法启动 curl：{e}；本次不计量、不计次，请检查安装和权限') from e
         actual, errors, reason = 0, bytearray(), ''
+        expected_actual = amount
+        headers_checked = False
         tick = time.monotonic() + DOWNLOAD_CHECK_SECONDS
         kill_at = None
         budget_stop = False
@@ -583,6 +590,18 @@ def download(c, source, amount, settings, day, deadline, guard=None):
                         if not chunk:
                             sel.unregister(key.fileobj)
                         elif key.data == 'body':
+                            if not headers_checked:
+                                headers_checked = True
+                                raw_headers = os.pread(header.fileno(), 65537, 0).decode('iso-8859-1')
+                                ranges = re.findall(r'^Content-Range:\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$', raw_headers, re.I | re.M)
+                                codes_so_far = re.findall(r'^HTTP/\S+\s+(\d{3})', raw_headers, re.M)
+                                if ranges:
+                                    start, end, total = map(int, ranges[-1])
+                                    expected_actual = min(amount, total)
+                                if (not codes_so_far or codes_so_far[-1] != '206' or not ranges or
+                                        start != 0 or total <= 0 or total > MAX_SOURCE_BYTES or
+                                        end+1 != expected_actual):
+                                    reason = '下载失败：来源文件大小或范围响应异常，已终止并记录实际消耗'
                             actual += len(chunk)
                         else:
                             if len(errors) + len(chunk) > 65536:
@@ -643,7 +662,7 @@ def download(c, source, amount, settings, day, deadline, guard=None):
         reason, budget_stop = '服务限流；已结束本轮并保存等待时间，不切源绕过', False
     # A deliberate stop after receiving exactly our payload budget is complete;
     # an interrupted/failed transfer or an overrun is never reported as success.
-    ok = (200 <= http < 300 and actual == amount and
+    ok = (http == 206 and headers_checked and actual == expected_actual and
           ((code == 0 and not reason) or (budget_stop and code in (0, -signal.SIGTERM))))
     reason = ('已完成本轮补量预算' if budget_stop and ok else reason) or (
         '下载成功' if ok else f'下载失败 curl={code} HTTP={http} {bytes(errors[:300]).decode("utf-8", errors="replace").strip()}，已记录实际消耗，下次检查再试')
@@ -693,10 +712,13 @@ def round_download(c, s, amount, settings, day, save=atomic_json):
         if date_now(settings, time.time() + 315) != day:
             s['reason'] = '临近统计日边界，不发起可能跨日的下载，等待下一轮'
             break
-        reserve(s, remaining, s['last'])
+        # No independent per-round quantity cap: one file is at most 1 GiB.
+        # The reservation may exceed a smaller file and is settled to actual bytes.
+        request_amount = min(remaining, MAX_SOURCE_BYTES)
+        reserve(s, request_amount, s['last'])
         save(STATE, s)
         try:
-            actual, ok, until, reason = download(c, source, remaining, settings, day, deadline, guard=guard)
+            actual, ok, until, reason = download(c, source, request_amount, settings, day, deadline, guard=guard)
         except DownloadNotStarted as e:
             # Only a positively known pre-process failure can refund a reservation.
             # A crash or any uncertain post-start failure keeps it conservatively.
@@ -991,7 +1013,7 @@ def config_summary(c, start_after=False):
     print(f"目标比例：入站:出站 {c['ratio']:g}:1")
     print(f"服务器带宽：{c['bandwidth_mbps']:g} Mbps")
     print(f"补下载占比：{c['download_percent']:g}%（限速 {effective_speed(c):g} Mbps）")
-    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；单轮上限：{format_amount(c['round_mib']*MIB)}")
+    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；单次文件不超过 1 GiB")
     print(f"检查间隔：{c['interval_min']}～{c['interval_max']} 分钟")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
         print('提示：下载速度超过 80% 带宽保护线，本设置会跳过下载；请调低补下载占比。')
@@ -1021,8 +1043,8 @@ def ensure_interface(interface):
 def edit_config(c):
     while True:
         config_summary(c)
-        print(f"7 每日请求上限：{c['max_attempts']}；8 起补出站：{format_amount(c['min_tx_mib']*MIB)}；9 每核负载：{c['load_per_cpu']:g}")
-        choice = ask('1 比例  2 带宽  3 占比  4 每日上限  5 单轮上限\n6 检查间隔  7 请求次数  8 起补门槛  9 负载阈值  0 完成')
+        print(f"6 每日请求上限：{c['max_attempts']}；7 起补出站：{format_amount(c['min_tx_mib']*MIB)}；8 每核负载：{c['load_per_cpu']:g}")
+        choice = ask('1 比例  2 带宽  3 占比  4 每日上限\n5 检查间隔  6 请求次数  7 起补门槛  8 负载阈值  0 完成')
         if choice == '0':
             return
         if choice == '1':
@@ -1034,17 +1056,15 @@ def edit_config(c):
         elif choice == '4':
             c['daily_mib'] = ask_amount('每日补量上限', c['daily_mib'], 1, 1048576)
         elif choice == '5':
-            c['round_mib'] = ask_amount('单轮补量上限', c['round_mib'], .001, 102400)
-        elif choice == '6':
             c['interval_min'], c['interval_max'] = ask_interval(c)
-        elif choice == '7':
+        elif choice == '6':
             c['max_attempts'] = ask_number('每日请求上限', c['max_attempts'], 1, 10000, True)
-        elif choice == '8':
+        elif choice == '7':
             c['min_tx_mib'] = ask_amount('起补出站门槛', c['min_tx_mib'], 0, 1048576)
-        elif choice == '9':
+        elif choice == '8':
             c['load_per_cpu'] = ask_number('每核负载保护阈值', c['load_per_cpu'], .01, 100)
         else:
-            print('请输入 0～9；未修改设置。')
+            print('请输入 0～8；未修改设置。')
 
 
 def configure(start_after=False):
@@ -1057,7 +1077,7 @@ def configure(start_after=False):
             if ask('1 卸载  0 返回') == '1':
                 uninstall()
             return False
-        if data.get('version') in (1, 2, 3, 4):
+        if data.get('version') in (1, 2, 3, 4, 5):
             print('检测到旧版配置，请先卸载再重新安装。')
             if ask('1 卸载  0 返回') == '1':
                 uninstall()

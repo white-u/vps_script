@@ -27,7 +27,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/tb.s
 如果无法连接 GitHub Raw，可用备用入口：
 
 ```bash
-bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.5')
+bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.6')
 ```
 
 选 **1 配置**，填写服务器带宽并确认启动。保存配置后使用短命令 **`tb`** 调起菜单，也保留 `traffic-balance`。不接入 `vt`；安装、参数及验证边界见 [流量调节手册](TRAFFIC_BALANCE_DOC.md)。精简系统缺少 curl 时先运行 `apt-get update && apt-get install -y curl ca-certificates`。
