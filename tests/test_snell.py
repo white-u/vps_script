@@ -319,6 +319,71 @@ FAIL_ALL_START=true
                     self.assertIn(f'version={version}', result.stdout)
                     self.assertIn(expected, result.stdout)
 
+    def test_client_details_match_exported_values_for_v5_and_v6(self):
+        conf = self.root / 'config'; conf.mkdir()
+        for version, settings, detail in (
+            (6, '', 'Mode: default'),
+            (6, 'mode = unshaped', 'Mode: unshaped'),
+            (6, 'mode = unsafe-raw', 'Mode: unsafe-raw'),
+            (5, 'obfs = http', 'Obfs: http'),
+            (5, '', 'Obfs: off'),
+        ):
+            with self.subTest(version=version, settings=settings):
+                (conf / '100.conf').write_text('psk = SECRET\n' + settings + '\n')
+                result = self.run_shell(['read_config_value', 'format_client_config'],
+                                        f'GREEN=""\nget_installed_major_ver() {{ echo {version}; }}\n'
+                                        'format_client_config 100 1.2.3.4 details\n')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for line in ('地址: 1.2.3.4', '端口: 100', 'PSK : SECRET',
+                             detail):
+                    self.assertIn(line, result.stdout.splitlines())
+                self.assertNotIn('协议:', result.stdout)
+                self.assertNotIn('版本:', result.stdout)
+                self.assertNotIn('TFO', result.stdout)
+                self.assertNotIn('Reuse', result.stdout)
+                self.assertNotIn('>>> Surge 配置:', result.stdout)
+                if version == 6:
+                    extra = ', mode=' + detail.removeprefix('Mode: ')
+                else:
+                    extra = ', obfs=http' if settings else ''
+                compact = (f'snell-100 = snell, 1.2.3.4, 100, psk=SECRET, version={version}, '
+                           f'tfo=true, reuse=true{extra}')
+                self.assertIn(compact, result.stdout.splitlines())
+                self.assertEqual(result.stdout.count('完整配置:'), 1)
+
+    def test_single_and_all_config_views_show_details_and_compact_config(self):
+        conf = self.root / 'config'; conf.mkdir()
+        (conf / '100.conf').write_text('psk = FIRST\nmode = unshaped\n')
+        (conf / '200.conf').write_text('psk = SECOND\n')
+        names = ['read_config_value', 'format_client_config', 'show_single_config', 'show_all_configs']
+        setup = '''
+GREEN=""; DIM=""
+get_installed_major_ver() { echo 6; }
+get_public_ipv4() { echo YOUR_IP; }
+get_instance_status() { echo running; }
+'''
+        for command, ports in (('show_single_config 100', (100,)), ('show_all_configs', (100, 200))):
+            with self.subTest(command=command):
+                result = self.run_shell(names, setup + command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('>>> Surge 配置:', result.stdout)
+                self.assertEqual(result.stdout.count('完整配置:'), len(ports))
+                for port in ports:
+                    self.assertIn(f'端口: {port}\n', result.stdout)
+                    self.assertIn(f'snell-{port} = snell, YOUR_IP, {port}, psk=', result.stdout)
+                self.assertIn('地址: YOUR_IP\n', result.stdout)
+                self.assertIn('未能获取公网 IPv4', result.stderr)
+        result = self.run_shell(names, setup.replace('echo YOUR_IP', 'echo 1.2.3.4') + 'show_all_configs')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('地址: 1.2.3.4\n', result.stdout)
+        self.assertNotIn('未能获取公网 IPv4', result.stderr)
+        (conf / '100.conf').write_text('psk = FIRST\nmode = invalid\n')
+        result = self.run_shell(names, setup + 'show_single_config 100')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('>>> Surge 配置:', result.stdout)
+        self.assertNotIn('完整配置:', result.stdout)
+        self.assertNotIn('PSK :', result.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

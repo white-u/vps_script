@@ -120,7 +120,7 @@ import_public_key "$KEY" "$TEST_DIR/.ssh/authorized_keys"
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('公钥已导入', result.stdout)
 
-    def test_disable_password_requires_separate_login_confirmation(self):
+    def test_disable_password_requires_only_choice_and_valid_key(self):
         target = self.path / 'authorized_keys'
         target.write_text(KEY + '\n')
         block = INIT.split('# --- 禁用密码登录 (独立判断) ---', 1)[1].split('# 应用 SSH 配置', 1)[0]
@@ -130,14 +130,14 @@ SSH_PORT=12345
 SSH_KEY_FILE="$TEST_DIR/authorized_keys"
 sshd_set() { echo WRITE; printf 'ARG:%s\\n' "$@"; }
 ''' + block + apply
-        for answer, disabled in (('y\nyes\n', True), ('y\nno\n', False), ('n\n', False)):
+        for answer, disabled in (('y\n', True), ('Y\r\n', True), ('n\n', False)):
             with self.subTest(answer=answer):
                 result = self.shell(code, stdin=answer)
                 self.assert_ok(result)
                 self.assertEqual('ARG:PasswordAuthentication\nARG:no' in result.stdout, disabled)
                 self.assertEqual(result.stdout.count('WRITE'), 1)
         target.write_text('invalid\n')
-        result = self.shell(code, stdin='y\nyes\n')
+        result = self.shell(code, stdin='y\n')
         self.assert_ok(result)
         self.assertNotIn('ARG:PasswordAuthentication', result.stdout)
 
@@ -196,18 +196,25 @@ sshd_set Port 12345
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_restored()
 
-    def test_declined_confirmation_or_unrelated_listener_rolls_back_and_reloads(self):
-        for override, answer in (('', 'no\n'), ('ss() { echo "LISTEN 0 128 0.0.0.0:12345 0.0.0.0:* users:((nginx,pid=1))"; }', 'yes\n')):
+    def test_listener_and_reload_failures_roll_back_and_reload(self):
+        for override in (
+            "ss() { echo 'LISTEN 0 128 0.0.0.0:12345 0.0.0.0:* users:((nginx,pid=1))'; }",
+            'ss() { return 0; }',
+            'systemctl() { echo "$*" >> "$TEST_DIR/systemctl.log"; [[ "$1" != reload || -f "$TEST_DIR/reload-failed" ]] || { touch "$TEST_DIR/reload-failed"; return 1; }; }',
+        ):
             with self.subTest(override=override):
-                result = self.shell(self.code() + '\nsshd_set Port 12345\n' + override + '\nactivate_ssh_settings', stdin=answer)
+                result = self.shell(self.code() + '\nsshd_set Port 12345\n' + override + '\nactivate_ssh_settings')
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_restored()
                 self.assertGreaterEqual((self.path / 'systemctl.log').read_text().count('reload ssh'), 2)
 
-    def test_confirmed_change_commits(self):
-        result = self.shell(self.code() + '\nsshd_set Port 12345\nactivate_ssh_settings', stdin='yes\n')
-        self.assert_ok(result)
+    def test_change_commits_without_reading_next_answer(self):
+        code = self.code() + '\nsshd_set Port 12345\nactivate_ssh_settings'
+        self.assert_ok(self.shell(code))
         self.assertIn('Port 12345', self.config.read_text())
+        result = self.shell(code + '\nread_prompt reply\nprintf "NEXT=%s\\n" "$reply"', stdin='n\n')
+        self.assert_ok(result)
+        self.assertIn('NEXT=n', result.stdout)
 
     def test_failed_restore_is_reported_with_backup_location(self):
         code = self.code() + '\ncp() { return 1; }\nfail "injected failure"'
@@ -245,43 +252,53 @@ timedatectl() {
     esac
 }
 curl() {
-    printf '%s\n' "$@" > "$TEST_DIR/curl.args"
+    printf '%s\n' "$@" >> "$TEST_DIR/curl.args"
     [[ "$MODE" != network-failure ]] || return 22
-    if [[ "$MODE" == primary-failure ]]; then
-        [[ "${@: -1}" != https://ipapi.co/timezone/ ]] || return 22
-        printf '{"success": true, "timezone": {"id": "Asia/Singapore"}}'
-        return
+    if [[ "${@: -1}" == https://ipwho.is/* ]]; then
+        [[ "$MODE" != primary-failure ]] || return 22
+        printf '%s' "$PRIMARY"
+    else
+        printf '%s' "$SECONDARY"
     fi
-    printf '%s' "$GUESS"
 }
 configure_timezone
 '''
 
-    def test_geoip_default_manual_override_and_keep(self):
-        for answer, expected in (('\n', 'Asia/Shanghai'), ('Asia/Singapore\n', 'Asia/Singapore'), ('keep\n', 'UTC'), ('Bad/Zone\nUTC\n', 'UTC')):
-            with self.subTest(answer=answer):
-                result = self.shell(self.timezone_code(), stdin=answer, GUESS='Asia/Shanghai')
-                self.assert_ok(result)
-                self.assertEqual((self.path / 'timezone').read_text().strip(), expected)
-                args = (self.path / 'curl.args').read_text()
-                self.assertIn('--max-time\n10', args)
-                self.assertIn('--proto\n=https', args)
+    def test_geoip_automatically_applies_without_consuming_input(self):
+        code = self.timezone_code() + '\nread_prompt reply\nprintf "NEXT=%s\\n" "$reply"'
+        result = self.shell(code, stdin='hostname\n', PRIMARY='{"success":true,"timezone":{"id":"Asia/Shanghai"}}')
+        self.assert_ok(result)
+        self.assertEqual((self.path / 'timezone').read_text().strip(), 'Asia/Shanghai')
+        self.assertIn('NEXT=hostname', result.stdout)
+        args = (self.path / 'curl.args').read_text()
+        self.assertIn('--max-time\n10', args)
+        self.assertIn('--proto\n=https', args)
+        self.assertNotIn('https://ipinfo.io/json', args)
 
     def test_geoip_failure_keeps_timezone_and_explains_failure(self):
-        for mode, guess in (('network-failure', ''), ('bad-response', '$(touch unwanted)'), ('bad-response', '<html>error</html>')):
-            with self.subTest(mode=mode, guess=guess):
-                result = self.shell(self.timezone_code(), stdin='\n', GUESS=guess, MODE=mode)
+        for response in ('$(touch unwanted)', '<html>error</html>', 'null', '[]',
+                         '{"success":true,"timezone":{"id":"Bad/Zone"}}',
+                         '{"success":true,"timezone":{"id":"Asia/Shanghai\\nUTC"}}'):
+            with self.subTest(response=response):
+                result = self.shell(self.timezone_code(), PRIMARY=response, SECONDARY=response)
                 self.assert_ok(result)
-                self.assertIn('默认保留 UTC', result.stderr)
+                self.assertIn('保留 UTC', result.stderr)
                 self.assertEqual((self.path / 'timezone').read_text(), 'UTC\n')
-        result = self.shell(self.timezone_code(), stdin='\n', GUESS='Asia/Shanghai', MODE='apply-failure')
+        result = self.shell(self.timezone_code(), MODE='network-failure')
+        self.assert_ok(result)
+        self.assertIn('保留 UTC', result.stderr)
+        result = self.shell(self.timezone_code(), PRIMARY='{"success":true,"timezone":{"id":"Asia/Shanghai"}}', MODE='apply-failure')
         self.assertNotEqual(result.returncode, 0)
 
-    def test_geoip_secondary_service_handles_primary_rate_limit(self):
-        result = self.shell(self.timezone_code(), stdin='\n', MODE='primary-failure')
-        self.assert_ok(result)
-        self.assertEqual((self.path / 'timezone').read_text(), 'Asia/Singapore\n')
-        self.assertIn('尝试备用服务', result.stderr)
+    def test_geoip_secondary_service_handles_primary_failure_and_invalid_data(self):
+        for mode, response in (('primary-failure', ''), ('', '{"success":false}'),
+                               ('', '{"success":true,"timezone":{"id":"Bad/Zone"}}')):
+            with self.subTest(mode=mode, response=response):
+                result = self.shell(self.timezone_code(), MODE=mode, PRIMARY=response,
+                                    SECONDARY='{"timezone":"Asia/Singapore"}')
+                self.assert_ok(result)
+                self.assertEqual((self.path / 'timezone').read_text(), 'Asia/Singapore\n')
+                self.assertIn('尝试备用服务', result.stderr)
 
     def ip_code(self):
         return HELPERS + functions('configure_ip_preference').replace('/etc/gai.conf', str(self.path / 'gai.conf')) + '\nconfigure_ip_preference\n'
@@ -289,7 +306,7 @@ configure_timezone
     def test_default_v4_switch_v6_and_repeated_runs(self):
         target = self.path / 'gai.conf'
         target.write_text('# custom\nlabel fc00::/7 6\nprecedence ::ffff:0:0/96 99\n')
-        for answer, value in (('\n', '100'), ('6\n', '10'), ('6\n', '10')):
+        for answer, value in (('\n', '100'), ('2\n', '10'), ('1\n', '100'), ('invalid\n2\r\n', '10'), ('4\n', '100'), ('6\n', '10')):
             result = self.shell(self.ip_code(), stdin=answer)
             self.assert_ok(result)
             text = target.read_text()
