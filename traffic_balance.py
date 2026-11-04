@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """独立的 Debian/Ubuntu 每日入站流量调节器。仅使用 Python 标准库。"""
 import argparse
+import copy
 import contextlib
 import datetime as dt
 import decimal
@@ -1253,24 +1254,41 @@ def status():
         label = '后台尚未运行，请查看详细检查' if active else '后台状态待确认'
     print(f'状态：{label}')
     print(f"目标：入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
-    stats_issue = False
+    gap = None
+    stats_day = None
+    settings = None
     try:
-        _, v = stats(c, vn_settings())
+        settings = vn_settings()
+        stats_day, v = stats(c, settings)
+        # Check continuity against the saved ledger without modifying it.
+        observe(copy.deepcopy(s), stats_day, v)
         ratio = f"{v['rx']/v['tx']:.3f}:1" if v['tx'] else '暂无出站'
         if v['tx'] < c['min_tx_mib']*MIB or not v['tx']:
             meaning = '未到起补门槛'
         else:
             meaning = '已达标，无需补量' if target_reached(c, v['rx'], v['tx']) else '低于目标，待补量'
         print(f"今日：入站 {format_amount(v['rx'])}，出站 {format_amount(v['tx'])}；比例 {ratio}（{meaning}）")
+        gap = max(0, required_inbound(c, v['tx']) - v['rx'])
+        print(f'当前缺口：约 {format_amount(gap)}')
+        if s['barrier'] or s['pending']:
+            print('统计尚未确认覆盖上次下载，缺口可能偏大。')
     except StatsNotReady as e:
-        stats_issue = True
         print('统计：'+e.short_reason)
+        print('当前缺口：暂无法判断')
     except Error as e:
-        stats_issue = True
         print(f'统计暂不可用：{e}')
+        print('当前缺口：暂无法判断')
     remaining = max(0, int(c['daily_mib']*MIB)-s['used'])
     reserve_note = '（含预留）' if s['pending'] else ''
-    print(f"补量：{format_amount(s['used'])}{reserve_note} / {format_amount(c['daily_mib']*MIB)}，剩余 {format_amount(remaining)}；请求 {s['attempts']}/{c['max_attempts']}")
+    current_day = stats_day if gap is not None else date_now(settings) if settings is not None else None
+    if not s['date'] or s['date'] != current_day:
+        print(f"补量账本：{s['date'] or '尚未建立'}；今日额度与缺口是否足够暂无法判断，等待统计检查")
+    else:
+        coverage = ('暂无法判断是否足够' if gap is None else
+                    '足够覆盖当前缺口' if remaining >= gap else '不足以覆盖当前缺口')
+        print(f'剩余额度：{format_amount(remaining)}（{coverage}）')
+        print(f"今日补量：{format_amount(s['used'])}{reserve_note} / {format_amount(c['daily_mib']*MIB)}；请求 {s['attempts']}/{c['max_attempts']}")
+    print('最近检查：'+s['reason'])
     if s['mode'] == 'running' and active == 'active':
         if s['next_check'] > time.time():
             stamp = dt.datetime.fromtimestamp(s['next_check']).astimezone().strftime('%m-%d %H:%M')
@@ -1278,8 +1296,6 @@ def status():
             print(f'下次检查：{stamp}（约 {minutes} 分钟）')
         else:
             print('下次检查：检查中')
-        if not stats_issue:
-            print('最近：'+s['reason'])
     else:
         print('下次检查：—')
 

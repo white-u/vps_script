@@ -998,7 +998,8 @@ class UserInterfaceTests(unittest.TestCase):
         text = self.out.getvalue()
         self.assertIn('后台尚未运行', text)
         self.assertIn('低于目标', text)
-        self.assertIn('剩余 9.98 GiB', text)
+        self.assertIn('剩余额度：9.98 GiB（足够覆盖当前缺口）', text)
+        self.assertIn('当前缺口：约 300 MiB', text)
         self.assertIn('下次检查：—', text)
         self.assertNotIn('ActiveState=', text)
 
@@ -1010,10 +1011,65 @@ class UserInterfaceTests(unittest.TestCase):
              patch.object(b, 'recent_logs') as logs:
             b.status()
         text = self.out.getvalue()
-        self.assertEqual(text.count('首日'), 1)
-        self.assertNotIn('旧的', text)
-        self.assertLessEqual(len(text.strip().splitlines()), 6)
+        self.assertIn('当前缺口：暂无法判断', text)
+        self.assertIn('今日额度与缺口是否足够暂无法判断', text)
+        self.assertIn('最近检查：旧的首日等待原因', text)
         logs.assert_not_called()
+
+    def test_status_displays_insufficient_remaining_budget_and_last_reason(self):
+        b.atomic_json(b.CONFIG, config())
+        state = b.initial_state()
+        day, v = sample()
+        b.observe(state, day, v)
+        state.update(mode='running', used=10100*b.MIB, attempts=7,
+                     reason='[预检保护] 当前占用过高 → 跳过本轮')
+        b.atomic_json(b.STATE, state)
+        with patch.object(b, 'run', return_value='active'), patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', return_value=(day, v)):
+            b.status()
+        text = self.out.getvalue()
+        self.assertIn('当前缺口：约 300 MiB', text)
+        self.assertIn('剩余额度：140 MiB（不足以覆盖当前缺口）', text)
+        self.assertIn('最近检查：[预检保护] 当前占用过高 → 跳过本轮', text)
+
+    def test_status_warns_when_stats_have_not_covered_last_download(self):
+        b.atomic_json(b.CONFIG, config())
+        state = b.initial_state()
+        day, v = sample()
+        b.observe(state, day, v)
+        state['barrier'] = dict(after=v['updated'], total_rx=v['total_rx']+b.MIB)
+        b.atomic_json(b.STATE, state)
+        with patch.object(b, 'run', return_value='inactive'), patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', return_value=(day, v)):
+            b.status()
+        self.assertIn('统计尚未确认覆盖上次下载，缺口可能偏大', self.out.getvalue())
+
+    def test_status_does_not_use_previous_days_budget(self):
+        b.atomic_json(b.CONFIG, config())
+        state = b.initial_state()
+        day, v = sample()
+        b.observe(state, day, v)
+        state.update(used=10100*b.MIB, attempts=7)
+        b.atomic_json(b.STATE, state)
+        with patch.object(b, 'run', return_value='inactive'), patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', return_value=('2026-11-03', v)):
+            b.status()
+        text = self.out.getvalue()
+        self.assertIn('补量账本：2026-11-02；今日额度与缺口是否足够暂无法判断', text)
+        self.assertNotIn('今日补量：', text)
+
+    def test_status_rejects_counter_regression_and_preserves_state(self):
+        b.atomic_json(b.CONFIG, config())
+        state = b.initial_state()
+        day, v = sample()
+        b.observe(state, day, v)
+        b.atomic_json(b.STATE, state)
+        before = b.STATE.read_bytes()
+        with patch.object(b, 'run', return_value='inactive'), patch.object(b, 'vn_settings', return_value=SETTINGS), \
+             patch.object(b, 'stats', return_value=(day, dict(v, rx=0, total_rx=0))):
+            b.status()
+        self.assertIn('当前缺口：暂无法判断', self.out.getvalue())
+        self.assertEqual(b.STATE.read_bytes(), before)
 
     def test_zero_and_legacy_seven_exit_without_changing_task(self):
         for value in ('0', '7'):

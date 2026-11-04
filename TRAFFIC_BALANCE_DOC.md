@@ -15,7 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/tb.s
 无法连接 GitHub Raw 时，优先从 GitHub 官方 API 获取相同发行版本的入口：
 
 ```bash
-bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.4')
+bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.5')
 ```
 
 如果官方 API 也不可达，可通过 jsDelivr 下载入口，先独立核对入口本身的 SHA256，再执行：
@@ -25,8 +25,8 @@ bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.gith
     tb_entry=$(mktemp) || exit 1
     trap 'rm -f "$tb_entry"' EXIT
     curl -q -fSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 \
-        -o "$tb_entry" 'https://cdn.jsdelivr.net/gh/white-u/vps_script@traffic-balance-v1.0.4/tb.sh' &&
-    printf '%s  %s\n' '9303809ea2b981701c5c682f92f72c3a49733c74324b32b7b27527a67e1ce507' "$tb_entry" | sha256sum -c - &&
+        -o "$tb_entry" 'https://cdn.jsdelivr.net/gh/white-u/vps_script@traffic-balance-v1.0.5/tb.sh' &&
+    printf '%s  %s\n' '216f84d6daaf3c130ddd66554b48233c2639402ccd181b8613dd4f581cceb0fb' "$tb_entry" | sha256sum -c - &&
     bash "$tb_entry"
 )
 ```
@@ -124,7 +124,7 @@ CPU 指全机繁忙率（包含 I/O 等待与 steal），不是单个进程 CPU 
 
 配置或状态缺失、损坏不会自动重建为零；状态写入失败立即停止补量，服务不自动重启。暂停/停止操作即使遇到损坏账本，也先停服并禁用开机启动再报告错误。修复存储、文件权限或从可信备份恢复账本后，手动启动；不要删除状态文件重置额度。不要在服务运行时手动编辑 JSON 或变更 vnStat 时区/数据库。
 
-详细检查中的状态页显示状态、目标比例和实际限速、当天流量或一条统计等待原因、已用/剩余额度和请求次数、下次检查。首日不完整等正常等待使用短提示，不重复显示同一状态原因和日志；0 MiB 等数量不带多余小数零。后台未运行时明确显示，暂停/停止没有下次检查。
+详细检查中的状态页显示状态、当天流量和目标、当前估算缺口、剩余额度是否足以覆盖缺口、当天补量与请求次数、最近检查原因及下次检查。统计不可用或回退时缺口显示暂无法判断；账本日期与当前统计日不一致时不将旧额度显示为今日额度。统计尚未覆盖补量时提示缺口可能偏大。额度足够仅比较当前缺口，不保证能在单轮或当天补完。首日不完整等正常等待使用短提示，不重复显示同一状态原因和日志；0 MiB 等数量不带多余小数零。后台未运行时明确显示，暂停/停止没有下次检查。
 
 菜单 3 显示最近 10 条日志，选 1 查看详细检查（状态、固定保护参数和服务状态），回车返回。`tb --status` 同样精简，`tb --diagnose` 保留完整诊断。配置或状态损坏时不会清零或改写文件，仍可查看详细检查。
 
