@@ -44,7 +44,7 @@ START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
 ROUND_SECONDS = 300
-DEFAULT = dict(version=5, interface='', ratio=2.1,
+DEFAULT = dict(version=5, interface='', ratio=3.2,
                daily_mib=10240, interval_min=20, interval_max=60,
                max_attempts=100, round_mib=1024, min_tx_mib=200,
                bandwidth_mbps=0, download_percent=40, load_per_cpu=0.8)
@@ -155,7 +155,7 @@ def number(value, low, high, name, integer=False):
 def validate_config(c):
     version = c.get('version')
     if version in (1, 2, 3, 4):
-        raise Error('检测到旧版配置，请先选 6 卸载，再重新运行安装入口')
+        raise Error('检测到旧版配置，请先在配置菜单卸载，再重新运行安装入口')
     if set(c) != set(DEFAULT) or version != DEFAULT['version']:
         raise Error('配置字段缺失或版本不支持，请检查 config.json')
     if not isinstance(c['interface'], str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}', c['interface']):
@@ -986,14 +986,14 @@ def format_amount(amount):
 
 
 def config_summary(c, start_after=False):
-    print('\n确认设置：')
-    print(f"  入站:出站 {c['ratio']:g}:1；服务器带宽 {c['bandwidth_mbps']:g} Mbps")
-    print(f"  每日 {format_amount(c['daily_mib']*MIB)}；每轮 {format_amount(c['round_mib']*MIB)}；每日 {c['max_attempts']} 次")
-    print(f"  检查 {c['interval_min']}～{c['interval_max']} 分钟；实际限速 {effective_speed(c):g} Mbps（带宽占比 {c['download_percent']:g}%）")
-    print(f"  起补出站 {format_amount(c['min_tx_mib']*MIB)}；每核负载阈值 {c['load_per_cpu']:g}")
+    print('\n当前配置：')
+    print(f"目标比例：入站:出站 {c['ratio']:g}:1")
+    print(f"服务器带宽：{c['bandwidth_mbps']:g} Mbps")
+    print(f"补下载占比：{c['download_percent']:g}%（限速 {effective_speed(c):g} Mbps）")
+    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；单轮上限：{format_amount(c['round_mib']*MIB)}")
+    print(f"检查间隔：{c['interval_min']}～{c['interval_max']} 分钟")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
-        print('  提示：下载速度已超过 80% 带宽保护线，当前设置会跳过下载；请调低补下载带宽占比。')
-    print('  保存后将启动任务；保留当日记录。' if start_after else '  保存后保持停止；选择 2 启动，保留当日记录。')
+        print('提示：下载速度超过 80% 带宽保护线，本设置会跳过下载；请调低补下载占比。')
 
 
 def ensure_interface(interface):
@@ -1017,67 +1017,127 @@ def ensure_interface(interface):
         run('systemctl', 'restart', 'vnstat.service')
 
 
+def edit_config(c):
+    while True:
+        config_summary(c)
+        print(f"7 每日请求上限：{c['max_attempts']}；8 起补出站：{format_amount(c['min_tx_mib']*MIB)}；9 每核负载：{c['load_per_cpu']:g}")
+        choice = ask('1 比例  2 带宽  3 占比  4 每日上限  5 单轮上限\n6 检查间隔  7 请求次数  8 起补门槛  9 负载阈值  0 完成')
+        if choice == '0':
+            return
+        if choice == '1':
+            c['ratio'] = ask_ratio(c['ratio'])
+        elif choice == '2':
+            c['bandwidth_mbps'] = ask_number('服务器带宽 Mbps', c['bandwidth_mbps'], .001, 1000000, suffix='Mbps')
+        elif choice == '3':
+            c['download_percent'] = ask_number('补下载带宽占比 %', c['download_percent'], 1, 100)
+        elif choice == '4':
+            c['daily_mib'] = ask_amount('每日补量上限', c['daily_mib'], 1, 1048576)
+        elif choice == '5':
+            c['round_mib'] = ask_amount('单轮补量上限', c['round_mib'], .001, 102400)
+        elif choice == '6':
+            c['interval_min'], c['interval_max'] = ask_interval(c)
+        elif choice == '7':
+            c['max_attempts'] = ask_number('每日请求上限', c['max_attempts'], 1, 10000, True)
+        elif choice == '8':
+            c['min_tx_mib'] = ask_amount('起补出站门槛', c['min_tx_mib'], 0, 1048576)
+        elif choice == '9':
+            c['load_per_cpu'] = ask_number('每核负载保护阈值', c['load_per_cpu'], .01, 100)
+        else:
+            print('请输入 0～9；未修改设置。')
+
+
 def configure(start_after=False):
-    old = config_for_edit()
-    print('\n配置任务（回车保留，q 取消；不带单位的下载量按 MiB）')
+    exists = CONFIG.exists()
+    if exists:
+        try:
+            data = load_json(CONFIG)
+        except Error as e:
+            print(f'配置无法读取：{e}；未更改文件。')
+            if ask('1 卸载  0 返回') == '1':
+                uninstall()
+            return False
+        if data.get('version') in (1, 2, 3, 4):
+            print('检测到旧版配置，请先卸载再重新安装。')
+            if ask('1 卸载  0 返回') == '1':
+                uninstall()
+            return False
+    try:
+        old = config_for_edit()
+    except Error as e:
+        if not exists:
+            raise
+        print(f'配置或账本异常：{e}；未更改文件。')
+        if ask('1 卸载  0 返回') == '1':
+            uninstall()
+        return False
     c = old.copy()
-    c['interface'] = detect_interface()
-    print(f"网卡：{c['interface']}（自动识别）")
-    c['ratio'] = ask_ratio(old['ratio'])
-    c['bandwidth_mbps'] = ask_number('服务器带宽 Mbps（必填）', old['bandwidth_mbps'] or None,
-                                     .001, 1000000, suffix='Mbps')
-    c['daily_mib'] = ask_amount('每日补量上限', old['daily_mib'], 1, 1048576)
-    c['interval_min'], c['interval_max'] = ask_interval(old)
-    c['download_percent'] = ask_number('补下载带宽占比 %', old['download_percent'], 1, 100)
-    advanced = ask_valid('修改高级设置？（y/n）', 'n', yes_no)
-    if advanced:
-        c['max_attempts'] = ask_number('每日最多下载请求数（失败、备用源请求也计次）', old['max_attempts'], 1, 10000, True)
-        c['round_mib'] = ask_amount('每轮最多补下载多少', old['round_mib'], .001, 102400)
-        c['min_tx_mib'] = ask_amount('当天出站达到多少才开始考虑补量', old['min_tx_mib'], 0, 1048576)
-        c['load_per_cpu'] = ask_number('负载保护阈值', old['load_per_cpu'], .01, 100)
+    if exists:
+        config_summary(c)
+        choice = ask('1 修改配置  2 卸载  0 返回')
+        if choice == '2':
+            uninstall()
+            return False
+        if choice != '1':
+            if choice != '0':
+                print('无效选项，未修改设置。')
+            return False
+        edit_config(c)
+    else:
+        print('配置任务（回车采用默认值，q 取消）')
+        c['interface'] = detect_interface()
+        print(f"网卡：{c['interface']}（自动识别）")
+        c['ratio'] = ask_ratio(c['ratio'])
+        c['bandwidth_mbps'] = ask_number('服务器带宽 Mbps（必填）', None, .001, 1000000, suffix='Mbps')
+        c['download_percent'] = ask_number('补下载带宽占比 %', c['download_percent'], 1, 100)
+        c['daily_mib'] = ask_amount('每日补量上限', c['daily_mib'], 1, 1048576)
     validate_config(c)
-    config_summary(c, start_after=start_after)
-    if not ask_valid('保存并启动任务？（y/n）' if start_after else '保存以上设置？（y/n）', 'y', yes_no):
+    config_summary(c)
+    choice = ask('1 确定并保存  0 取消' if exists else '1 确定并启动  0 取消')
+    if choice != '1':
         print('已取消保存，原任务保持不变。')
         return False
-    validate_config(c)
-    print('正在确认出口网卡，随后安装依赖并保存设置……', flush=True)
     verify_interface(c)
-    # 所有输入确认有效后才安装、停服、保存；无效输入不会改动任务。
+    was_running = False
+    previous_mode = 'stopped'
+    if exists:
+        previous = validate_state(load_json(STATE))
+        previous_mode = previous['mode']
+        if previous_mode == 'running':
+            active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
+            if active not in ('active', 'inactive', 'failed'):
+                raise Error('无法确认后台状态，未保存配置；请检查服务')
+            was_running = active == 'active'
+        if c['interface'] != old['interface'] and previous['date']:
+            raise Error('已有统计不能直接换网卡；配置未保存，请先核对原网卡和账本')
     if not UNIT.exists():
         install()
     else:
-        print('正在停止本任务后台服务，以便保存设置……', flush=True)
         run('systemctl', 'stop', SERVICE)
-    print('正在保存配置和额度记录；任务保持停止……', flush=True)
     with locked():
-        s = validate_state(load_json(STATE))
-        recover(s)
-        if CONFIG.exists() and c['interface'] != old['interface'] and s['date']:
+        state = validate_state(load_json(STATE))
+        recover(state)
+        if exists and c['interface'] != old['interface'] and state['date']:
             raise Error('已有统计不能直接换网卡；配置未保存，请先核对原网卡和账本')
         ensure_interface(c['interface'])
         if Path(__file__).resolve() != SCRIPT.resolve():
             atomic_write(SCRIPT, Path(__file__).read_text(), 0o755)
-        s['mode'], s['reason'] = 'stopped', '配置已保存；请启动任务'
-        atomic_json(STATE, s)
+        state['mode'] = 'paused' if previous_mode == 'paused' else 'stopped'
+        state['reason'], state['next_check'] = '配置已保存', 0
+        atomic_json(STATE, state)
         atomic_json(CONFIG, c)
         ensure_shortcut()
-    print('配置已保存。' if start_after else '配置已保存。下一步：在主菜单选择 2「启动任务」。')
-    if start_after:
+    print('配置已保存。')
+    if not exists or was_running:
         control('running')
+    else:
+        print('任务保持停止或暂停；选择 2 启动。')
     return True
 
 
 def start_task():
-    if CONFIG.exists():
-        control('running')
-        return
-    if STATE.exists():
-        s = validate_state(load_json(STATE))
-        if s['mode'] == 'running' and run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() == 'active':
-            raise Error('任务已运行；阻止重复启动，无需操作')
-    print('首次使用请完成配置，确认保存后启动。')
-    configure(start_after=True)
+    if not CONFIG.exists():
+        raise Error('尚未配置任务，请先选择 1 配置')
+    control('running')
 
 
 def control(mode):
@@ -1105,25 +1165,45 @@ def control(mode):
             run('systemctl', 'start', SERVICE)
             run('systemctl', 'is-active', SERVICE)
     print({'running': '任务已启动，先检查统计并随机等待。',
-           'paused': '任务已暂停；选择 3 继续，保留当日记录。',
+           'paused': '任务已暂停；选择 2 启动，保留当日记录。',
            'stopped': '任务已停止并关闭开机启动；保留配置与当日记录。'}[mode])
 
 
 def recent_logs(count):
-    print(f'\n最近 {count} 条记录（日志自动轮转，最多保留 3 份）：')
+    print('\n最近日志：')
     if not LOG.exists():
         print('暂无日志；首次启动后会开始记录。')
         return
     try:
         from collections import deque
         with LOG.open() as f:
-            print(''.join(deque(f, maxlen=count)).rstrip())
+            lines = deque(f, maxlen=count)
+        if not lines:
+            print('暂无日志；首次启动后会开始记录。')
+        for line in lines:
+            match = re.match(r'^\d{4}-(\d\d-\d\d \d\d:\d\d):\d\d,\d+ (INFO|WARNING|ERROR) (.*)$', line.rstrip())
+            if not match:
+                print(line.rstrip())
+                continue
+            stamp, level, message = match.groups()
+            started = re.fullmatch(r'开始下载 source=(\w+) budget=(\d+) fixed_rate=([\d.]+) Mbps', message)
+            finished = re.fullmatch(r'(下载成功|已完成本轮补量预算) source=(\w+) bytes=(\d+)', message)
+            if started:
+                source, amount, speed = started.groups()
+                message = f'开始下载：{source.upper()}，计划 {format_amount(int(amount))}，限速 {speed} Mbps'
+            elif finished:
+                _, source, amount = finished.groups()
+                message = f'下载完成：{source.upper()}，已补 {format_amount(int(amount))}'
+            elif level != 'INFO':
+                message = f'{level} {message}'
+            print(f'{stamp}  {message}')
     except OSError as e:
         print(f'无法读取日志：{e}；请检查日志文件权限或磁盘。')
 
 
-def diagnostics():
+def diagnostics(include_logs=True):
     print('\n详细运行检查：')
+    status()
     try:
         c = validate_config(load_json(CONFIG))
         print(f"网卡 {c['interface']}；目标入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
@@ -1132,16 +1212,19 @@ def diagnostics():
     except Error as e:
         print(f'配置无法读取：{e}')
     try:
-        print(run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result'))
+        service = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
+        print('任务服务：' + {'active': '运行中', 'inactive': '已停止', 'failed': '启动失败'}.get(service, service or '状态未知'))
     except Error as e:
         print(f'无法查询后台服务：{e}；请检查系统服务管理器。')
     try:
-        print('vnStat 服务：\n'+run('systemctl', 'show', 'vnstat.service', '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result'))
+        service = run('systemctl', 'show', 'vnstat.service', '-p', 'ActiveState', '--value').strip()
+        print('vnStat：' + {'active': '运行中', 'inactive': '已停止', 'failed': '启动失败'}.get(service, service or '状态未知'))
     except Error as e:
         print(f'vnStat 服务状态无法确认：{e}；请检查 vnStat。')
-    recent_logs(25)
-    print(f'配置文件：{CONFIG}\n状态文件：{STATE}\n完整日志：{LOG}')
-    print('若服务启动失败，可运行：sudo journalctl -u traffic-balance.service -n 50 --no-pager')
+    if include_logs:
+        recent_logs(25)
+        print(f'配置文件：{CONFIG}\n状态文件：{STATE}\n完整日志：{LOG}')
+        print('若服务启动失败，可运行：sudo journalctl -u traffic-balance.service -n 50 --no-pager')
 
 
 def status():
@@ -1161,7 +1244,7 @@ def status():
         print('请先停止任务，再选详细检查；不会清零记录。')
         return
     if s['mode'] == 'paused':
-        label = '已暂停，选 3 继续'
+        label = '已暂停，选 2 启动'
     elif s['mode'] == 'stopped':
         label = '已停止，选 2 启动'
     elif active == 'active':
@@ -1230,64 +1313,44 @@ def uninstall():
 
 
 def menu():
-    print('每日流量调节｜首次选 2 配置并启动')
+    print('每日流量调节')
     while True:
         try:
-            pause_label = '暂停/继续'
-            task_status = '尚未配置'
-            try:
-                mode = validate_state(load_json(STATE))['mode']
-                if mode == 'running':
-                    active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
-                    task_status = '运行中' if active == 'active' else '后台未运行，选 5 检查'
-                    pause_label = '暂停'
-                else:
-                    task_status = '已暂停' if mode == 'paused' else '已停止'
-                    pause_label = '继续' if mode == 'paused' else '暂停/继续'
-            except Error as e:
-                if STATE.exists() or CONFIG.exists():
-                    task_status = '配置或记录需要检查'
-                    print(f'任务记录需要检查：{e}；可选 4 先停止任务，选 5 查看诊断。')
-            choice = input(f'\n状态：{task_status}\n1 配置  2 启动  3 {pause_label}\n4 停止  5 状态/日志  6 卸载\n0 退出\n选择: ').strip()
+            mode = None
+            label = '未配置'
+            if CONFIG.exists() or STATE.exists():
+                try:
+                    mode = validate_state(load_json(STATE))['mode']
+                    if mode == 'running':
+                        active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip()
+                        label = '运行中' if active == 'active' else '后台未运行，请查看日志'
+                    else:
+                        label = '已暂停' if mode == 'paused' else '已停止'
+                except Error as e:
+                    label = '记录需要检查'
+                    print(f'任务记录异常：{e}；请选择 2 停止或 3 查看检查。')
+            action = '停止' if mode == 'running' or label == '记录需要检查' else '启动'
+            choice = ask(f'\n状态：{label}\n1 配置  2 {action}  3 日志  0 退出\n选择')
             if choice == '1':
                 configure()
             elif choice == '2':
-                start_task()
+                if mode == 'running' or label == '记录需要检查':
+                    control('stopped')
+                else:
+                    start_task()
             elif choice == '3':
-                try:
-                    s = validate_state(load_json(STATE))
-                except Error:
-                    if CONFIG.exists() or STATE.exists() or UNIT.exists():
-                        control('paused')
-                    else:
-                        print('尚未配置任务，请先选择 1。')
-                else:
-                    if s['mode'] == 'stopped':
-                        print('任务已停止。选择 2「启动任务」即可，不需要先暂停或继续。')
-                    else:
-                        control('running' if s['mode'] == 'paused' else 'paused')
-            elif choice == '4':
-                control('stopped')
-            elif choice == '5':
-                if not CONFIG.exists() and not STATE.exists():
-                    print('尚未配置任务。先选择 1「配置任务」，保存后再选择 2 启动。')
-                else:
-                    status()
-                    detail = ask('1 日志  2 详细检查（回车返回）')
-                    if detail == '1':
-                        recent_logs(10)
-                    elif detail == '2':
-                        diagnostics()
-                    elif detail:
-                        print('请输入 1 或 2；已返回菜单。')
-            elif choice == '6':
-                if uninstall():
-                    return
+                recent_logs(10)
+                detail = ask('1 详细检查  0 返回')
+                if detail == '1':
+                    diagnostics(include_logs=False)
+                    ask('回车返回')
+                elif detail not in ('', '0'):
+                    print('无效选项，已返回菜单。')
             elif choice in ('0', '7'):
                 print('已退出菜单，后台任务保持原状态。')
                 return
             else:
-                print('无效选项，请输入 0～6；未修改任务。')
+                print('无效选项，请输入 0～3；未修改任务。')
         except Cancelled:
             print('已取消当前操作，尚未保存设置；原任务保持不变。')
         except (Error, ValueError, OSError) as e:

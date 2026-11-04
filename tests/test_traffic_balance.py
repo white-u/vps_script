@@ -24,7 +24,7 @@ SETTINGS = dict(UseUTC=1, SaveInterval=5)
 
 
 def config(**kw):
-    return dict(dict(b.DEFAULT, interface='eth0', bandwidth_mbps=20), **kw)
+    return dict(dict(b.DEFAULT, interface='eth0', bandwidth_mbps=20, ratio=2.1), **kw)
 
 
 def fixture(rx=120*b.MIB, tx=200*b.MIB, updated=NOW):
@@ -879,46 +879,23 @@ class UserInterfaceTests(unittest.TestCase):
         with self.assertRaises(b.Error):
             b.validate_config(config(bandwidth_mbps=0))
 
-    def test_old_configs_require_uninstall_before_configuring_or_starting(self):
+    def test_old_configs_can_be_uninstalled_without_migration(self):
         for version in (1, 2, 3, 4):
-            with self.subTest(version=version):
-                b.atomic_json(b.CONFIG, config(version=version))
-                b.atomic_json(b.STATE, b.initial_state())
-                before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
-                with patch.object(b, 'run') as run, patch.object(b, 'detect_interface') as detect:
-                    for action in (b.configure, b.start_task):
-                        with self.assertRaisesRegex(b.Error, '选 6 卸载'):
-                            action()
-                run.assert_not_called()
-                detect.assert_not_called()
-                self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
+            b.atomic_json(b.CONFIG, config(version=version))
+            b.atomic_json(b.STATE, b.initial_state())
+            before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
+            with patch('builtins.input', return_value='1'), patch.object(b, 'uninstall') as uninstall:
+                self.assertFalse(b.configure())
+                uninstall.assert_called_once()
+            self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
 
-    def test_detection_failure_never_installs_or_stops_existing_task(self):
+    def test_detection_failure_never_installs(self):
         with patch.object(b, 'detect_interface', side_effect=b.Error('没有唯一出口')), \
-             patch.object(b, 'run') as run, patch.object(b, 'install') as install, \
-             patch('builtins.input') as prompt:
+             patch.object(b, 'run') as run, patch.object(b, 'install') as install:
             with self.assertRaises(b.Error):
                 b.configure()
         run.assert_not_called()
         install.assert_not_called()
-        prompt.assert_not_called()
-
-    def test_auto_detected_new_interface_cannot_replace_existing_accounting(self):
-        b.atomic_json(b.CONFIG, config())
-        s = b.initial_state()
-        day, v = sample()
-        b.observe(s, day, v)
-        s.update(used=1234, attempts=3)
-        b.atomic_json(b.STATE, s)
-        b.UNIT.write_text('existing service')
-        before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
-        with patch.object(b, 'detect_interface', return_value='ens9'), patch.object(b, 'run'), \
-             patch.object(b, 'ensure_interface') as register, patch.object(b, 'locked', contextlib.nullcontext), \
-             patch('builtins.input', side_effect=['']*7), self.assertRaisesRegex(b.Error, '不能直接换网卡'):
-            b.configure()
-        register.assert_not_called()
-        self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
-
 
     def test_missing_config_with_existing_accounting_cannot_switch_interface(self):
         s = b.initial_state()
@@ -936,73 +913,77 @@ class UserInterfaceTests(unittest.TestCase):
         b.atomic_json(b.STATE, b.initial_state())
         self.assertEqual(b.config_for_edit(), b.DEFAULT)
 
-    def test_first_setup_retries_only_invalid_fields_then_saves(self):
+    def test_first_setup_defaults_and_start(self):
         def install():
             b.atomic_json(b.STATE, b.initial_state())
-        entries = ['junk', '1.9', '2.1', '', '0', '30 Mbps', 'bad', '512', '', '25', '', '']
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'counters'), \
+        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'verify_interface'), \
              patch.object(b, 'install', side_effect=install), patch.object(b, 'ensure_interface'), \
-             patch.object(b, 'locked', contextlib.nullcontext), patch('builtins.input', side_effect=entries):
-            b.configure()
+             patch.object(b, 'locked', contextlib.nullcontext), patch.object(b, 'control') as control, \
+             patch('builtins.input', side_effect=['', '30', '', '', '1']):
+            self.assertTrue(b.configure())
         c = b.validate_config(b.load_json(b.CONFIG))
-        self.assertEqual((c['ratio'], c['bandwidth_mbps'], c['daily_mib'], c['download_percent']), (2.1, 30, 512, 25))
-        self.assertEqual(b.load_json(b.STATE)['mode'], 'stopped')
-        self.assertEqual(b.SCRIPT.read_text(), Path(b.__file__).read_text())
-        self.assertIn('选择 2', self.out.getvalue())
+        self.assertEqual((c['ratio'], c['bandwidth_mbps'], c['download_percent'], c['daily_mib'], c['round_mib']),
+                         (3.2, 30, 40, 10240, 1024))
+        control.assert_called_once_with('running')
 
-    def test_advanced_settings_save_bandwidth_share_without_fixed_protection_inputs(self):
-        def install():
-            b.atomic_json(b.STATE, b.initial_state())
-        entries = ['', '30', '', '', '25', 'y', '50', '128', '300', '.5', '']
-        with patch.object(b, 'detect_interface', return_value='eth0'), \
-             patch.object(b, 'install', side_effect=install), patch.object(b, 'ensure_interface'), \
-             patch.object(b, 'locked', contextlib.nullcontext), patch('builtins.input', side_effect=entries):
-            b.configure()
-        c = b.validate_config(b.load_json(b.CONFIG))
-        self.assertEqual((c['download_percent'], c['max_attempts'], c['round_mib'],
-                          c['min_tx_mib'], c['load_per_cpu']), (25, 50, 128, 300, .5))
-        self.assertNotIn('bandwidth_percent', c)
-        self.assertEqual(b.effective_speed(c), 7.5)
+    def test_edit_running_config_preserves_accounting_and_restarts(self):
+        b.atomic_json(b.CONFIG, config())
+        state = b.initial_state()
+        day, sample_data = sample()
+        b.observe(state, day, sample_data)
+        state.update(mode='running', used=1234, attempts=3)
+        b.atomic_json(b.STATE, state)
+        b.UNIT.write_text('service')
+        with patch.object(b, 'verify_interface'), patch.object(b, 'run', return_value='active'), \
+             patch.object(b, 'ensure_interface'), patch.object(b, 'locked', contextlib.nullcontext), \
+             patch.object(b, 'control') as control, \
+             patch('builtins.input', side_effect=['1', '3', '25', '0', '1']):
+            self.assertTrue(b.configure())
+        self.assertEqual(b.load_json(b.CONFIG)['download_percent'], 25)
+        self.assertEqual((b.load_json(b.STATE)['used'], b.load_json(b.STATE)['attempts']), (1234, 3))
+        control.assert_called_once_with('running')
 
-    def test_configuring_from_new_source_refreshes_existing_installed_copy(self):
+    def test_edit_stopped_config_does_not_start(self):
         b.atomic_json(b.CONFIG, config())
         b.atomic_json(b.STATE, b.initial_state())
-        b.UNIT.write_text('existing service')
-        b.SCRIPT.write_text('old script')
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'counters'), \
-             patch.object(b, 'run', return_value=''), patch.object(b, 'ensure_interface'), \
-             patch.object(b, 'locked', contextlib.nullcontext), patch('builtins.input', side_effect=['']*7):
-            b.configure()
-        self.assertEqual(b.SCRIPT.read_text(), Path(b.__file__).read_text())
-        self.assertEqual(b.SCRIPT.stat().st_mode & 0o777, 0o755)
+        b.UNIT.write_text('service')
+        with patch.object(b, 'verify_interface'), patch.object(b, 'run'), patch.object(b, 'ensure_interface'), \
+             patch.object(b, 'locked', contextlib.nullcontext), patch.object(b, 'control') as control, \
+             patch('builtins.input', side_effect=['1', '5', '2 GiB', '0', '1']):
+            self.assertTrue(b.configure())
+        self.assertEqual(b.load_json(b.CONFIG)['round_mib'], 2048)
+        control.assert_not_called()
+
+    def test_cancel_edit_keeps_task_and_files_untouched(self):
+        b.atomic_json(b.CONFIG, config())
+        b.atomic_json(b.STATE, dict(b.initial_state(), mode='running'))
+        before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
+        with patch.object(b, 'run') as run, patch('builtins.input', side_effect=['1', '3', '25', '0', '0']):
+            self.assertFalse(b.configure())
+        run.assert_not_called()
+        self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
+
+    def test_changed_interface_rejected_before_stopping_task(self):
+        b.atomic_json(b.CONFIG, config())
+        b.atomic_json(b.STATE, dict(b.initial_state(), mode='running'))
+        before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
+        with patch.object(b, 'verify_interface', side_effect=b.Error('出口网卡已变化')), \
+             patch.object(b, 'run') as run, patch('builtins.input', side_effect=['1', '3', '25', '0', '1']):
+            with self.assertRaisesRegex(b.Error, '出口网卡已变化'):
+                b.configure()
+        run.assert_not_called()
+        self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
+
+    def test_q_cancels_before_installing(self):
+        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'install') as install, \
+             patch('builtins.input', return_value='q'):
+            with self.assertRaises(b.Cancelled):
+                b.configure()
+        install.assert_not_called()
 
     def test_summary_warns_when_download_itself_can_trigger_protection(self):
         b.config_summary(config(bandwidth_mbps=100, download_percent=90))
-        self.assertIn('当前设置会跳过下载', self.out.getvalue())
-
-    def test_cancelling_summary_keeps_running_task_and_files_untouched(self):
-        b.atomic_json(b.CONFIG, config())
-        s = b.initial_state()
-        day, v = sample()
-        b.observe(s, day, v)
-        s.update(mode='running', used=1234, attempts=3)
-        b.atomic_json(b.STATE, s)
-        before = (b.CONFIG.read_bytes(), b.STATE.read_bytes())
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'run') as run, \
-             patch.object(b, 'install') as install, patch('builtins.input', side_effect=['', '', '', '', '', '', 'n']):
-            b.configure()
-        run.assert_not_called()
-        install.assert_not_called()
-        self.assertEqual((b.CONFIG.read_bytes(), b.STATE.read_bytes()), before)
-        self.assertIn('原任务保持不变', self.out.getvalue())
-
-    def test_q_cancels_before_installing_or_stopping_task(self):
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'run') as run, \
-             patch.object(b, 'install') as install, patch('builtins.input', side_effect=['q']):
-            with self.assertRaises(b.Cancelled): b.configure()
-        run.assert_not_called()
-        install.assert_not_called()
-        self.assertFalse(b.CONFIG.exists())
+        self.assertIn('会跳过下载', self.out.getvalue())
 
     def test_status_shows_actual_stopped_service_and_explains_ratio(self):
         b.atomic_json(b.CONFIG, config())
@@ -1041,14 +1022,12 @@ class UserInterfaceTests(unittest.TestCase):
             self.assertIn('0 退出', prompt.call_args.args[0])
             control.assert_not_called()
 
-    def test_logs_and_details_are_explicit_choices_after_status(self):
-        b.atomic_json(b.STATE, b.initial_state())
-        for choice in ('', '1', '2'):
-            with patch('builtins.input', side_effect=['5', choice, '0']), patch.object(b, 'status'), \
-                 patch.object(b, 'recent_logs') as logs, patch.object(b, 'diagnostics') as diagnostics:
-                b.menu()
-            self.assertEqual(logs.call_count, int(choice == '1'))
-            self.assertEqual(diagnostics.call_count, int(choice == '2'))
+    def test_logs_then_details_from_menu(self):
+        with patch('builtins.input', side_effect=['3', '1', '', '0']), \
+             patch.object(b, 'recent_logs') as logs, patch.object(b, 'diagnostics') as diagnostics:
+            b.menu()
+        logs.assert_called_once_with(10)
+        diagnostics.assert_called_once_with(include_logs=False)
 
     def test_status_and_diagnostics_remain_available_for_corrupt_state(self):
         b.atomic_json(b.CONFIG, config())
@@ -1057,46 +1036,37 @@ class UserInterfaceTests(unittest.TestCase):
         with patch.object(b, 'run', return_value='active'):
             b.status()
             b.diagnostics()
-        text = self.out.getvalue()
-        self.assertIn('配置或记录暂不可用', text)
-        self.assertIn('停止任务', text)
-        self.assertIn('状态保存失败', text)
+        self.assertIn('配置或记录暂不可用', self.out.getvalue())
         self.assertEqual(b.STATE.read_text(), '{broken')
 
-    def test_first_use_menu_opens_save_and_start_wizard(self):
-        with patch.object(b, 'configure', return_value=False) as configure, patch.object(b, 'run') as run, \
-             patch('builtins.input', side_effect=['2', '7']):
-            b.menu()
-        configure.assert_called_once_with(start_after=True)
+    def test_first_start_requires_config(self):
+        with patch.object(b, 'configure') as configure, patch.object(b, 'run') as run:
+            with self.assertRaisesRegex(b.Error, '先选择 1 配置'):
+                b.start_task()
+        configure.assert_not_called()
         run.assert_not_called()
 
-    def test_direct_start_saves_configuration_then_starts_once(self):
-        def install():
-            b.atomic_json(b.STATE, b.initial_state())
-        def start(mode):
-            self.assertEqual(mode, 'running')
-            self.assertEqual(b.validate_config(b.load_json(b.CONFIG))['bandwidth_mbps'], 30)
-        with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'install', side_effect=install), \
-             patch.object(b, 'ensure_interface'), patch.object(b, 'locked', contextlib.nullcontext), \
-             patch.object(b, 'control', side_effect=start) as control, \
-             patch('builtins.input', side_effect=['', '30', '', '', '', '', '']):
-            b.start_task()
+    def test_menu_stops_and_starts_existing_task(self):
+        b.atomic_json(b.CONFIG, config())
+        b.atomic_json(b.STATE, dict(b.initial_state(), mode='running'))
+        with patch('builtins.input', side_effect=['2', '0']), patch.object(b, 'run', return_value='active'), \
+             patch.object(b, 'control') as control:
+            b.menu()
+        control.assert_called_once_with('stopped')
+        b.atomic_json(b.STATE, b.initial_state())
+        with patch('builtins.input', side_effect=['2', '0']), patch.object(b, 'control') as control:
+            b.menu()
         control.assert_called_once_with('running')
-        self.assertIn('保存后将启动任务', self.out.getvalue())
 
-    def test_direct_start_cancel_or_q_never_installs_or_starts(self):
-        for inputs in (['q'], ['', '30', '', '', '', '', 'n']):
-            with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'install') as install, \
-                 patch.object(b, 'control') as control, patch('builtins.input', side_effect=inputs):
-                if inputs == ['q']:
-                    with self.assertRaises(b.Cancelled):
-                        b.start_task()
-                else:
-                    b.start_task()
-            install.assert_not_called()
-            control.assert_not_called()
-            self.assertFalse(b.CONFIG.exists())
-            self.assertFalse(b.STATE.exists())
+    def test_log_formats_known_entries_and_keeps_warnings(self):
+        b.LOG.write_text('2026-11-04 10:20:01,000 INFO 开始下载 source=ovh budget=1073741824 fixed_rate=80.0 Mbps\n'
+                         '2026-11-04 10:22:01,000 INFO 已完成本轮补量预算 source=ovh bytes=1073741824\n'
+                         '2026-11-04 11:05:01,000 WARNING [下载保护] CPU 90% > 70% → 停止本轮\n')
+        b.recent_logs(10)
+        text = self.out.getvalue()
+        self.assertIn('OVH，计划 1 GiB', text)
+        self.assertIn('OVH，已补 1 GiB', text)
+        self.assertIn('CPU 90% > 70%', text)
 
     def test_direct_start_existing_valid_config_does_not_reconfigure(self):
         b.atomic_json(b.CONFIG, config())
