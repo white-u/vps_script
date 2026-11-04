@@ -18,6 +18,8 @@
 | 公网地址、延迟、双向带宽和回程检测 | [项目导览](PROJECT.md) | [network_audit.sh](network_audit.sh) |
 | 修改代码、选测试、故障注入与 Linux 集成验证 | [开发与验证](DEVELOPMENT.md) | [tests](tests/) |
 
+接入 monitor 的首版范围为 Realm 后台安装、转发规则增删改及应用回滚。详见同级工作区的 [Realm 转发管理首版设计](../monitor/PROXY_FORWARDING_DESIGN.md)（设计草案）。单独克隆时可在 [monitor 仓库](https://github.com/white-u/monitor) 查阅。
+
 ## 两个项目的关系
 
 | 维度 | vps_script | monitor |
