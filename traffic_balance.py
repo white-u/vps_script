@@ -44,9 +44,9 @@ START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
 ROUND_SECONDS = 300
-DEFAULT = dict(version=4, interface='', ratio=2.1,
-               daily_mib=10240, interval_min=20, interval_max=60, speed_mbps=80,
-               max_attempts=100, round_mib=512, min_tx_mib=200,
+DEFAULT = dict(version=5, interface='', ratio=2.1,
+               daily_mib=10240, interval_min=20, interval_max=60,
+               max_attempts=100, round_mib=1024, min_tx_mib=200,
                bandwidth_mbps=0, download_percent=40, load_per_cpu=0.8)
 
 
@@ -154,7 +154,7 @@ def number(value, low, high, name, integer=False):
 
 def validate_config(c):
     version = c.get('version')
-    if version in (1, 2, 3):
+    if version in (1, 2, 3, 4):
         raise Error('检测到旧版配置，请先选 6 卸载，再重新运行安装入口')
     if set(c) != set(DEFAULT) or version != DEFAULT['version']:
         raise Error('配置字段缺失或版本不支持，请检查 config.json')
@@ -163,7 +163,7 @@ def validate_config(c):
     number(c['ratio'], 2, 5, '入站:出站目标比例')
     for key, lo, hi, integer in [
         ('daily_mib', 1, 1048576, False), ('interval_min', 1, 1440, True),
-        ('interval_max', 1, 1440, True), ('speed_mbps', .001, 10000, False),
+        ('interval_max', 1, 1440, True),
         ('max_attempts', 1, 10000, True), ('round_mib', .001, 102400, False),
         ('min_tx_mib', 0, 1048576, False), ('bandwidth_mbps', .001, 1000000, False),
         ('download_percent', 1, 100, False),
@@ -403,8 +403,7 @@ def counters(interface):
 
 def effective_speed(c):
     # A fixed rate for this round, never a dynamic ramp or an attempt to catch up.
-    allowance = c['bandwidth_mbps'] * c['download_percent']/100
-    return min(c['speed_mbps'], allowance)
+    return c['bandwidth_mbps'] * c['download_percent']/100
 
 
 def cpu_times():
@@ -990,10 +989,10 @@ def config_summary(c, start_after=False):
     print('\n确认设置：')
     print(f"  入站:出站 {c['ratio']:g}:1；服务器带宽 {c['bandwidth_mbps']:g} Mbps")
     print(f"  每日 {format_amount(c['daily_mib']*MIB)}；每轮 {format_amount(c['round_mib']*MIB)}；每日 {c['max_attempts']} 次")
-    print(f"  检查 {c['interval_min']}～{c['interval_max']} 分钟；实际限速 {effective_speed(c):g} Mbps（用户上限 {c['speed_mbps']:g}，带宽占比 {c['download_percent']:g}%）")
+    print(f"  检查 {c['interval_min']}～{c['interval_max']} 分钟；实际限速 {effective_speed(c):g} Mbps（带宽占比 {c['download_percent']:g}%）")
     print(f"  起补出站 {format_amount(c['min_tx_mib']*MIB)}；每核负载阈值 {c['load_per_cpu']:g}")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
-        print('  提示：下载速度已超过 80% 带宽保护线，当前设置会跳过下载；请调低下载限速或补下载带宽占比。')
+        print('  提示：下载速度已超过 80% 带宽保护线，当前设置会跳过下载；请调低补下载带宽占比。')
     print('  保存后将启动任务；保留当日记录。' if start_after else '  保存后保持停止；选择 2 启动，保留当日记录。')
 
 
@@ -1029,10 +1028,9 @@ def configure(start_after=False):
                                      .001, 1000000, suffix='Mbps')
     c['daily_mib'] = ask_amount('每日补量上限', old['daily_mib'], 1, 1048576)
     c['interval_min'], c['interval_max'] = ask_interval(old)
-    c['speed_mbps'] = ask_number('下载限速 Mbps', old['speed_mbps'], .001, 10000, suffix='Mbps')
+    c['download_percent'] = ask_number('补下载带宽占比 %', old['download_percent'], 1, 100)
     advanced = ask_valid('修改高级设置？（y/n）', 'n', yes_no)
     if advanced:
-        c['download_percent'] = ask_number('补下载带宽占比 %', old['download_percent'], 1, 100)
         c['max_attempts'] = ask_number('每日最多下载请求数（失败、备用源请求也计次）', old['max_attempts'], 1, 10000, True)
         c['round_mib'] = ask_amount('每轮最多补下载多少', old['round_mib'], .001, 102400)
         c['min_tx_mib'] = ask_amount('当天出站达到多少才开始考虑补量', old['min_tx_mib'], 0, 1048576)

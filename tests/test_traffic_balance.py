@@ -57,12 +57,12 @@ class AccountingTests(unittest.TestCase):
         for value in ('500', '500 MB', '-1 MiB', 'NaN MiB'):
             with self.assertRaises(b.Error):
                 b.amount_input(value)
-        for key, value in [('speed_mbps', float('nan')), ('daily_mib', True),
+        for key, value in [('download_percent', float('nan')), ('daily_mib', True),
                            ('ratio', 1.9), ('ratio', 5.1), ('bandwidth_mbps', 0), ('interval_max', 1), ('max_attempts', 1.1),
                            ('interface', '../eth0')]:
             with self.subTest(key=key), self.assertRaises(b.Error):
                 b.validate_config(dict(self.c, **{key: value}))
-        self.assertEqual(b.validate_config(dict(self.c, speed_mbps=.25))['speed_mbps'], .25)
+        self.assertEqual(b.validate_config(dict(self.c, download_percent=12.5))['download_percent'], 12.5)
 
     def test_gap_bounds_daily_and_attempt_limits(self):
         self.assertEqual(b.plan(self.c, self.s, self.v)[0], 300*b.MIB)
@@ -91,7 +91,7 @@ class AccountingTests(unittest.TestCase):
 
     def test_large_daily_budget_still_stops_after_real_gap_is_filled(self):
         s = b.initial_state()
-        c = dict(self.c, ratio=2)
+        c = dict(self.c, ratio=2, round_mib=512)
         v = dict(self.v, rx=1024*b.MIB, tx=1024*b.MIB,
                  total_rx=2048*b.MIB, total_tx=2048*b.MIB)
         b.observe(s, self.day, v)
@@ -113,13 +113,13 @@ class AccountingTests(unittest.TestCase):
     def test_reported_near_equal_traffic_needs_inbound_download(self):
         # User's example: 591.81 MiB received, 613.64 MiB sent.
         v = dict(self.v, rx=59181*b.MIB//100, tx=61364*b.MIB//100)
-        self.assertEqual(b.plan(self.c, self.s, v)[0], 512*b.MIB)
+        self.assertAlmostEqual(b.plan(self.c, self.s, v)[0] / b.MIB, 696.834, places=3)
         self.assertAlmostEqual((b.required_inbound(self.c, v['tx']) - v['rx']) / b.MIB,
                                696.834, places=3)
 
     def test_multiple_rounds_stop_at_target_without_using_entire_daily_budget(self):
         s = b.initial_state()
-        c = dict(self.c, ratio=2)
+        c = dict(self.c, ratio=2, round_mib=512)
         v = dict(self.v, rx=5*1024*b.MIB, tx=4608*b.MIB,
                  total_rx=6*1024*b.MIB, total_tx=5*1024*b.MIB)
         b.observe(s, self.day, v)
@@ -138,7 +138,7 @@ class AccountingTests(unittest.TestCase):
 
     def test_large_gap_is_capped_per_round_but_small_gap_is_not_padded(self):
         large = dict(self.v, rx=1024*b.MIB, tx=10*1024*b.MIB)
-        self.assertEqual(b.plan(self.c, self.s, large)[0], 512*b.MIB)
+        self.assertEqual(b.plan(self.c, self.s, large)[0], 1024*b.MIB)
         near = dict(self.v, rx=1890*b.MIB, tx=1000*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, near)[0], 210*b.MIB)
         # Reaching the inbound/outbound target stops future rounds.
@@ -179,11 +179,11 @@ class AccountingTests(unittest.TestCase):
 
     def test_large_round_uses_large_static_files_and_requests_only_its_budget(self):
         for source in b.SOURCES:
-            cmd = b.curl_command(self.c, source, 512*b.MIB, 300)
-            self.assertEqual(cmd[cmd.index('--range')+1], '0-536870911')
-            self.assertEqual(cmd[cmd.index('--max-filesize')+1], '536870912')
+            cmd = b.curl_command(self.c, source, 1024*b.MIB, 300)
+            self.assertEqual(cmd[cmd.index('--range')+1], '0-1073741823')
+            self.assertEqual(cmd[cmd.index('--max-filesize')+1], '1073741824')
             self.assertIn({'ovh': '/1Gb.dat', 'hetzner': '/1GB.bin',
-                           'cloudflare': 'bytes=536870912'}[source], cmd[-1])
+                           'cloudflare': 'bytes=1073741824'}[source], cmd[-1])
 
     def test_reserve_partial_settle_and_coverage_barrier(self):
         with patch.object(b.time, 'time', return_value=NOW):
@@ -542,9 +542,8 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(self.s['used'], 512*b.MIB)
         self.assertEqual(self.s['attempts'], 1)
 
-    def test_user_limit_is_never_raised_by_server_bandwidth_share(self):
-        self.assertEqual(b.effective_speed(dict(self.c, speed_mbps=.5)), .5)
-        self.assertEqual(b.effective_speed(dict(self.c, speed_mbps=.5, bandwidth_mbps=30)), .5)
+    def test_speed_is_derived_from_bandwidth_share(self):
+        self.assertEqual(b.effective_speed(dict(self.c, bandwidth_mbps=50, download_percent=1)), .5)
         self.assertEqual(b.effective_speed(dict(self.c, bandwidth_mbps=30)), 12)
         self.assertEqual(b.effective_speed(self.c), 8)
 
@@ -617,7 +616,7 @@ class AccountingTests(unittest.TestCase):
         capped = b.curl_command(dict(self.c, bandwidth_mbps=30), 'cloudflare', 1024, 30)
         self.assertEqual(capped[capped.index('--limit-rate')+1], '1500000')
         self.assertEqual(self.c['min_tx_mib'], 200)
-        cmd = b.curl_command(dict(self.c, speed_mbps=.5), 'cloudflare', 1024, 30)
+        cmd = b.curl_command(dict(self.c, bandwidth_mbps=50, download_percent=1), 'cloudflare', 1024, 30)
         self.assertEqual(cmd[cmd.index('--limit-rate')+1], '62500')
         self.assertIn('--noproxy', cmd)
         self.assertIn('0-1023', cmd)
@@ -625,8 +624,9 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('--connect-timeout')+1], '5')
         self.assertEqual(cmd[cmd.index('--speed-time')+1], '5')
 
-    def test_bandwidth_share_is_configurable_without_overriding_user_speed(self):
+    def test_bandwidth_share_is_configurable(self):
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=200)), 80)
+        self.assertEqual(b.effective_speed(config(bandwidth_mbps=1000)), 400)
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=30)), 12)
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=200, download_percent=10)), 20)
         for value in (0, 101, float('nan'), True):
@@ -880,7 +880,7 @@ class UserInterfaceTests(unittest.TestCase):
             b.validate_config(config(bandwidth_mbps=0))
 
     def test_old_configs_require_uninstall_before_configuring_or_starting(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version):
                 b.atomic_json(b.CONFIG, config(version=version))
                 b.atomic_json(b.STATE, b.initial_state())
@@ -939,13 +939,13 @@ class UserInterfaceTests(unittest.TestCase):
     def test_first_setup_retries_only_invalid_fields_then_saves(self):
         def install():
             b.atomic_json(b.STATE, b.initial_state())
-        entries = ['junk', '1.9', '2.1', '', '0', '30 Mbps', 'bad', '512', '', '.5 Mbps', '', '']
+        entries = ['junk', '1.9', '2.1', '', '0', '30 Mbps', 'bad', '512', '', '25', '', '']
         with patch.object(b, 'detect_interface', return_value='eth0'), patch.object(b, 'counters'), \
              patch.object(b, 'install', side_effect=install), patch.object(b, 'ensure_interface'), \
              patch.object(b, 'locked', contextlib.nullcontext), patch('builtins.input', side_effect=entries):
             b.configure()
         c = b.validate_config(b.load_json(b.CONFIG))
-        self.assertEqual((c['ratio'], c['bandwidth_mbps'], c['daily_mib'], c['speed_mbps']), (2.1, 30, 512, .5))
+        self.assertEqual((c['ratio'], c['bandwidth_mbps'], c['daily_mib'], c['download_percent']), (2.1, 30, 512, 25))
         self.assertEqual(b.load_json(b.STATE)['mode'], 'stopped')
         self.assertEqual(b.SCRIPT.read_text(), Path(b.__file__).read_text())
         self.assertIn('选择 2', self.out.getvalue())
@@ -953,7 +953,7 @@ class UserInterfaceTests(unittest.TestCase):
     def test_advanced_settings_save_bandwidth_share_without_fixed_protection_inputs(self):
         def install():
             b.atomic_json(b.STATE, b.initial_state())
-        entries = ['', '30', '', '', '', 'y', '25', '50', '128', '300', '.5', '']
+        entries = ['', '30', '', '', '25', 'y', '50', '128', '300', '.5', '']
         with patch.object(b, 'detect_interface', return_value='eth0'), \
              patch.object(b, 'install', side_effect=install), patch.object(b, 'ensure_interface'), \
              patch.object(b, 'locked', contextlib.nullcontext), patch('builtins.input', side_effect=entries):
@@ -977,7 +977,7 @@ class UserInterfaceTests(unittest.TestCase):
         self.assertEqual(b.SCRIPT.stat().st_mode & 0o777, 0o755)
 
     def test_summary_warns_when_download_itself_can_trigger_protection(self):
-        b.config_summary(config(bandwidth_mbps=100, speed_mbps=100, download_percent=90))
+        b.config_summary(config(bandwidth_mbps=100, download_percent=90))
         self.assertIn('当前设置会跳过下载', self.out.getvalue())
 
     def test_cancelling_summary_keeps_running_task_and_files_untouched(self):
