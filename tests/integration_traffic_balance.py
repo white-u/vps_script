@@ -93,6 +93,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--public-interface')
+    parser.add_argument('--previous-script', type=Path, help='Published old payload, only loaded inside isolated fixture')
     args = parser.parse_args()
     require(sys.platform.startswith('linux') and os.geteuid() == 0 and
             Path('/run/systemd/system').exists(), 'Requires Linux/root with systemd')
@@ -224,7 +225,7 @@ ExecStart={shutil.which('vnstatd')} --config {b.VNSTAT_CONFIG} --nodaemon
             cmd[-1] = f'http://{peer_ip}:45443/download'
             return cmd
         b.curl_command = local_command
-        amount, ok, _, reason = b.download(c, 'wechat', 1024*1024, settings, day, time.monotonic()+15)
+        amount, ok, _, reason = b.download(c, 'ovh', 1024*1024, settings, day, time.monotonic()+15)
         require(ok and amount == 1024*1024, 'Real limited curl failed: '+reason)
         report('real Linux curl payload accounting, interface binding and header cleanup')
         require(not list(base.glob('traffic-balance-header-*')), 'Temporary header was retained')
@@ -245,7 +246,7 @@ ExecStart={shutil.which('vnstatd')} --config {b.VNSTAT_CONFIG} --nodaemon
                 raise AssertionError('Busy network preflight allowed a download')
             report('busy real isolated veth traffic prevents new downloads')
             before = time.monotonic()
-            amount, ok, _, reason = b.download(busy_c, 'wechat', 4*b.MIB, settings, day, before+15)
+            amount, ok, _, reason = b.download(busy_c, 'ovh', 4*b.MIB, settings, day, before+15)
             require(not ok and '带宽' in reason and '[下载保护]' in reason and
                     '> 0.8 Mbps' in reason and time.monotonic()-before < 6,
                     'Live protection did not stop promptly: '+reason)
@@ -264,7 +265,7 @@ ExecStart={shutil.which('vnstatd')} --config {b.VNSTAT_CONFIG} --nodaemon
         s['mode'] = 'running'
         b.atomic_json(b.STATE, s)
         module = root/'traffic_balance.py'
-        shutil.copyfile(SOURCE, module)
+        shutil.copyfile(args.previous_script or SOURCE, module)
         b.SCRIPT.write_text(f'''import importlib.util, sys
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('balance_task', {str(module)!r})
@@ -318,13 +319,95 @@ detect_interface=lambda: {host_if!r}
             'StartLimitIntervalSec=0\nDescription=Daily inbound traffic balance')
         payload = payload.replace("if __name__ == '__main__':", overrides+"\nif __name__ == '__main__':")
         candidate.write_text(payload)
+        # Exercise update while an old-version local curl is actually running.
+        # Only the private veth receives traffic, at 1 Mbps, never the WAN.
+        b.run('systemctl', 'stop', b.SERVICE)
+        previous = b.load_json(b.STATE)
+        previous['source_order'] = ['wechat', 'qwen', 'doubao', 'blender', 'gimp', 'firefox'] if args.previous_script else []
+        previous['source_index'] = 0
+        b.atomic_json(b.STATE, previous)
+        legacy_config = b.load_json(b.CONFIG)
+        legacy_config['interval_max'] = 60
+        b.atomic_json(b.CONFIG, legacy_config)
+        marker_file = base/'curl-started'
+        received_file, settled_file = base/'curl-received', base/'curl-settled'
+        worker_code = f"""
+def active_download():
+    with b.locked():
+        state=b.validate_state(b.load_json(b.STATE))
+        c=b.validate_config(b.load_json(b.CONFIG))
+        c['download_percent']=1/c['bandwidth_mbps']*100
+        settings=b.vn_settings()
+        b.reserve(state,4*b.MIB,state['last'])
+        b.atomic_json(b.STATE,state)
+        original_command=b.curl_command
+        def local_command(c,source,amount,seconds):
+            cmd=original_command(c,source,amount,seconds)
+            cmd[cmd.index('--proto')+1]='=http'
+            cmd[-1]={('http://'+peer_ip+':45443/update')!r}
+            return cmd
+        b.curl_command=local_command
+        original_popen=b.subprocess.Popen
+        def started(*a,**kw):
+            proc=original_popen(*a,**kw)
+            Path({str(marker_file)!r}).write_text(str(proc.pid))
+            return proc
+        b.subprocess.Popen=started
+        original_read=b.os.read
+        received=[0]
+        def counted(fd,size):
+            data=original_read(fd,size)
+            if Path({str(marker_file)!r}).exists():
+                # Only stdout body is counted, never stderr or header metadata.
+                if fd == body_fd[0]:
+                    received[0]+=len(data)
+                    Path({str(received_file)!r}).write_text(str(received[0]))
+            return data
+        body_fd=[None]
+        original_started=started
+        def with_body_fd(*a,**kw):
+            proc=original_started(*a,**kw)
+            body_fd[0]=proc.stdout.fileno()
+            return proc
+        b.subprocess.Popen=with_body_fd
+        b.os.read=counted
+        source='ovh' if 'ovh' in b.SOURCE_FILES else 'wechat'
+        actual,ok,until,reason=b.download(c,source,4*b.MIB,settings,state['date'],b.time.monotonic()+60)
+        b.settle(state,actual)
+        state['reason']=reason
+        b.atomic_json(b.STATE,state)
+        Path({str(settled_file)!r}).write_text(str(actual))
+if '--daemon' in sys.argv:
+    b.daemon=active_download
+"""
+        wrapper=b.SCRIPT.read_text().replace('sys.exit(b.main())',worker_code+'\nsys.exit(b.main())')
+        b.SCRIPT.write_text(wrapper)
+        b.run('systemctl','start',b.SERVICE)
+        wait_until(marker_file.exists)
+        def has_body():
+            try: return int(received_file.read_text()) >= 16384
+            except (OSError, ValueError): return False
+        wait_until(has_body)
+        old_curl_pid=int(marker_file.read_text())
+        require(Path('/proc',str(old_curl_pid)).exists(), 'Old curl was not running before update')
         before_update = b.load_json(b.STATE)
         b.run(sys.executable, str(candidate), '--apply-update', timeout=90, live=True)
         after_update = b.load_json(b.STATE)
         require(active(b.SERVICE) == 'active' and after_update['next_check'] > time.time(),
                 'Updated service did not complete startup checks')
-        require((before_update['used'], before_update['attempts']) ==
-                (after_update['used'], after_update['attempts']), 'Online update changed accounting')
+        require(not Path('/proc',str(old_curl_pid)).exists(), 'Update left old download process running')
+        settled_actual=int(settled_file.read_text())
+        independently_received=int(received_file.read_text())
+        original_used=before_update['used']-before_update['pending']['amount']
+        require(settled_actual == independently_received and settled_actual >= 16384,
+                'Old curl did not settle its independently counted body')
+        require(after_update['attempts'] == before_update['attempts'] and
+                after_update['used'] == original_used+settled_actual and after_update['pending'] is None,
+                'Online update did not preserve exact settled download bytes')
+        require(b.load_json(b.CONFIG)['interval_max'] == 40 and not after_update['source_order'],
+                'Update did not apply new interval/source policy')
+        before_update = after_update
+        baseline_used, baseline_attempts = after_update['used'], after_update['attempts']
         require(b.SCRIPT.read_text() == payload, 'Update did not replace installed source')
         report('real online update stops, installs, restarts and retains accounting')
         bad = payload.replace("elif args.daemon:\n            handler", "elif args.daemon:\n            raise Error('integration intentional startup failure')\n            handler")
@@ -345,20 +428,20 @@ detect_interface=lambda: {host_if!r}
         b.control('running')
         b.run('systemctl', 'restart', b.SERVICE)
         wait_until(lambda: active(b.SERVICE) == 'active')
-        require(b.load_json(b.STATE)['attempts'] == 0, 'Service restart issued download')
+        require(b.load_json(b.STATE)['attempts'] == baseline_attempts, 'Service restart issued download')
         b.run('systemctl', 'stop', b.SERVICE)
         s = b.validate_state(b.load_json(b.STATE))
         b.reserve(s, b.MIB, s['last'])
         b.atomic_json(b.STATE, s)
         b.run('systemctl', 'start', b.SERVICE)
         wait_until(lambda: b.load_json(b.STATE)['pending'] is None)
-        require(b.load_json(b.STATE)['used'] == b.MIB and b.load_json(b.STATE)['attempts'] == 1,
+        require(b.load_json(b.STATE)['used'] == baseline_used+b.MIB and b.load_json(b.STATE)['attempts'] == baseline_attempts+1,
                 'Unsettled reservation was lost or double-counted')
         report('real process restart conservatively preserves unsettled reservation')
         b.control('paused')
         b.run('systemctl', 'start', b.SERVICE)  # emulate boot of enabled paused unit
         wait_until(lambda: active(b.SERVICE) == 'inactive')
-        require(b.load_json(b.STATE)['mode'] == 'paused' and b.load_json(b.STATE)['used'] == b.MIB,
+        require(b.load_json(b.STATE)['mode'] == 'paused' and b.load_json(b.STATE)['used'] == baseline_used+b.MIB,
                 'Pause was not preserved across process start')
         b.control('stopped')
         require(b.STATE.exists() and b.CONFIG.exists(), 'Stop removed accounting')

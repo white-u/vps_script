@@ -1,4 +1,4 @@
-"""Online update transactions and complete-file rounds; isolated local fixtures."""
+"""Online update transactions and bounded rounds; isolated local fixtures."""
 import copy
 import hashlib
 import importlib.util
@@ -167,15 +167,38 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][-1], '--check-update')
         apply.assert_called_once()
 
+    def test_old_defaults_and_deck_are_updated_without_clearing_quota(self):
+        old = dict(self.c, interval_min=20, interval_max=60)
+        b.atomic_json(b.CONFIG, old)
+        state = dict(self.s, source_order=['wechat','qwen','doubao','blender','gimp','firefox'], source_index=5)
+        b.atomic_json(b.STATE, state)
+        b.apply_update()
+        result = b.load_json(b.STATE)
+        self.assertEqual((result['used'], result['attempts'], result['date']), (123456, 3, self.s['date']))
+        self.assertEqual((b.load_json(b.CONFIG)['interval_min'],b.load_json(b.CONFIG)['interval_max']), (20,40))
+        self.assertTrue(not result['source_order'] or set(result['source_order']) == set(b.SOURCES))
 
-class CompleteRoundsTests(unittest.TestCase):
+    def test_failed_update_restores_old_config_without_rewinding_accounting(self):
+        old = dict(self.c, interval_min=20, interval_max=60)
+        b.atomic_json(b.CONFIG, old)
+        # Use the same service-state simulation as the existing rollback test.
+        def command(*args, **kwargs):
+            self.calls.append(args)
+            if 'start' in args: raise b.Error('start failed')
+            return ('active' if len([x for x in self.calls if 'show' in x]) == 1 else 'inactive') if 'show' in args else ''
+        self.run.side_effect = command
+        with self.assertRaises(b.Error): b.apply_update()
+        self.assertEqual(b.load_json(b.CONFIG), old)
+        self.assertEqual(b.load_json(b.STATE)['used'], 123456)
+
+
+class BoundedRoundsTests(unittest.TestCase):
     def setUp(self):
         b.STOP.clear()
         self.c = dict(b.DEFAULT, interface='eth0', bandwidth_mbps=200)
         self.s = b.initial_state()
         self.s.update(date='2026-11-04', last=dict(rx=0, tx=10000*b.MIB, total_rx=0, total_tx=0, updated=1, created=1))
         for name, kw in [('preflight', dict(return_value=SimpleNamespace(received=0))),
-                         ('file_pause', dict(return_value=False)),
                          ('date_now', dict(return_value='2026-11-04'))]:
             p = patch.object(b, name, **kw); p.start(); self.addCleanup(p.stop)
         self.saved = []
@@ -183,57 +206,38 @@ class CompleteRoundsTests(unittest.TestCase):
     def invoke(self, gap):
         b.round_download(self.c, self.s, gap, {}, '2026-11-04', lambda _, state: self.saved.append(copy.deepcopy(state)))
 
-    def test_continues_complete_files_then_smallest_overshoot(self):
-        sizes = dict(wechat=303*b.MIB, firefox=82*b.MIB, blender=344*b.MIB)
-        def complete(c, source, amount, *a, **kw):
-            self.assertTrue(kw['full_file'])
-            self.assertEqual(amount, sizes[source])
-            return amount, True, 0, '下载成功'
-        with patch.object(b, 'source_candidates', return_value=list(sizes)), \
-             patch.object(b, 'source_size', side_effect=lambda c, x, d: (sizes[x], 0)), \
-             patch.object(b, 'download', side_effect=complete) as dl:
-            self.invoke(400*b.MIB)
-        # Last smallest file can repeat rather than causing a larger overshoot.
-        self.assertEqual([x.args[2] for x in dl.call_args_list], [303*b.MIB, 82*b.MIB, 82*b.MIB])
-        self.assertEqual(self.s['used'], 467*b.MIB)
-        self.assertEqual(self.s['barrier']['total_rx'], 467*b.MIB)
+    def test_large_gap_is_bounded_and_success_stops(self):
+        with patch.object(b, 'download', return_value=(256*b.MIB, True, 0, '下载成功')) as dl:
+            self.invoke(2000*b.MIB)
+        dl.assert_called_once()
+        self.assertEqual(dl.call_args.args[2], 256*b.MIB)
+        self.assertEqual(self.s['used'], 256*b.MIB)
 
-    def test_final_preflight_reselects_smallest_after_gap_reduces(self):
-        with patch.object(b, 'source_candidates', return_value=['wechat', 'firefox']), \
-             patch.object(b, 'source_size', side_effect=[(180, 0), (50, 0)]), \
-             patch.object(b, 'preflight', side_effect=[SimpleNamespace(received=0), SimpleNamespace(received=175)]), \
-             patch.object(b, 'download', return_value=(50, True, 0, '下载成功')) as dl:
-            self.invoke(200)
-        self.assertEqual(dl.call_args.args[1:3], ('firefox', 50))
-
-    def test_quota_cannot_fit_whole_file_never_starts(self):
+    def test_small_daily_remainder_can_be_used_without_complete_file(self):
         self.s['used'] = int(self.c['daily_mib']*b.MIB)-50*b.MIB
-        with patch.object(b, 'source_size', return_value=(82*b.MIB, 0)), patch.object(b, 'download') as dl:
+        with patch.object(b, 'download', return_value=(50*b.MIB, True, 0, '下载成功')) as dl:
             self.invoke(400*b.MIB)
-        dl.assert_not_called()
-        self.assertIn('每日剩余额度不足', self.s['reason'])
+        self.assertEqual(dl.call_args.args[2], 50*b.MIB)
+        self.assertEqual(self.s['used'], int(self.c['daily_mib']*b.MIB))
 
-    def test_metadata_rate_limit_ends_round_without_attempt(self):
-        with patch.object(b, 'source_size', return_value=(None, 9999999999)), patch.object(b, 'download') as dl:
+    def test_no_padding_when_preflight_reduces_small_gap(self):
+        with patch.object(b, 'preflight', return_value=SimpleNamespace(received=175)), \
+             patch.object(b, 'download', return_value=(25, True, 0, '下载成功')) as dl:
+            self.invoke(200)
+        self.assertEqual(dl.call_args.args[2], 25)
+
+    def test_rate_limit_persists_and_never_switches(self):
+        with patch.object(b, 'download', return_value=(0, False, 9999999999, '服务限流')) as dl:
             self.invoke(400*b.MIB)
-        dl.assert_not_called()
-        self.assertEqual(self.s['attempts'], 0)
+        dl.assert_called_once()
         self.assertEqual(self.s['cooldown'], 9999999999)
 
-    def test_download_failure_counts_bytes_and_excludes_source(self):
-        with patch.object(b, 'source_candidates', return_value=['wechat', 'firefox']), \
-             patch.object(b, 'source_size', return_value=(82*b.MIB, 0)), \
-             patch.object(b, 'download', side_effect=[(5*b.MIB, False, 0, '下载失败'), (82*b.MIB, True, 0, '下载成功')]) as dl:
+    def test_download_failure_counts_bytes_and_uses_remaining_budget(self):
+        with patch.object(b, 'source_candidates', return_value=['ovh', 'hetzner']), \
+             patch.object(b, 'download', side_effect=[(5*b.MIB, False, 0, '下载失败'), (75*b.MIB, True, 0, '下载成功')]) as dl:
             self.invoke(80*b.MIB)
-        self.assertEqual(self.s['used'], 87*b.MIB)
-        self.assertEqual(self.s['attempts'], 2)
-        self.assertEqual([x.args[1] for x in dl.call_args_list], ['wechat', 'firefox'])
-
-    def test_non_utf8_header_is_a_source_error_not_daemon_crash(self):
-        error = UnicodeDecodeError('utf-8', b'\xe9', 0, 1, 'invalid start byte')
-        with patch.object(b.subprocess, 'run', side_effect=error):
-            with self.assertRaises(b.Error):
-                b.source_size(self.c, 'firefox', b.time.monotonic()+5)
+        self.assertEqual(self.s['used'], 80*b.MIB)
+        self.assertEqual([x.args[2] for x in dl.call_args_list], [80*b.MIB,75*b.MIB])
 
     def test_date_change_after_reservation_never_starts_curl(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -241,19 +245,9 @@ class CompleteRoundsTests(unittest.TestCase):
              patch.object(b, 'date_now', return_value='2026-11-05'), \
              patch.object(b.subprocess, 'Popen') as process:
             with self.assertRaises(b.DownloadNotStarted):
-                b.download(self.c, 'firefox', 50, {}, '2026-11-04',
-                           b.time.monotonic()+300, guard=SimpleNamespace(), full_file=True)
+                b.download(self.c, 'ovh', 50, {}, '2026-11-04',
+                           b.time.monotonic()+120, guard=SimpleNamespace())
         process.assert_not_called()
-
-    def test_head_size_and_rate_limit_validation(self):
-        for text, expected in [('HTTP/1.1 200 OK\r\nContent-Length: 85933992\r\n', 85933992),
-                               ('HTTP/1.1 200 OK\r\nContent-Length: 1073741825\r\n', None),
-                               ('HTTP/1.1 403 Forbidden\r\n', None)]:
-            with patch.object(b, 'run', return_value=text):
-                if expected:
-                    self.assertEqual(b.source_size(self.c, 'firefox', b.time.monotonic()+5), (expected, 0))
-                else:
-                    with self.assertRaises(b.Error): b.source_size(self.c, 'firefox', b.time.monotonic()+5)
 
 
 if __name__ == '__main__':
