@@ -207,11 +207,11 @@ class BoundedRoundsTests(unittest.TestCase):
         b.round_download(self.c, self.s, gap, {}, '2026-11-04', lambda _, state: self.saved.append(copy.deepcopy(state)))
 
     def test_large_gap_is_bounded_and_success_stops(self):
-        with patch.object(b, 'download', return_value=(256*b.MIB, True, 0, '下载成功')) as dl:
+        with patch.object(b, 'download', return_value=(384*b.MIB, True, 0, '下载成功')) as dl:
             self.invoke(2000*b.MIB)
         dl.assert_called_once()
-        self.assertEqual(dl.call_args.args[2], 256*b.MIB)
-        self.assertEqual(self.s['used'], 256*b.MIB)
+        self.assertEqual(dl.call_args.args[2], 384*b.MIB)
+        self.assertEqual(self.s['used'], 384*b.MIB)
 
     def test_small_daily_remainder_can_be_used_without_complete_file(self):
         self.s['used'] = int(self.c['daily_mib']*b.MIB)-50*b.MIB
@@ -246,7 +246,7 @@ class BoundedRoundsTests(unittest.TestCase):
              patch.object(b.subprocess, 'Popen') as process:
             with self.assertRaises(b.DownloadNotStarted):
                 b.download(self.c, 'ovh', 50, {}, '2026-11-04',
-                           b.time.monotonic()+120, guard=SimpleNamespace())
+                           b.time.monotonic()+200, guard=SimpleNamespace())
         process.assert_not_called()
 
 

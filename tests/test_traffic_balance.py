@@ -65,7 +65,7 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(b.validate_config(dict(self.c, download_percent=12.5))['download_percent'], 12.5)
 
     def test_gap_bounds_daily_and_attempt_limits(self):
-        self.assertEqual(b.plan(self.c, self.s, self.v)[0], 256*b.MIB)
+        self.assertEqual(b.plan(self.c, self.s, self.v)[0], 300*b.MIB)
         v = dict(self.v, rx=379*b.MIB, tx=200*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, v)[0], 41*b.MIB)
         for v in (dict(self.v, rx=420*b.MIB), dict(self.v, rx=500*b.MIB),
@@ -96,9 +96,9 @@ class AccountingTests(unittest.TestCase):
                  total_rx=2048*b.MIB, total_tx=2048*b.MIB)
         b.observe(s, self.day, v)
         # Only 1 GiB is needed for a 2:1 target, even though the budget is 10 GiB.
-        for _ in range(4):
+        for expected in (384, 384, 256):
             amount, _ = b.plan(c, s, v)
-            self.assertEqual(amount, 256*b.MIB)
+            self.assertEqual(amount, expected*b.MIB)
             with patch.object(b.time, 'time', return_value=v['updated']):
                 b.reserve(s, amount, v)
                 b.settle(s, amount)
@@ -108,12 +108,12 @@ class AccountingTests(unittest.TestCase):
         amount, reason = b.plan(c, s, v)
         self.assertEqual(amount, 0)
         self.assertIn('无需补量', reason)
-        self.assertEqual((s['used'], s['attempts']), (1024*b.MIB, 4))
+        self.assertEqual((s['used'], s['attempts']), (1024*b.MIB, 3))
 
     def test_reported_near_equal_traffic_needs_inbound_download(self):
         # User's example: 591.81 MiB received, 613.64 MiB sent.
         v = dict(self.v, rx=59181*b.MIB//100, tx=61364*b.MIB//100)
-        self.assertEqual(b.plan(self.c, self.s, v)[0], 256*b.MIB)
+        self.assertEqual(b.plan(self.c, self.s, v)[0], 384*b.MIB)
         self.assertAlmostEqual((b.required_inbound(self.c, v['tx']) - v['rx']) / b.MIB,
                                696.834, places=3)
 
@@ -123,10 +123,10 @@ class AccountingTests(unittest.TestCase):
         v = dict(self.v, rx=5*1024*b.MIB, tx=4608*b.MIB,
                  total_rx=6*1024*b.MIB, total_tx=5*1024*b.MIB)
         b.observe(s, self.day, v)
-        for _ in range(16):
+        for expected in [384]*10+[256]:
             gap, _ = b.plan(c, s, v)
-            amount = min(gap, 256*b.MIB)  # Simulate one bounded round.
-            self.assertEqual(amount, 256*b.MIB)
+            amount = min(gap, 384*b.MIB)  # Simulate one bounded round.
+            self.assertEqual(amount, expected*b.MIB)
             with patch.object(b.time, 'time', return_value=v['updated']):
                 b.reserve(s, amount, v)
                 b.settle(s, amount)
@@ -134,12 +134,12 @@ class AccountingTests(unittest.TestCase):
                      updated=v['updated']+1)
             b.observe(s, self.day, v)
         self.assertEqual(b.plan(c, s, v)[0], 0)
-        self.assertEqual((s['used'], s['attempts']), (4*1024*b.MIB, 16))
+        self.assertEqual((s['used'], s['attempts']), (4*1024*b.MIB, 11))
         self.assertEqual(v['rx'], v['tx']*2)
 
     def test_large_gap_is_capped_per_round_but_small_gap_is_not_padded(self):
         large = dict(self.v, rx=1024*b.MIB, tx=10*1024*b.MIB)
-        self.assertEqual(b.plan(self.c, self.s, large)[0], 256*b.MIB)
+        self.assertEqual(b.plan(self.c, self.s, large)[0], 384*b.MIB)
         near = dict(self.v, rx=1890*b.MIB, tx=1000*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, near)[0], 210*b.MIB)
         # Reaching the inbound/outbound target stops future rounds.
@@ -188,12 +188,12 @@ class AccountingTests(unittest.TestCase):
     def test_three_sources_use_api_or_range(self):
         self.assertEqual(set(b.SOURCES), {'cloudflare', 'ovh', 'hetzner'})
         for source, url in b.SOURCE_FILES.items():
-            cmd = b.curl_command(self.c, source, 256*b.MIB, 120)
+            cmd = b.curl_command(self.c, source, 384*b.MIB, 200)
             if source == 'cloudflare':
                 self.assertNotIn('--range', cmd)
-                self.assertIn(str(256*b.MIB), cmd[-1])
+                self.assertIn(str(384*b.MIB), cmd[-1])
             else:
-                self.assertEqual(cmd[cmd.index('--range')+1], f'0-{256*b.MIB-1}')
+                self.assertEqual(cmd[cmd.index('--range')+1], f'0-{384*b.MIB-1}')
 
     def test_round_direct_call_cannot_bypass_quantity_cap(self):
         def completed(_c, _source, amount, *_args, **_kwargs):
@@ -201,19 +201,19 @@ class AccountingTests(unittest.TestCase):
         with patch.object(b, 'download', side_effect=completed) as dl:
             b.round_download(self.c, self.s, 3*1024*b.MIB, SETTINGS,
                              b.date_now(SETTINGS), lambda *_: None)
-        self.assertEqual(dl.call_args.args[2], 256*b.MIB)
-        self.assertEqual((self.s['used'], self.s['attempts']), (256*b.MIB, 1))
+        self.assertEqual(dl.call_args.args[2], 384*b.MIB)
+        self.assertEqual((self.s['used'], self.s['attempts']), (384*b.MIB, 1))
 
     def test_fallback_shares_quantity_and_deadline(self):
         self.s['last']['tx'] = 1200*b.MIB
-        results = [(80*b.MIB, False, 0, '下载失败'), (176*b.MIB, True, 0, '下载成功')]
+        results = [(80*b.MIB, False, 0, '下载失败'), (304*b.MIB, True, 0, '下载成功')]
         with patch.object(b, 'source_candidates', return_value=['ovh', 'hetzner']), \
              patch.object(b, 'download', side_effect=results) as dl:
             b.round_download(self.c, self.s, 1500*b.MIB, SETTINGS,
                              b.date_now(SETTINGS), lambda *_: None)
-        self.assertEqual([x.args[2] for x in dl.call_args_list], [256*b.MIB,176*b.MIB])
+        self.assertEqual([x.args[2] for x in dl.call_args_list], [384*b.MIB,304*b.MIB])
         self.assertEqual(dl.call_args_list[0].args[5], dl.call_args_list[1].args[5])
-        self.assertEqual((self.s['used'], self.s['attempts']), (256*b.MIB, 2))
+        self.assertEqual((self.s['used'], self.s['attempts']), (384*b.MIB, 2))
 
     def test_reserve_partial_settle_and_coverage_barrier(self):
         with patch.object(b.time, 'time', return_value=NOW):
@@ -569,8 +569,8 @@ class AccountingTests(unittest.TestCase):
         self.s['last']['tx'] = 1200*b.MIB
         with patch.object(b, 'download', side_effect=completed) as dl:
             b.round_download(c, self.s, 512*b.MIB, SETTINGS, b.date_now(SETTINGS), lambda *_: None)
-        self.assertEqual(dl.call_args.args[2], 256*b.MIB)
-        self.assertEqual(self.s['used'], 256*b.MIB)
+        self.assertEqual(dl.call_args.args[2], 384*b.MIB)
+        self.assertEqual(self.s['used'], 384*b.MIB)
         self.assertEqual(self.s['attempts'], 1)
 
     def test_speed_is_derived_from_bandwidth_share(self):
@@ -672,10 +672,24 @@ class AccountingTests(unittest.TestCase):
         self.assertIsNone(self.s['pending'])
         self.assertEqual(self.s['barrier']['total_rx'], self.v['total_rx']+3*b.MIB)
 
+    def test_new_round_allows_download_after_old_120_second_boundary(self):
+        clock = [1000]
+        def preflight(_c, **_):
+            clock[0] = 1150  # New 200-second round still has 50 seconds left.
+            return SimpleNamespace(received=0)
+        with patch.object(b.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(b, 'date_now', return_value=self.day), \
+             patch.object(b, 'preflight', side_effect=preflight), \
+             patch.object(b, 'download', return_value=(b.MIB, True, 0, '下载成功')) as dl:
+            b.round_download(self.c, self.s, b.MIB, SETTINGS, self.day, lambda *_: None)
+        dl.assert_called_once()
+        self.assertEqual(dl.call_args.args[5], 1200)
+        self.assertEqual((self.s['used'], self.s['attempts']), (b.MIB, 1))
+
     def test_preflight_cannot_start_new_request_after_shared_round_deadline(self):
         clock = [0]
         def preflight(_c, **_):
-            clock[0] = 121
+            clock[0] = 201
             return SimpleNamespace(received=0)
         with patch.object(b.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(b, 'preflight', side_effect=preflight), patch.object(b, 'download') as dl:

@@ -24,6 +24,8 @@ SOURCES = {
     'hetzner': ('https://fsn1-speed.hetzner.com/1GB.bin', 'range'),
 }
 TOTAL_LIMIT = 1024*MIB
+FULL_BYTES = 384*MIB
+ATTEMPT_SECONDS = 200
 
 
 def positive(text):
@@ -60,7 +62,7 @@ def rss_kib(pid):
 
 def probe(b, c, source, amount, deadline=None):
     started = time.monotonic()
-    deadline = started+120 if deadline is None else deadline
+    deadline = started+ATTEMPT_SECONDS if deadline is None else deadline
     result = dict(source=source, requested_bytes=amount, actual_bytes=0, success=False,
                   status='not_started', http=0, curl=None, reason='', limited_until=0)
     usage0 = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -68,7 +70,7 @@ def probe(b, c, source, amount, deadline=None):
     own_peak, curl_peak = rss_kib(os.getpid()), 0
     proc = None
     try:
-        # Includes preflight in the 120-second shared attempt deadline.
+        # Includes preflight in the 200-second shared attempt deadline.
         guard = b.preflight(c, deadline=deadline)
         if b.STOP.is_set() or time.monotonic() >= deadline:
             raise b.Error('预检后取消或超时；未发起下载')
@@ -108,7 +110,7 @@ def probe(b, c, source, amount, deadline=None):
                             elif b.STOP.is_set():
                                 result['reason'] = '用户中断，停止测试'
                             elif now >= deadline:
-                                result['reason'] = '120 秒时限到达'
+                                result['reason'] = '200 秒时限到达'
                             elif header.exists() and header.stat().st_size > 65536:
                                 result['reason'] = '响应头异常过大'
                             elif now >= tick:
@@ -161,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--script', type=Path, default=Path(__file__).resolve().parents[1]/'traffic_balance.py')
     parser.add_argument('--bandwidth-mbps', type=positive, required=True, help='必须先向用户确认，不得猜测')
-    parser.add_argument('--full', action='store_true', help='初筛通过后，各追加一次256 MiB验证；总正文正常最多840 MiB')
+    parser.add_argument('--full', action='store_true', help='初筛通过后，追加384 MiB验证；总预算1 GiB，最多两家完整验证')
     parser.add_argument('--output', type=Path, required=True, help='新的报告路径，不覆盖已有文件')
     args = parser.parse_args()
     if not Path('/proc/stat').exists() or not shutil.which('curl') or not shutil.which('ip'):
@@ -173,14 +175,14 @@ def main():
     c = dict(b.DEFAULT, interface=b.detect_interface(), bandwidth_mbps=args.bandwidth_mbps,
              download_percent=speed/args.bandwidth_mbps*100)
     b.STOP.clear()
-    report = dict(schema=1, started_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    report = dict(schema=2, started_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   hostname=os.uname().nodename, bandwidth_mbps=args.bandwidth_mbps,
                   effective_limit_mbps=b.effective_speed(c), module_sha256=hashlib.sha256(args.script.read_bytes()).hexdigest(),
                   scope='source_probe_only; no install, state modification, or online update', results=[],
-                  short_term_candidates=[], round_256mib_candidates=[], limitations=[
+                  short_term_candidates=[], round_384mib_candidates=[], limitations=[
                       '平均速度包含5秒预检；CPU百分比按一个核计算，非全机繁忙率',
                       'RSS为采样峰值；不代表所有区域或长期稳定性；不验证真实业务延迟',
-                      '正常最多840 MiB正文；异常在途/缓冲字节可能超额，仍如实报告'])
+                      '总预算1 GiB正文；异常在途/缓冲字节可能超额，仍如实报告'])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation prevents accidentally overwriting earlier evidence.
     with args.output.open('x') as output:
@@ -211,17 +213,20 @@ def main():
             if args.full and not halted:
                 for source in report['short_term_candidates']:
                     if b.STOP.is_set(): break
-                    if 256*MIB*8/(speed*1000000) > 115:
+                    if FULL_BYTES*8/(speed*1000000) > ATTEMPT_SECONDS-5:
                         report['results'].append(dict(source=source, phase='full', status='skipped',
-                            reason='安全限速不足以在120秒内完成256 MiB，不能据此判定来源故障'))
+                            reason='安全限速不足以在200秒内完成384 MiB，不能据此判定来源故障'))
                         continue
                     consumed = sum(x.get('actual_bytes',0) for x in report['results'])
-                    if consumed+256*MIB > TOTAL_LIMIT: break
-                    item = probe(b, c, source, 256*MIB)
+                    if consumed+FULL_BYTES > TOTAL_LIMIT:
+                        report['results'].append(dict(source=source, phase='full', status='skipped',
+                            reason='剩余测试总预算不足384 MiB'))
+                        continue
+                    item = probe(b, c, source, FULL_BYTES)
                     item['phase'] = 'full'
                     report['results'].append(item)
                     print(json.dumps(item, ensure_ascii=False), flush=True)
-                    if item['success']: report['round_256mib_candidates'].append(source)
+                    if item['success']: report['round_384mib_candidates'].append(source)
                     if item['limited_until'] or item['status'] == 'protected_or_error' or '[下载保护]' in item['reason']:
                         halted = True; break
                     if not item['success']:
@@ -236,7 +241,7 @@ def main():
             json.dump(report, output, ensure_ascii=False, indent=2)
             output.write('\n'); output.flush(); os.fsync(output.fileno())
     print('报告已保存：'+str(args.output))
-    passed = bool(report['round_256mib_candidates'] or (not args.full and report['short_term_candidates']))
+    passed = bool(report['round_384mib_candidates'] or (not args.full and report['short_term_candidates']))
     return 0 if passed and not report['interrupted'] and not halted else 1
 
 

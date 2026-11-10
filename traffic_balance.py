@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 MIB = 1024 ** 2
 BASE = Path('/etc/traffic-balance')
 CONFIG = BASE / 'config.json'
@@ -48,7 +48,7 @@ SOURCE_FILES = {
 SOURCES = list(SOURCE_FILES)
 LEGACY_SOURCE_DECKS = [sorted(['wechat', 'qwen', 'doubao', 'blender', 'gimp']),
                        sorted(['wechat', 'qwen', 'doubao', 'blender', 'gimp', 'firefox'])]
-MAX_ROUND_BYTES = 256 * MIB
+MAX_ROUND_BYTES = 384 * MIB
 # Legacy installations may have reserved a long-running transfer. Retain its
 # conservative recovery horizon; never shorten an existing uncertainty window.
 RECOVERY_SECONDS = 900
@@ -58,7 +58,7 @@ CPU_LIMIT = 70
 START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
-ROUND_SECONDS = 120
+ROUND_SECONDS = 200
 MAX_DOWNLOAD_MBPS = 80
 DEFAULT = dict(version=6, interface='', ratio=3.2,
                daily_mib=10240, interval_min=20, interval_max=40,
@@ -640,7 +640,7 @@ def download(c, source, amount, settings, day, deadline, guard=None):
                         if STOP.is_set():
                             reason = '任务收到暂停或停止信号'
                         elif now >= deadline:
-                            reason = '单轮总时长已达 120 秒'
+                            reason = f'单轮总时长已达 {ROUND_SECONDS} 秒'
                         elif date_now(settings) != day:
                             reason = '统计日已切换，终止本轮，不跨午夜追量'
                         elif actual == amount and proc.poll() is None:
@@ -712,7 +712,7 @@ def round_download(c, s, amount, settings, day, save=atomic_json):
         if STOP.is_set() or remaining <= 0 or s['attempts'] >= c['max_attempts']:
             break
         if time.monotonic() >= deadline:
-            s['reason'] = '单轮总时长已达 120 秒'
+            s['reason'] = f'单轮总时长已达 {ROUND_SECONDS} 秒'
             break
         if date_now(settings, time.time()+ROUND_SECONDS+15) != day:
             s['reason'] = '临近统计日边界，等待下一轮'
@@ -1196,7 +1196,7 @@ def config_summary(c, start_after=False):
     print(f"目标比例：入站:出站 {c['ratio']:g}:1")
     print(f"服务器带宽：{c['bandwidth_mbps']:g} Mbps")
     print(f"补下载占比：{c['download_percent']:g}%（限速 {effective_speed(c):g} Mbps，最高 80 Mbps）")
-    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；每轮最多 256 MiB / 2 分钟")
+    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；每轮最多 {MAX_ROUND_BYTES//MIB} MiB / {ROUND_SECONDS} 秒")
     print(f"检查间隔：{c['interval_min']}～{c['interval_max']} 分钟")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
         print('提示：下载速度超过 80% 带宽保护线，本设置会跳过下载；请调低补下载占比。')
@@ -1412,7 +1412,7 @@ def diagnostics(include_logs=True):
         c = validate_config(load_json(CONFIG))
         print(f"网卡 {c['interface']}；目标入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
         print(f"固定保护：CPU {CPU_LIMIT}%，启动占用低于 {START_BANDWIDTH_PERCENT}%，带宽 {BANDWIDTH_LIMIT_PERCENT}%；每核负载 {c['load_per_cpu']:g}")
-        print('预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，每轮最多 256 MiB、120 秒；按缺口下载后直接丢弃。')
+        print(f'预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，每轮最多 {MAX_ROUND_BYTES//MIB} MiB、{ROUND_SECONDS} 秒；按缺口下载后直接丢弃。')
     except Error as e:
         print(f'配置无法读取：{e}')
     try:
