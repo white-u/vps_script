@@ -1,0 +1,1232 @@
+#!/bin/bash
+#
+# Realm 端口转发管理脚本（内网版）v1.0.0
+# 将当前版本、对应架构的官方 Realm 压缩包保留原名，与脚本放在一起。
+# 用法: sudo bash fw-intranet.sh
+# 缺少系统依赖时，使用现有系统软件源安装。
+
+set -Eeuo pipefail
+
+# 临时资源清理 (Ctrl+C / 异常退出时自动清理)
+_CLEANUP_FILES=()
+_RECOVERY=()
+cleanup() {
+    local f recovery_path=${_RECOVERY[1]:-}
+    for f in "${_CLEANUP_FILES[@]+"${_CLEANUP_FILES[@]}"}"; do
+        [[ -z "$recovery_path" || "$f" != "$recovery_path" ]] || continue
+        rm -rf "$f" 2>/dev/null || true
+    done
+    if [[ -n "$recovery_path" ]]; then
+        printf '自动恢复未完成，恢复备份已保留: %s\n' "$recovery_path" >&2
+    fi
+}
+
+handle_signal() {
+    local rc=$1
+    trap '' INT TERM
+    printf '\n操作已中断。\n' >&2
+    if [[ -n "${_RECOVERY[0]:-}" ]]; then
+        rollback_pending true || true
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+CURRENT_ACTION="初始化"
+unexpected_error() {
+    local rc=${1:-1} line=${2:-?}
+    printf '\n%b❌ 未预期错误: %s（第 %s 行，退出码 %s）%b\n' \
+        "${RED:-}" "${CURRENT_ACTION:-脚本执行}" "$line" "$rc" "${PLAIN:-}" >&2
+    echo "请保留以上信息，并执行: journalctl -xe --no-pager | tail -50" >&2
+}
+trap 'unexpected_error "$?" "$LINENO"' ERR
+
+# ==================== 变量定义 ====================
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+DIM="\033[2m"
+PLAIN="\033[0m"
+
+SCRIPT_VERSION="1.0.0"
+REALM_VERSION="2.9.6"
+
+REALM_BIN="/usr/local/bin/realm-intranet"
+CONFIG_DIR="/etc/realm-intranet"
+CONFIG_TOML="${CONFIG_DIR}/config.toml"
+META_FILE="${CONFIG_DIR}/fw.json"
+SERVICE_NAME="realm-intranet"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# 快捷命令路径
+SCRIPT_PATH="/usr/local/bin/fw-intranet"
+# ==================== 基础函数 ====================
+err() { echo -e "${RED}❌ 错误: $1${PLAIN}"; exit 1; }
+info() { echo -e "${GREEN}INFO: $1${PLAIN}"; }
+warn() { echo -e "${YELLOW}警告: $1${PLAIN}"; }
+read_prompt() {
+    local rc
+    if read "$@"; then return 0; else rc=$?; fi
+    if [[ "$rc" -ne 1 ]]; then
+        echo "读取输入失败（退出码 ${rc}）。" >&2
+        exit "$rc"
+    fi
+    echo
+    echo "输入已结束，退出管理。"
+    exit 0
+}
+
+strip_cr() { echo "${1//$'\r'/}"; }
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        err "请使用 root 用户运行此脚本: sudo bash fw-intranet.sh"
+    fi
+}
+
+validate_script_candidate() {
+    local file=$1
+    local version
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qx '#!/bin/bash' || return 1
+    grep -q '^SCRIPT_VERSION="' "$file" || return 1
+    version=$(grep '^SCRIPT_VERSION=' "$file" | head -1 | cut -d'"' -f2)
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    bash -n "$file"
+}
+
+version_is_older() {
+    local candidate=$1 current=$2 i candidate_part current_part
+    local IFS=.
+    local -a candidate_parts current_parts
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for ((i=0; i<${#candidate_parts[@]} || i<${#current_parts[@]}; i++)); do
+        candidate_part=${candidate_parts[i]:-0}; current_part=${current_parts[i]:-0}
+        ((10#$candidate_part < 10#$current_part)) && return 0
+        ((10#$candidate_part > 10#$current_part)) && return 1
+    done
+    return 1
+}
+
+# 同步快捷命令 (入口处调用, 确保 /usr/local/bin/fw-intranet 与运行版本一致)
+sync_script() {
+    local current_real target_real
+    current_real=$(realpath "$0" 2>/dev/null || true)
+    target_real=$(realpath "$SCRIPT_PATH" 2>/dev/null || true)
+    if [[ "$0" == "$SCRIPT_PATH" ]] || \
+       [[ -n "$current_real" && -n "$target_real" && "$current_real" == "$target_real" ]]; then
+        return 0
+    fi
+
+    local tmp_script
+    tmp_script=$(mktemp "${SCRIPT_PATH}.sync.XXXXXX") || {
+        warn "无法创建快捷命令同步临时文件，继续运行当前脚本。"
+        return 0
+    }
+    _CLEANUP_FILES+=("$tmp_script")
+
+    cp -- "$0" "$tmp_script" || err "无法复制内网版脚本，请从本地文件运行"
+
+    local candidate_ver installed_ver=""
+    candidate_ver=$(grep '^SCRIPT_VERSION=' "$tmp_script" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+    if [[ -f "$SCRIPT_PATH" ]]; then
+        installed_ver=$(grep '^SCRIPT_VERSION=' "$SCRIPT_PATH" 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+    fi
+
+    if validate_script_candidate "$tmp_script" \
+        && { [[ -z "$installed_ver" ]] || ! version_is_older "$candidate_ver" "$installed_ver"; } \
+        && chmod 755 "$tmp_script" && mv -f "$tmp_script" "$SCRIPT_PATH"; then
+        return 0
+    fi
+    if [[ "$installed_ver" =~ ^[0-9]+([.][0-9]+)*$ ]] \
+        && [[ "$candidate_ver" =~ ^[0-9]+([.][0-9]+)*$ ]] \
+        && version_is_older "$candidate_ver" "$installed_ver"; then
+        warn "拒绝用旧脚本 v${candidate_ver} 覆盖现有快捷命令 v${installed_ver}。"
+    else
+        warn "快捷命令同步失败，继续运行当前脚本；现有快捷命令未被覆盖。"
+    fi
+    return 0
+}
+
+# 依赖检查
+check_deps() {
+    local commands=(jq tar find ss sha256sum install realpath timeout)
+    local missing=() cmd
+    for cmd in "${commands[@]}"; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    info "安装必要依赖..."
+    if [ -f /etc/debian_version ]; then
+        if ! apt-get update -qq; then
+            warn "部分 APT 软件源刷新失败；将使用现有索引继续安装。请检查上方报错的软件源。"
+        fi
+        apt-get install -y -qq jq tar findutils iproute2 coreutils || true
+    elif [ -f /etc/redhat-release ]; then
+        local rpm_pm="yum"
+        command -v dnf &>/dev/null && rpm_pm="dnf"
+        "$rpm_pm" install -y jq tar findutils iproute coreutils || true
+    else
+        err "不支持当前系统的自动依赖安装，缺少: ${missing[*]}"
+    fi
+
+    missing=()
+    for cmd in "${commands[@]}"; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -eq 0 ]] || err "依赖安装失败，缺少: ${missing[*]}"
+}
+
+check_platform() {
+    [[ "$(uname -s)" == "Linux" ]] || err "fw-intranet 仅支持 Linux"
+    [[ ! -f /etc/alpine-release ]] || err "fw 依赖 systemd，当前不支持 Alpine/OpenRC"
+    command -v systemctl &>/dev/null || err "未找到 systemctl，当前系统不支持"
+    [[ -d /run/systemd/system ]] || err "systemd 未运行，无法管理 realm 服务"
+}
+
+# Realm 发行资产与官方 SHA256（glibc 2.28 兼容 Debian 10+）
+detect_realm_asset() {
+    case $(uname -m) in
+        x86_64|amd64)
+            printf '%s\t%s\n' "x86_64-unknown-linux-gnu-glibc2.28" \
+                "a85652b940fa23bf08fd29582e33e87ea9c940a71bcc7d21df9c0bd03f351149" ;;
+        aarch64|arm64)
+            printf '%s\t%s\n' "aarch64-unknown-linux-gnu-glibc2.28" \
+                "0e277d58df7a9ee9eaca1277223b54b29b1af27a1fad04ae83c7b938d451c5f8" ;;
+        armv7*)
+            printf '%s\t%s\n' "armv7-unknown-linux-gnueabihf-glibc2.28" \
+                "cb7058702c1f74bcbd45920cd778c2c5e7db98c3944ac6e05910b0e1386e4c4b" ;;
+        *) err "不支持的架构: $(uname -m)" ;;
+    esac
+}
+
+realm_installed() { [[ -x "$REALM_BIN" ]]; }
+realm_running()   { systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }
+
+# 获取 realm 运行状态 (带颜色)
+get_realm_status() {
+    if ! realm_installed; then
+        echo -e "${RED}未安装${PLAIN}"
+    elif realm_running; then
+        echo -e "${GREEN}运行中${PLAIN}"
+    else
+        echo -e "${YELLOW}已停止${PLAIN}"
+    fi
+}
+
+# 获取已安装的 realm 版本
+get_realm_version() {
+    if realm_installed; then
+        "$REALM_BIN" --version 2>/dev/null | grep -Eo '[0-9]+([.][0-9]+)+' | head -1 || true
+    fi
+}
+
+# ==================== JSON 元数据 ====================
+
+init_meta() {
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$META_FILE" ]]; then
+        local tmp_meta
+        tmp_meta=$(mktemp "${META_FILE}.init.XXXXXX") || err "无法创建规则文件"
+        _CLEANUP_FILES+=("$tmp_meta")
+        if ! printf '%s\n' '{"rules":[]}' > "$tmp_meta" \
+            || ! chmod 600 "$tmp_meta" || ! mv -f "$tmp_meta" "$META_FILE"; then
+            err "初始化规则文件失败"
+        fi
+        return
+    fi
+    # 同时校验 JSON 语法、字段类型和端口唯一性。
+    if ! jq -e '
+        type == "object" and (.rules | type == "array") and
+        all(.rules[];
+            . as $r |
+            ($r | type == "object") and
+            ($r.src_port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+            ($r.dst_port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+            ($r.dst_ip | type == "string" and
+                test("^[0-9]{1,3}([.][0-9]{1,3}){3}$") and
+                (split(".") | all(.[]; (tonumber >= 0 and tonumber <= 255)))) and
+            (($r.comment // "") | type == "string")
+        ) and
+        (([.rules[].src_port] | length) == ([.rules[].src_port] | unique | length))
+    ' "$META_FILE" >/dev/null 2>&1; then
+        local backup="${META_FILE}.corrupt.$(date +%Y%m%d%H%M%S)"
+        if ! cp -p "$META_FILE" "$backup" 2>/dev/null; then
+            err "fw.json 结构无效，且无法创建备份；原文件保持不变"
+        fi
+        err "fw.json 格式或规则结构无效，已保留为 ${backup}，请修复后重试"
+    fi
+    chmod 600 "$META_FILE" 2>/dev/null || warn "无法将 fw.json 权限设为 600"
+}
+
+rule_count() {
+    [[ -f "$META_FILE" ]] || { echo 0; return; }
+    jq '.rules | length' "$META_FILE" 2>/dev/null || echo 0
+}
+
+# ==================== 输入校验 ====================
+
+validate_port() {
+    local port=$1 label=$2
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        warn "无效${label}: $port"; return 1
+    fi
+    # 先去掉前导零并限制长度，避免超长输入在算术转换时溢出。
+    port=${port#"${port%%[!0]*}"}
+    port=${port:-0}
+    if [[ ${#port} -gt 5 ]]; then
+        warn "无效${label}: $1 (范围 1-65535)"; return 1
+    fi
+    port=$((10#$port))
+    if [[ $port -lt 1 || $port -gt 65535 ]]; then
+        warn "无效${label}: $port (范围 1-65535)"; return 1
+    fi
+}
+
+validate_ipv4() {
+    local ip=$1
+    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        warn "无效 IP: $ip"; return 1
+    fi
+    local IFS='.'; local -a parts=($ip); IFS=' '
+    local p; for p in "${parts[@]}"; do
+        if [[ $((10#$p)) -gt 255 ]]; then
+            warn "无效 IP: $ip"; return 1
+        fi
+    done
+}
+
+# 交互选择返回零起始索引；取消或输入结束返回失败，不输出索引。
+read_rule_index() {
+    local count=$1 prompt=$2 choice
+    while true; do
+        read -rp " ${prompt} (0 返回): " choice || return 1
+        choice=$(strip_cr "$choice")
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            warn "请输入有效序号，或输入 0 返回" >&2
+            continue
+        fi
+        choice=${choice#"${choice%%[!0]*}"}
+        [[ -n "$choice" ]] || return 1
+        if [[ ${#choice} -gt ${#count} ]]; then
+            warn "序号超出范围" >&2
+            continue
+        fi
+        choice=$((10#$choice))
+        if [[ $choice -lt 1 || $choice -gt $count ]]; then
+            warn "序号超出范围" >&2
+            continue
+        fi
+        printf '%s\n' "$((choice - 1))"
+        return 0
+    done
+}
+
+# ==================== IPv6 检测 ====================
+
+# 检测监听地址: IPv6 可用则双栈 [::], 否则仅 IPv4
+detect_listen_addr() {
+    if [[ -f /proc/net/if_inet6 ]] && \
+       [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]]; then
+        echo "[::]"
+    else
+        echo "0.0.0.0"
+    fi
+}
+
+# ==================== 核心逻辑 ====================
+
+# 恢复期间忽略重复中断；失败备份移出清理清单，供手动恢复。
+rollback_pending() {
+    local interrupted=${1:-false} kind=${_RECOVERY[0]:-} backup=${_RECOVERY[1]:-}
+    local rc=0 i
+    [[ -n "$kind" ]] || return 0
+    trap '' INT TERM
+    if [[ "$kind" == "rules" ]]; then
+        if ! cp -p "$backup" "$META_FILE"; then
+            warn "规则备份恢复失败"
+            rc=1
+        elif ! reload_realm true; then
+            warn "规则已恢复，但 Realm 恢复启动失败"
+            rc=1
+        fi
+    elif ! rollback_realm_install "$backup" "${_RECOVERY[2]}" "${_RECOVERY[3]}"; then
+        rc=1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        for i in "${!_CLEANUP_FILES[@]}"; do
+            [[ "${_CLEANUP_FILES[$i]}" != "$backup" ]] || unset '_CLEANUP_FILES[i]'
+        done
+        warn "自动回滚未完成，恢复备份已保留: ${backup}"
+    fi
+    _RECOVERY=()
+    if [[ "$interrupted" != "true" ]]; then
+        trap 'handle_signal 130' INT
+        trap 'handle_signal 143' TERM
+    fi
+    return "$rc"
+}
+
+rollback_realm_install() {
+    local backup_dir=$1 had_bin=$2 had_service=$3
+    warn "Realm 更新失败，正在恢复旧版本..."
+    if ! systemctl stop "$SERVICE_NAME" >/dev/null 2>&1; then
+        warn "Realm 停止失败，未继续覆盖核心和服务文件"
+        return 1
+    fi
+
+    if [[ "$had_bin" == "true" ]]; then
+        cp -p "${backup_dir}/backup.realm" "$REALM_BIN" || return 1
+    else
+        rm -f "$REALM_BIN" || return 1
+    fi
+    if [[ "$had_service" == "true" ]]; then
+        cp -p "${backup_dir}/backup.realm.service" "$SERVICE_FILE" || return 1
+    else
+        rm -f "$SERVICE_FILE" || return 1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+
+    if [[ "$had_bin" == "true" ]] && [[ "$(rule_count)" -gt 0 ]]; then
+        reload_realm true || return 1
+    fi
+    info "已恢复更新前的 Realm"
+}
+
+# 1. 安装/更新 realm 核心二进制
+install_realm() {
+    CURRENT_ACTION="安装或更新 realm"
+    if realm_installed; then
+        local cur_ver
+        cur_ver=$(get_realm_version)
+        echo -e " 当前版本: ${GREEN}v${cur_ver:-unknown}${PLAIN}"
+        read -rp " 是否重新安装 v${REALM_VERSION}? [y/N] " confirm || return 0
+        confirm=$(strip_cr "$confirm")
+        [[ "$confirm" =~ ^[yY] ]] || return 0
+    fi
+
+    echo -e "${BLUE}>>> 准备安装 realm v${REALM_VERSION}${PLAIN}"
+
+    local asset_name expected_sha archive_name local_archive script_archive tmp_dir
+    IFS=$'\t' read -r asset_name expected_sha < <(detect_realm_asset)
+    [[ -n "$asset_name" && -n "$expected_sha" ]] || err "无法确定 Realm 发行资产"
+    archive_name="realm-${asset_name}.tar.gz"
+    local_archive="${PWD}/${archive_name}"
+    if [[ -f "$0" ]]; then
+        script_archive="$(dirname -- "$0")/${archive_name}"
+        if [[ -e "$script_archive" ]]; then
+            local_archive=$script_archive
+        fi
+    fi
+
+    tmp_dir=$(mktemp -d /tmp/realm_install.XXXXXX)
+    _CLEANUP_FILES+=("$tmp_dir")
+
+    [[ -e "$local_archive" ]] || err "未找到 Realm v${REALM_VERSION} 安装包，请将 ${archive_name} 放到脚本目录或当前目录后重试"
+    info "使用本地 Realm 安装包: ${local_archive}"
+    if [[ ! -f "$local_archive" ]] || ! cp -- "$local_archive" "${tmp_dir}/realm.tar.gz"; then
+        err "无法读取本地 Realm 安装包: ${local_archive}"
+    fi
+    info "正在校验安装包..."
+    if ! printf '%s  %s\n' "$expected_sha" "${tmp_dir}/realm.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+        err "Realm 官方 SHA256 校验失败，已拒绝安装"
+    fi
+
+    # 解压到临时目录，只提取二进制
+    info "安装包校验通过，正在解压..."
+    if ! tar -xzf "${tmp_dir}/realm.tar.gz" -C "$tmp_dir"; then
+        err "解压失败。"
+    fi
+
+    local bin_path
+    bin_path=$(find "$tmp_dir" -name "realm" -type f -perm -111 2>/dev/null | head -1)
+    [[ -n "$bin_path" ]] || err "解压后未找到 realm 二进制"
+    chmod 755 "$bin_path"
+
+    local candidate_ver
+    candidate_ver=$("$bin_path" --version 2>/dev/null | grep -Eo '[0-9]+([.][0-9]+)+' | head -1 || true)
+    [[ "$candidate_ver" == "$REALM_VERSION" ]] \
+        || err "Realm 二进制验证失败（期望 v${REALM_VERSION}，实际 v${candidate_ver:-unknown}）"
+
+    info "正在安装 Realm 并检查服务..."
+    local had_bin=false had_service=false backup_dir
+    backup_dir=$(mktemp -d "${CONFIG_DIR}/.realm-backup.XXXXXX") || err "无法创建 Realm 恢复备份目录"
+    _CLEANUP_FILES+=("$backup_dir")
+    if [[ -f "$REALM_BIN" ]]; then
+        cp -p "$REALM_BIN" "${backup_dir}/backup.realm" || err "无法备份旧 Realm 二进制"
+        had_bin=true
+    fi
+    if [[ -f "$SERVICE_FILE" ]]; then
+        cp -p "$SERVICE_FILE" "${backup_dir}/backup.realm.service" || err "无法备份 Realm 服务文件"
+        had_service=true
+    fi
+
+    local new_bin new_service
+    new_bin=$(mktemp "$(dirname "$REALM_BIN")/.realm.new.XXXXXX") || err "无法创建 Realm 二进制临时文件"
+    new_service=$(mktemp "$(dirname "$SERVICE_FILE")/.realm.service.XXXXXX") || err "无法创建 Realm 服务临时文件"
+    _CLEANUP_FILES+=("$new_bin" "$new_service")
+    install -m 755 "$bin_path" "$new_bin" || err "准备 Realm 二进制失败"
+
+    cat > "$new_service" <<EOF
+[Unit]
+Description=Realm Intranet Port Forwarding
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${REALM_BIN} -c ${CONFIG_TOML}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$new_service"
+
+    _RECOVERY=(install "$backup_dir" "$had_bin" "$had_service")
+    if ! mv -f "$new_bin" "$REALM_BIN" || ! mv -f "$new_service" "$SERVICE_FILE"; then
+        rollback_pending || true
+        err "Realm 文件安装失败，已尝试回滚"
+    fi
+    if ! systemctl daemon-reload; then
+        rollback_pending || true
+        err "systemctl daemon-reload 失败，已尝试回滚"
+    fi
+
+    if ! reload_realm true; then
+        if ! rollback_pending; then
+            err "Realm 启动失败，且自动回滚失败，请立即检查 journalctl -u ${SERVICE_NAME}"
+        fi
+        err "Realm v${REALM_VERSION} 启动失败，已恢复旧版本"
+    fi
+
+    _RECOVERY=()
+    info "realm v${REALM_VERSION} 已安装完成"
+}
+
+# 2. 配置生成
+generate_config() {
+    init_meta
+    local tmp_config
+    tmp_config=$(mktemp "${CONFIG_TOML}.new.XXXXXX") || {
+        warn "无法创建 Realm 配置临时文件"
+        return 1
+    }
+    _CLEANUP_FILES+=("$tmp_config")
+
+    if ! printf '%s\n' \
+        '# 由 fw.sh 自动生成，请勿手动编辑' \
+        '[log]' 'level = "warn"' 'output = "stdout"' '' \
+        '[network]' 'use_udp = true' > "$tmp_config"; then
+        warn "Realm 配置写入失败"
+        return 1
+    fi
+
+    local count
+    count=$(rule_count)
+    if [[ "$count" -gt 0 ]]; then
+        local rules
+        if ! rules=$(jq -r '.rules[] | [.src_port, .dst_ip, .dst_port] | @tsv' "$META_FILE"); then
+            warn "无法读取 Realm 转发规则"
+            return 1
+        fi
+
+        local listen_addr
+        listen_addr=$(detect_listen_addr)
+
+        while IFS=$'\t' read -r sp dip dp; do
+            [[ -n "$sp" ]] || continue
+            if ! printf '\n%s\n%s\n%s\n' '[[endpoints]]' \
+                "listen = \"${listen_addr}:${sp}\"" \
+                "remote = \"${dip}:${dp}\"" >> "$tmp_config"; then
+                warn "Realm 端点配置写入失败"
+                return 1
+            fi
+        done <<< "$rules"
+    fi
+
+    if ! chmod 644 "$tmp_config" || ! mv -f "$tmp_config" "$CONFIG_TOML"; then
+        warn "Realm 配置替换失败"
+        return 1
+    fi
+}
+
+# 核对所有规则的 TCP/UDP 监听，必须属于当前服务主进程。
+check_realm_listeners() {
+    local ports=$1 pid sockets
+    if ! realm_running; then
+        echo "Realm 服务未运行"
+        return 1
+    fi
+    if ! pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null) \
+        || ! [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        echo "无法获取 Realm 主进程 PID"
+        return 1
+    fi
+    if ! sockets=$(ss -H -ltnup 2>/dev/null); then
+        echo "无法读取 TCP/UDP 监听状态"
+        return 1
+    fi
+
+    awk -v pid="$pid" -v ports="${ports//$'\n'/ }" '
+        ($1 == "tcp" || $1 == "udp") && $0 ~ ("pid=" pid "([,)]|$)") {
+            port = $5
+            sub(/^.*:/, "", port)
+            listening[$1 ":" port] = 1
+        }
+        END {
+            count = split(ports, expected, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                for (j = 1; j <= 2; j++) {
+                    proto = (j == 1 ? "tcp" : "udp")
+                    if (!listening[proto ":" expected[i]]) {
+                        printf "%s %s 未由 Realm 主进程监听\n", proto, expected[i]
+                        failed = 1
+                    }
+                }
+            }
+            exit failed
+        }
+    ' <<< "$sockets"
+}
+
+# 3. 重载 realm
+reload_realm() {
+    local quiet=${1:-false}
+    generate_config || return 1
+
+    local count
+    count=$(rule_count)
+
+    if [[ "$count" -eq 0 ]]; then
+        if realm_running; then
+            if ! systemctl stop "$SERVICE_NAME"; then
+                warn "realm 停止失败"
+                return 1
+            fi
+            [[ "$quiet" == "true" ]] || info "无转发规则，realm 已停止"
+        fi
+        if ! systemctl disable "$SERVICE_NAME" >/dev/null 2>&1; then
+            warn "realm 取消开机启动失败"
+            return 1
+        fi
+        return 0
+    fi
+
+    if ! realm_installed; then
+        warn "realm 未安装，配置已保存，请先运行: fw-intranet install"
+        return 1
+    fi
+
+    local ports
+    if ! ports=$(jq -r '.rules[].src_port' "$META_FILE"); then
+        warn "无法读取待检查的 Realm 监听端口"
+        return 1
+    fi
+
+    # 有规则, 确保开机自启
+    if ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+        warn "realm 设置开机启动失败"
+        return 1
+    fi
+
+    local service_command_ok=true
+    if realm_running; then
+        systemctl restart "$SERVICE_NAME" || service_command_ok=false
+    else
+        systemctl start "$SERVICE_NAME" || service_command_ok=false
+    fi
+
+    local attempt listener_error=""
+    if [[ "$service_command_ok" == "true" ]]; then
+        for ((attempt=0; attempt<5; attempt++)); do
+            sleep 1
+            if listener_error=$(check_realm_listeners "$ports"); then
+                [[ "$quiet" == "true" ]] || info "realm 已重载 (${count} 条规则)"
+                return 0
+            fi
+        done
+    fi
+
+    warn "realm 启动或监听检查失败，最近日志如下:"
+    [[ -z "$listener_error" ]] || printf '%s\n' "$listener_error" >&2
+    journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' >&2 || true
+    return 1
+}
+
+# 监听端口的可用性检查由交互输入和实际写入共同使用。
+check_source_port_available() {
+    local src_port=$1 occupied
+    if jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
+        warn "源端口 ${src_port} 已存在"; return 1
+    fi
+
+    # 精确检查 TCP 和 UDP 监听，避免重启 Realm 时影响已有规则。
+    if ! occupied=$(ss -H -ltnup "sport = :${src_port}" 2>/dev/null); then
+        warn "无法检查端口占用，未添加规则"
+        return 1
+    fi
+    if [[ -n "$occupied" ]]; then
+        warn "端口 ${src_port} 已被其他进程占用"
+        printf '%s\n' "$occupied" | sed 's/^/  /'
+        return 1
+    fi
+    return 0
+}
+
+# 4. 添加转发规则
+add_forward() {
+    CURRENT_ACTION="添加 realm 转发规则"
+    local src_port=$1 dst_ip=$2 dst_port=$3 comment=${4:-""}
+
+    validate_port "$src_port" "源端口" || return 1
+    validate_port "$dst_port" "目标端口" || return 1
+    validate_ipv4 "$dst_ip" || return 1
+
+    # 规范化端口
+    src_port=$((10#$src_port))
+    dst_port=$((10#$dst_port))
+
+    init_meta
+    check_source_port_available "$src_port" || return 1
+
+    # JSON 本身会转义引号，只需删除可破坏终端显示的控制字符。
+    comment=$(printf '%s' "$comment" | LC_ALL=C tr -d '\000-\037\177')
+
+    local backup_file tmp_file
+    backup_file=$(mktemp "${META_FILE}.backup.XXXXXX") || { warn "无法创建规则备份"; return 1; }
+    _CLEANUP_FILES+=("$backup_file")
+    tmp_file=$(mktemp /tmp/fw_meta_new.XXXXXX) || { warn "无法创建规则临时文件"; return 1; }
+    _CLEANUP_FILES+=("$tmp_file")
+    if ! cp -p "$META_FILE" "$backup_file"; then
+        warn "无法备份当前规则"
+        return 1
+    fi
+    if ! jq --argjson sp "$src_port" --arg di "$dst_ip" --argjson dp "$dst_port" --arg c "$comment" \
+        '.rules += [{"src_port":$sp, "dst_ip":$di, "dst_port":$dp, "comment":$c}]' "$META_FILE" > "$tmp_file"; then
+        warn "规则写入失败"
+        return 1
+    fi
+    if ! chmod 600 "$tmp_file"; then
+        warn "规则文件替换失败"
+        return 1
+    fi
+    _RECOVERY=(rules "$backup_file")
+    if ! mv -f "$tmp_file" "$META_FILE"; then
+        rollback_pending || true
+        warn "规则文件替换失败"
+        return 1
+    fi
+
+    if ! reload_realm true; then
+        if ! rollback_pending; then
+            warn "转发启动失败，且规则回滚未完成"
+            return 1
+        fi
+        warn "转发启动失败，新增规则已回滚"
+        return 1
+    fi
+    _RECOVERY=()
+    echo ""
+    info "转发已添加: :${src_port} → ${dst_ip}:${dst_port}"
+    echo -e " ${YELLOW}注意: FW 不会修改防火墙；如外部无法连接，请自行放行 TCP/UDP ${src_port}${PLAIN}"
+}
+
+# 5. 删除转发规则
+delete_forward() {
+    CURRENT_ACTION="删除 realm 转发规则"
+    local src_port=$1
+
+    validate_port "$src_port" "源端口" || return 1
+    src_port=$((10#$src_port))
+    init_meta
+
+    if ! jq -e --argjson p "$src_port" '.rules[] | select(.src_port == $p)' "$META_FILE" &>/dev/null; then
+        warn "源端口 ${src_port} 不存在"; return 1
+    fi
+
+    local backup_file tmp_file
+    backup_file=$(mktemp "${META_FILE}.backup.XXXXXX") || { warn "无法创建规则备份"; return 1; }
+    _CLEANUP_FILES+=("$backup_file")
+    tmp_file=$(mktemp /tmp/fw_meta_new.XXXXXX) || { warn "无法创建规则临时文件"; return 1; }
+    _CLEANUP_FILES+=("$tmp_file")
+    if ! cp -p "$META_FILE" "$backup_file"; then
+        warn "无法备份当前规则"
+        return 1
+    fi
+    if ! jq --argjson sp "$src_port" '.rules = [.rules[] | select(.src_port != $sp)]' "$META_FILE" > "$tmp_file"; then
+        warn "规则写入失败"
+        return 1
+    fi
+    if ! chmod 600 "$tmp_file"; then
+        warn "规则文件替换失败"
+        return 1
+    fi
+    _RECOVERY=(rules "$backup_file")
+    if ! mv -f "$tmp_file" "$META_FILE"; then
+        rollback_pending || true
+        warn "规则文件替换失败"
+        return 1
+    fi
+
+    if ! reload_realm true; then
+        if ! rollback_pending; then
+            warn "realm 重载失败，且规则回滚未完成"
+            return 1
+        fi
+        warn "realm 重载失败，删除操作已回滚"
+        return 1
+    fi
+    _RECOVERY=()
+    info "转发已删除: 源端口 ${src_port}"
+    echo -e " ${DIM}提示: 如在 pm.sh 中有对应监控，请手动移除${PLAIN}"
+}
+
+print_rule_table() {
+    local rules i=1 sp dip dp cmt
+    if ! rules=$(jq -r '.rules[] | [.src_port, .dst_ip, .dst_port, (.comment // "")] | @tsv' "$META_FILE"); then
+        warn "无法读取规则"
+        return 1
+    fi
+    printf " %-4s %-10s %-25s %s\n" "序号" "监听" "目标" "备注"
+    echo -e " ─────────────────────────────────────────────────────────────────────"
+    while IFS=$'\t' read -r sp dip dp cmt; do
+        [[ -n "$sp" ]] || continue
+        printf " [%d]  %-10s %-25s %s\n" "$i" ":${sp}" "${dip}:${dp}" "$cmt"
+        i=$((i + 1))
+    done <<< "$rules"
+}
+
+# 6. 查看所有配置
+show_all_configs() {
+    init_meta
+    local count
+    count=$(rule_count)
+
+    if [[ "$count" -eq 0 ]]; then
+        warn "暂无转发规则。"
+        return
+    fi
+
+    echo -e " ${BLUE}>>> 转发规则清单${PLAIN}"
+    echo -e " ════════════════════════════════════════════════════════════════"
+
+    print_rule_table || return
+
+    echo -e " ${DIM}提示: 配额/限速请在 pm.sh 中为对应端口添加监控。${PLAIN}"
+}
+
+# 7. 测试转发规则
+test_forward_rule() {
+    CURRENT_ACTION="测试 realm 转发规则"
+    init_meta
+    local preset_port=${1:-}
+
+    local count
+    count=$(rule_count)
+    if [[ "$count" -eq 0 ]]; then
+        warn "暂无转发规则。"
+        [[ -n "$preset_port" ]] || pause_to_menu
+        return 0
+    fi
+
+    local rule src_port dst_ip dst_port
+    if [[ -n "$preset_port" ]]; then
+        validate_port "$preset_port" "源端口" || return 0
+        preset_port=$((10#$preset_port))
+        if ! rule=$(jq -r --argjson p "$preset_port" \
+            '.rules[]? | select(.src_port == $p) | [.src_port, .dst_ip, .dst_port] | @tsv' "$META_FILE"); then
+            warn "无法读取转发规则"
+            return 0
+        fi
+    else
+        echo -e "\n${BLUE}>>> 测试转发规则${PLAIN}\n"
+        print_rule_table || { pause_to_menu; return 0; }
+        echo
+
+        local idx
+        idx=$(read_rule_index "$count" "请选择要测试的序号") || return 0
+        if ! rule=$(jq -r ".rules[$idx] | [.src_port, .dst_ip, .dst_port] | @tsv" "$META_FILE"); then
+            warn "无法读取转发规则"
+            pause_to_menu
+            return 0
+        fi
+    fi
+    if [[ -z "$rule" ]]; then
+        warn "未找到转发规则"
+        [[ -n "$preset_port" ]] || pause_to_menu
+        return 0
+    fi
+    if ! IFS=$'\t' read -r src_port dst_ip dst_port <<< "$rule"; then
+        warn "无法读取转发规则"
+        [[ -n "$preset_port" ]] || pause_to_menu
+        return 0
+    fi
+    if [[ -z "$src_port" || -z "$dst_ip" || -z "$dst_port" ]]; then
+        warn "转发规则内容不完整"
+        [[ -n "$preset_port" ]] || pause_to_menu
+        return 0
+    fi
+
+    echo
+    echo -e " 检测: :${src_port} → ${dst_ip}:${dst_port}"
+    echo -e " ─────────────────────────────────────────────"
+
+    local tcp_socket udp_socket
+    if realm_running; then
+        echo -e " ${GREEN}✓ Realm 服务运行中${PLAIN}"
+    else
+        echo -e " ${RED}✗ Realm 服务未运行${PLAIN}"
+    fi
+
+    tcp_socket=$(ss -H -ltnp "sport = :${src_port}" 2>/dev/null || true)
+    if [[ "$tcp_socket" == *'"realm-intranet"'* ]]; then
+        echo -e " ${GREEN}✓ TCP ${src_port} 由 Realm 监听${PLAIN}"
+    else
+        echo -e " ${RED}✗ TCP ${src_port} 未由 Realm 监听${PLAIN}"
+    fi
+
+    udp_socket=$(ss -H -lunp "sport = :${src_port}" 2>/dev/null || true)
+    if [[ "$udp_socket" == *'"realm-intranet"'* ]]; then
+        echo -e " ${GREEN}✓ UDP ${src_port} 由 Realm 监听${PLAIN}"
+    else
+        echo -e " ${YELLOW}! UDP ${src_port} 未由 Realm 监听${PLAIN}"
+    fi
+
+    if timeout 4 bash -c 'exec 3<>"/dev/tcp/${1}/${2}"' _ "$dst_ip" "$dst_port" \
+        >/dev/null 2>&1; then
+        echo -e " ${GREEN}✓ 本机可连接目标 TCP ${dst_ip}:${dst_port}${PLAIN}"
+    else
+        echo -e " ${RED}✗ 本机无法连接目标 TCP ${dst_ip}:${dst_port}${PLAIN}"
+    fi
+
+    echo -e " ─────────────────────────────────────────────"
+    [[ -n "$preset_port" ]] || pause_to_menu
+    return 0
+}
+
+# 8. 完整卸载
+uninstall_all() {
+    CURRENT_ACTION="卸载 realm"
+    echo
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo -e " ${RED}  警告: 即将卸载 realm 并清除全部配置!${PLAIN}"
+    echo -e " ${RED}════════════════════════════════════════${PLAIN}"
+    echo
+    read_prompt -rp " 确认执行? (输入 yes 确认): " confirm
+    confirm=$(strip_cr "$confirm")
+    [[ "${confirm,,}" != "yes" ]] && { echo " 已取消。"; return; }
+
+    if realm_running && ! systemctl stop "$SERVICE_NAME"; then
+        err "realm 停止失败，未继续删除文件"
+    fi
+
+    if [[ -f "$SERVICE_FILE" ]]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 \
+            || err "realm 取消开机启动失败"
+        rm -f "$SERVICE_FILE" || err "Realm 服务文件删除失败"
+        systemctl daemon-reload || err "systemd 重载失败"
+    fi
+
+    rm -f "$REALM_BIN" || err "Realm 二进制删除失败"
+    rm -rf "$CONFIG_DIR" || err "Realm 配置目录删除失败"
+    rm -f "$SCRIPT_PATH" || err "FW 快捷命令删除失败"
+
+    info "realm 已彻底卸载。"
+    warn "请按需清理为内网转发手动添加的防火墙规则。"
+    exit 0
+}
+
+# ==================== 交互菜单 ====================
+
+pause_to_menu() {
+    read -rp " 按回车返回..." || true
+}
+
+print_rule_preview() {
+    printf '\n 转发规则: :%s → %s:%s（TCP/UDP）\n 备注: %s\n' \
+        "$1" "$2" "$3" "${4:-无}"
+}
+
+menu_add() {
+    echo -e "\n${BLUE}>>> 添加转发规则${PLAIN}\n"
+    local src_port dst_ip dst_port comment="" confirm count
+    init_meta
+
+    while true; do
+        read -rp " 本机监听端口 (0 返回): " src_port || return 0
+        src_port=$(strip_cr "$src_port")
+        [[ "$src_port" =~ ^0+$ ]] && return 0
+        validate_port "$src_port" "本机监听端口" || continue
+        src_port=$((10#$src_port))
+        check_source_port_available "$src_port" || continue
+        break
+    done
+
+    while true; do
+        read -rp " 目标 IPv4 地址 (0 返回): " dst_ip || return 0
+        dst_ip=$(strip_cr "$dst_ip")
+        [[ "$dst_ip" =~ ^0+$ ]] && return 0
+        validate_ipv4 "$dst_ip" || continue
+        break
+    done
+
+    while true; do
+        read -rp " 目标端口 [默认 ${src_port}，0 返回]: " dst_port || return 0
+        dst_port=$(strip_cr "$dst_port")
+        [[ "$dst_port" =~ ^0+$ ]] && return 0
+        [[ -n "$dst_port" ]] || dst_port="$src_port"
+        validate_port "$dst_port" "目标端口" || continue
+        dst_port=$((10#$dst_port))
+        break
+    done
+
+    read -rp " 备注 (可选，回车留空): " comment || return 0
+    comment=$(strip_cr "$comment")
+    comment=$(printf '%s' "$comment" | LC_ALL=C tr -d '\000-\037\177')
+
+    print_rule_preview "$src_port" "$dst_ip" "$dst_port" "$comment"
+    count=$(rule_count)
+    if [[ "$count" -gt 0 ]]; then
+        warn "添加后将重启 Realm，现有 ${count} 条规则的连接会短暂中断。"
+    else
+        info "添加后将启动 Realm。"
+    fi
+    while true; do
+        read -rp " 确认添加? [Y/n，0 返回]: " confirm || return 0
+        confirm=$(strip_cr "$confirm")
+        case "${confirm,,}" in
+            ""|y|yes) break ;;
+            n|no|0) echo " 已取消。"; return 0 ;;
+            *) warn "请输入 y 或 n（回车确认，0 返回）" ;;
+        esac
+    done
+
+    echo
+    if ! add_forward "$src_port" "$dst_ip" "$dst_port" "$comment"; then
+        warn "添加失败，请查看上方信息"
+    else
+        local test_now
+        read -rp " 是否立即测试? [Y/n] " test_now || true
+        test_now=$(strip_cr "$test_now")
+        [[ "$test_now" =~ ^[nN] ]] || test_forward_rule "$src_port"
+    fi
+    pause_to_menu
+    return 0
+}
+
+menu_delete() {
+    local count idx confirm rule target_port dst_ip dst_port comment
+    count=$(rule_count)
+
+    if [[ "$count" -eq 0 ]]; then
+        warn "暂无转发规则。"
+        pause_to_menu
+        return
+    fi
+
+    echo -e "\n${BLUE}>>> 删除转发规则${PLAIN}\n"
+
+    print_rule_table || { pause_to_menu; return 0; }
+
+    echo
+    idx=$(read_rule_index "$count" "请选择要删除的序号") || return 0
+    if ! rule=$(jq -r ".rules[$idx] | [.src_port, .dst_ip, .dst_port, (.comment // \"\")] | @tsv" "$META_FILE"); then
+        warn "无法读取转发规则"
+        pause_to_menu
+        return 0
+    fi
+    IFS=$'\t' read -r target_port dst_ip dst_port comment <<< "$rule"
+
+    print_rule_preview "$target_port" "$dst_ip" "$dst_port" "$comment"
+    if [[ "$count" -eq 1 ]]; then
+        warn "删除后将停止 Realm，该规则的现有连接会断开。"
+    else
+        warn "删除后将重启 Realm，全部 ${count} 条规则的现有连接会中断。"
+    fi
+    while true; do
+        read -rp " 确认删除? [y/N，0 返回]: " confirm || return 0
+        confirm=$(strip_cr "$confirm")
+        case "${confirm,,}" in
+            y|yes) break ;;
+            ""|n|no|0) echo " 已取消。"; return 0 ;;
+            *) warn "请输入 y 或 n（回车取消，0 返回）" ;;
+        esac
+    done
+    echo
+    if ! delete_forward "$target_port"; then
+        warn "删除失败，请查看上方信息"
+    fi
+    pause_to_menu
+    return 0
+}
+
+menu_status() {
+    echo
+    echo -e " ${BLUE}>>> 服务状态${PLAIN}"
+    echo
+
+    if ! realm_installed; then
+        echo -e " realm: ${RED}未安装${PLAIN}"
+        return
+    fi
+
+    local ver
+    ver=$(get_realm_version)
+    echo -e " 版本:  v${ver:-unknown}"
+    echo -e " 二进制: ${REALM_BIN}"
+    echo -e " 配置:  ${CONFIG_TOML}"
+    echo
+
+    if realm_running; then
+        echo -e " 状态: ${GREEN}● 运行中${PLAIN}"
+        local pid mem
+        pid=$(systemctl show -p MainPID "$SERVICE_NAME" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$pid" && "$pid" != "0" ]]; then
+            mem=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+            echo -e " PID: ${pid}  内存: ${mem}"
+        fi
+        echo
+        echo -e " ${DIM}监听端口:${PLAIN}"
+        ss -H -ltnup 2>/dev/null | awk '/"realm-intranet"/ {print "   " $1 "  " $5}' | head -40 || true
+    else
+        echo -e " 状态: ${YELLOW}● 已停止${PLAIN}"
+        echo
+        if journalctl -u "$SERVICE_NAME" -n 1 &>/dev/null 2>&1; then
+            echo -e " ${DIM}最近日志:${PLAIN}"
+            journalctl -u "$SERVICE_NAME" -n 5 --no-pager 2>/dev/null | sed 's/^/   /' || true
+        fi
+    fi
+}
+
+# ==================== 菜单 ====================
+menu() {
+    CURRENT_ACTION="读取 fw-intranet 管理菜单"
+    clear
+    echo -e "========================================================================"
+    echo -e "  FW 内网端口转发 · v${SCRIPT_VERSION}"
+    echo -e "========================================================================"
+
+    # ---- 状态面板 ----
+    local realm_status
+    realm_status=$(get_realm_status)
+    local ver_str=""
+    if realm_installed; then
+        local ver
+        ver=$(get_realm_version)
+        [[ -n "$ver" ]] && ver_str=" v${ver}"
+    fi
+    echo -e " Realm: ${realm_status}${ver_str}    规则: $(rule_count) 条"
+    echo -e "------------------------------------------------------------------------"
+
+    # ---- 规则列表 ----
+    local count
+    count=$(rule_count)
+    if [[ "$count" -gt 0 ]]; then
+        print_rule_table || true
+    else
+        echo -e " ${DIM}暂无转发规则，请先安装 realm 并添加规则。${PLAIN}"
+    fi
+
+    echo -e "========================================================================"
+    echo
+    if ! realm_installed; then
+        echo -e " 1. ${GREEN}安装 Realm${PLAIN}"
+    else
+        echo -e " 1. 更新或重装 Realm"
+    fi
+    echo -e " 2. ${GREEN}添加转发规则${PLAIN}"
+    echo -e " 3. 测试转发规则"
+    echo -e " 4. 服务状态与日志"
+    echo -e " 5. 删除转发规则"
+    echo -e " 6. ${RED}卸载内网版${PLAIN}"
+    echo -e " 0. 退出"
+    echo -e "========================================================================"
+    read_prompt -rp " 请输入选项: " choice
+    choice=$(strip_cr "$choice")
+
+    case $choice in
+        1) install_realm; read_prompt -rp " 按回车返回..." ;;
+        2)
+            if ! realm_installed; then
+                warn "realm 未安装"
+                read_prompt -rp " 现在安装? [Y/n] " c
+                c=$(strip_cr "$c")
+                [[ "$c" =~ ^[nN] ]] && return
+                install_realm
+            fi
+            menu_add ;;
+        3) test_forward_rule ;;
+        4) menu_status; read_prompt -rp " 按回车返回..." ;;
+        5) menu_delete ;;
+        6) uninstall_all ;;
+        0) exit 0 ;;
+        *) warn "无效选项，请输入 0-6。"; pause_to_menu ;;
+    esac
+}
+
+show_help() {
+    echo
+    echo " fw-intranet — Realm 内网端口转发 v${SCRIPT_VERSION}"
+    echo
+    echo " 用法:"
+    echo "   fw-intranet                交互菜单"
+    echo "   fw-intranet install        从本地包安装或重装 Realm"
+    echo "   fw-intranet list           列出转发规则"
+    echo "   fw-intranet add SP DIP DP [备注]"
+    echo "   fw-intranet del SP         删除转发"
+    echo "   fw-intranet status         服务状态"
+    echo "   fw-intranet uninstall      卸载内网版"
+    echo " Realm 安装使用脚本目录或当前目录中的官方 v${REALM_VERSION} 压缩包。"
+    echo
+}
+
+# ==================== 入口 ====================
+if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    show_help
+    exit 0
+fi
+
+check_root
+check_platform
+check_deps
+sync_script
+init_meta
+
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        install)   install_realm ;;
+        uninstall) uninstall_all ;;
+        list|ls)   show_all_configs ;;
+        status)    menu_status ;;
+        add)
+            realm_installed || err "realm 未安装，请先: $0 install"
+            [[ $# -ge 4 ]] || err "用法: $0 add <源端口> <目标IP> <目标端口> [备注]"
+            if ! add_forward "$2" "$3" "$4" "${5:-}"; then exit 1; fi
+            ;;
+        del|delete|rm)
+            [[ $# -ge 2 ]] || err "用法: $0 del <源端口>"
+            if ! delete_forward "$2"; then exit 1; fi
+            ;;
+        *) err "未知命令: $1 ($0 help 查看帮助)" ;;
+    esac
+else
+    if ! realm_installed; then
+        info "未检测到 Realm 核心，正在自动安装..."
+        install_realm
+    fi
+    while true; do
+        menu
+    done
+fi
