@@ -96,9 +96,9 @@ class AccountingTests(unittest.TestCase):
                  total_rx=2048*b.MIB, total_tx=2048*b.MIB)
         b.observe(s, self.day, v)
         # Only 1 GiB is needed for a 2:1 target, even though the budget is 10 GiB.
-        for _ in range(1):
+        for expected in (384, 384, 256):
             amount, _ = b.plan(c, s, v)
-            self.assertEqual(amount, 1024*b.MIB)
+            self.assertEqual(amount, expected*b.MIB)
             with patch.object(b.time, 'time', return_value=v['updated']):
                 b.reserve(s, amount, v)
                 b.settle(s, amount)
@@ -108,12 +108,12 @@ class AccountingTests(unittest.TestCase):
         amount, reason = b.plan(c, s, v)
         self.assertEqual(amount, 0)
         self.assertIn('无需补量', reason)
-        self.assertEqual((s['used'], s['attempts']), (1024*b.MIB, 1))
+        self.assertEqual((s['used'], s['attempts']), (1024*b.MIB, 3))
 
     def test_reported_near_equal_traffic_needs_inbound_download(self):
         # User's example: 591.81 MiB received, 613.64 MiB sent.
         v = dict(self.v, rx=59181*b.MIB//100, tx=61364*b.MIB//100)
-        self.assertAlmostEqual(b.plan(self.c, self.s, v)[0] / b.MIB, 696.834, places=3)
+        self.assertEqual(b.plan(self.c, self.s, v)[0], 384*b.MIB)
         self.assertAlmostEqual((b.required_inbound(self.c, v['tx']) - v['rx']) / b.MIB,
                                696.834, places=3)
 
@@ -123,10 +123,10 @@ class AccountingTests(unittest.TestCase):
         v = dict(self.v, rx=5*1024*b.MIB, tx=4608*b.MIB,
                  total_rx=6*1024*b.MIB, total_tx=5*1024*b.MIB)
         b.observe(s, self.day, v)
-        for _ in range(8):
+        for expected in [384]*10+[256]:
             gap, _ = b.plan(c, s, v)
-            amount = min(gap, 512*b.MIB)  # Simulate a selected 512 MiB file.
-            self.assertEqual(amount, 512*b.MIB)
+            amount = min(gap, 384*b.MIB)  # Simulate one bounded round.
+            self.assertEqual(amount, expected*b.MIB)
             with patch.object(b.time, 'time', return_value=v['updated']):
                 b.reserve(s, amount, v)
                 b.settle(s, amount)
@@ -134,12 +134,12 @@ class AccountingTests(unittest.TestCase):
                      updated=v['updated']+1)
             b.observe(s, self.day, v)
         self.assertEqual(b.plan(c, s, v)[0], 0)
-        self.assertEqual((s['used'], s['attempts']), (4*1024*b.MIB, 8))
+        self.assertEqual((s['used'], s['attempts']), (4*1024*b.MIB, 11))
         self.assertEqual(v['rx'], v['tx']*2)
 
     def test_large_gap_is_capped_per_round_but_small_gap_is_not_padded(self):
         large = dict(self.v, rx=1024*b.MIB, tx=10*1024*b.MIB)
-        self.assertEqual(b.plan(self.c, self.s, large)[0], 10240*b.MIB)
+        self.assertEqual(b.plan(self.c, self.s, large)[0], 384*b.MIB)
         near = dict(self.v, rx=1890*b.MIB, tx=1000*b.MIB)
         self.assertEqual(b.plan(self.c, self.s, near)[0], 210*b.MIB)
         # Reaching the inbound/outbound target stops future rounds.
@@ -178,40 +178,42 @@ class AccountingTests(unittest.TestCase):
         self.assertIn('网卡不一致', s['reason'])
         self.assertEqual((s['used'], s['attempts']), (0, 0))
 
-    def test_five_file_sources_respect_one_gib_file_bound(self):
-        self.assertEqual(len(b.SOURCES), 5)
+    def test_legacy_source_deck_is_recognized_without_changing_ledger(self):
+        s = copy.deepcopy(self.s)
+        s.update(source_order=['wechat','qwen','doubao','blender','gimp','firefox'],
+                 source_index=4, used=123456, attempts=7)
+        b.validate_state(s)
+        self.assertEqual((s['used'], s['attempts']), (123456, 7))
+
+    def test_three_sources_use_api_or_range(self):
+        self.assertEqual(set(b.SOURCES), {'cloudflare', 'ovh', 'hetzner'})
         for source, url in b.SOURCE_FILES.items():
-            size = 1024*b.MIB
-            cmd = b.curl_command(self.c, source, size, 300)
-            self.assertEqual(cmd[cmd.index('--range')+1], f'0-{size-1}')
-            self.assertEqual(cmd[-1], url)
+            cmd = b.curl_command(self.c, source, 384*b.MIB, 200)
+            if source == 'cloudflare':
+                self.assertNotIn('--range', cmd)
+                self.assertIn(str(384*b.MIB), cmd[-1])
+            else:
+                self.assertEqual(cmd[cmd.index('--range')+1], f'0-{384*b.MIB-1}')
 
-    def test_large_gap_settles_when_selected_file_is_smaller(self):
-        saved = []
-        chosen = 'wechat'
-        amount = 259961968
-        def completed(_c, _source, budget, *_args, **_kwargs):
+    def test_round_direct_call_cannot_bypass_quantity_cap(self):
+        def completed(_c, _source, amount, *_args, **_kwargs):
             return amount, True, 0, '下载成功'
-        with patch.object(b, 'source_candidates', return_value=[chosen]), \
-             patch.object(b, 'download', side_effect=completed) as dl:
-            b.round_download(self.c, self.s, 3*1024*b.MIB, SETTINGS, b.date_now(SETTINGS),
-                             lambda _, state: saved.append(copy.deepcopy(state)))
-        self.assertEqual(dl.call_args.args[2], 1024*b.MIB)
-        self.assertEqual(saved[0]['pending']['amount'], 1024*b.MIB)
-        self.assertEqual((self.s['used'], self.s['attempts']), (amount, 1))
+        with patch.object(b, 'download', side_effect=completed) as dl:
+            b.round_download(self.c, self.s, 3*1024*b.MIB, SETTINGS,
+                             b.date_now(SETTINGS), lambda *_: None)
+        self.assertEqual(dl.call_args.args[2], 384*b.MIB)
+        self.assertEqual((self.s['used'], self.s['attempts']), (384*b.MIB, 1))
 
-    def test_fallback_shares_remaining_daily_budget_without_round_cap(self):
-        saved = []
+    def test_fallback_shares_quantity_and_deadline(self):
         self.s['last']['tx'] = 1200*b.MIB
-        results = [(800*b.MIB, False, 0, '下载失败'), (700*b.MIB, True, 0, '下载成功')]
-        with patch.object(b, 'source_candidates', return_value=['wechat', 'qwen']), \
-             patch.object(b, 'download', side_effect=results) as download:
-            b.round_download(self.c, self.s, 1500*b.MIB, SETTINGS, b.date_now(SETTINGS),
-                             lambda _, state: saved.append(copy.deepcopy(state)))
-        self.assertEqual(download.call_count, 2)
-        self.assertEqual([entry['pending']['amount'] for entry in saved if entry['pending']],
-                         [1024*b.MIB, 700*b.MIB])
-        self.assertEqual((self.s['used'], self.s['attempts']), (1500*b.MIB, 2))
+        results = [(80*b.MIB, False, 0, '下载失败'), (304*b.MIB, True, 0, '下载成功')]
+        with patch.object(b, 'source_candidates', return_value=['ovh', 'hetzner']), \
+             patch.object(b, 'download', side_effect=results) as dl:
+            b.round_download(self.c, self.s, 1500*b.MIB, SETTINGS,
+                             b.date_now(SETTINGS), lambda *_: None)
+        self.assertEqual([x.args[2] for x in dl.call_args_list], [384*b.MIB,304*b.MIB])
+        self.assertEqual(dl.call_args_list[0].args[5], dl.call_args_list[1].args[5])
+        self.assertEqual((self.s['used'], self.s['attempts']), (384*b.MIB, 2))
 
     def test_reserve_partial_settle_and_coverage_barrier(self):
         with patch.object(b.time, 'time', return_value=NOW):
@@ -381,7 +383,7 @@ class AccountingTests(unittest.TestCase):
         with patch.object(b, 'Guard'), patch.object(b.tempfile, 'NamedTemporaryFile', side_effect=OSError('full /run')), \
              patch.object(b.subprocess, 'Popen') as process:
             with self.assertRaises(b.DownloadNotStarted):
-                b.download(self.c, 'wechat', b.MIB, SETTINGS, self.day, time.monotonic()+10)
+                b.download(self.c, 'ovh', b.MIB, SETTINGS, self.day, time.monotonic()+10)
         process.assert_not_called()
 
     def test_curl_exec_failure_is_known_not_started(self):
@@ -389,7 +391,7 @@ class AccountingTests(unittest.TestCase):
             with patch.object(b, 'Guard'), patch.object(b, 'HEADER_DIR', headers_dir), \
                  patch.object(b.subprocess, 'Popen', side_effect=FileNotFoundError('curl missing')):
                 with self.assertRaises(b.DownloadNotStarted):
-                    b.download(self.c, 'wechat', b.MIB, SETTINGS, self.day, time.monotonic()+10)
+                    b.download(self.c, 'ovh', b.MIB, SETTINGS, self.day, time.monotonic()+10)
             self.assertEqual(list(Path(headers_dir).iterdir()), [])
 
     def test_rate_limit_ends_round_and_persists_cooldown(self):
@@ -400,7 +402,7 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(self.s['attempts'], 1)
 
     def test_three_failures_stop_and_attempt_limit_caps_fallback(self):
-        for attempts, expected in ((0, 5), (99, 1)):
+        for attempts, expected in ((0, 3), (99, 1)):
             s = copy.deepcopy(self.s)
             s['attempts'] = attempts
             with patch.object(b, 'Guard'), patch.object(b, 'download', return_value=(0, False, 0, '下载失败')) as dl:
@@ -408,7 +410,7 @@ class AccountingTests(unittest.TestCase):
             self.assertEqual(dl.call_count, expected)
 
     def test_sources_rotate_as_a_shuffled_deck(self):
-        first = [b.source_candidates(self.s)[0] for _ in range(5)]
+        first = [b.source_candidates(self.s)[0] for _ in range(3)]
         self.assertEqual(sorted(first), sorted(b.SOURCES))
 
     def test_paused_and_stopped_daemon_never_queries_or_downloads(self):
@@ -521,7 +523,7 @@ class AccountingTests(unittest.TestCase):
         stats.assert_called_once()
         dl.assert_not_called()
         self.assertGreaterEqual(s['next_check'], int(before)+20*60)
-        self.assertLessEqual(s['next_check'], int(time.time())+60*60)
+        self.assertLessEqual(s['next_check'], int(time.time())+40*60)
 
     def test_busy_preflight_never_reserves_or_starts_download(self):
         with patch.object(b, 'preflight', side_effect=b.Error('业务繁忙')), patch.object(b, 'download') as dl:
@@ -560,14 +562,15 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual((self.s['used'], self.s['attempts']), (2*b.MIB, 1))
         self.assertIn('比例达标', self.s['reason'])
 
-    def test_round_budget_is_not_reduced_by_old_240_second_prediction(self):
+    def test_round_budget_is_quantity_capped_without_duration_prediction(self):
         c = dict(self.c, bandwidth_mbps=30)
         def completed(_c, _source, amount, *_args, **_kw):
             return amount, True, 0, '下载成功'
+        self.s['last']['tx'] = 1200*b.MIB
         with patch.object(b, 'download', side_effect=completed) as dl:
             b.round_download(c, self.s, 512*b.MIB, SETTINGS, b.date_now(SETTINGS), lambda *_: None)
-        self.assertEqual(dl.call_args.args[2], 512*b.MIB)
-        self.assertEqual(self.s['used'], 512*b.MIB)
+        self.assertEqual(dl.call_args.args[2], 384*b.MIB)
+        self.assertEqual(self.s['used'], 384*b.MIB)
         self.assertEqual(self.s['attempts'], 1)
 
     def test_speed_is_derived_from_bandwidth_share(self):
@@ -639,12 +642,12 @@ class AccountingTests(unittest.TestCase):
                 b.run('vnstat', '--json')
 
     def test_fixed_rate_decimal_mbps_conversion(self):
-        default_cmd = b.curl_command(self.c, 'wechat', 1024, 30)
+        default_cmd = b.curl_command(self.c, 'ovh', 1024, 30)
         self.assertEqual(default_cmd[default_cmd.index('--limit-rate')+1], '1000000')
-        capped = b.curl_command(dict(self.c, bandwidth_mbps=30), 'wechat', 1024, 30)
+        capped = b.curl_command(dict(self.c, bandwidth_mbps=30), 'ovh', 1024, 30)
         self.assertEqual(capped[capped.index('--limit-rate')+1], '1500000')
         self.assertEqual(self.c['min_tx_mib'], 200)
-        cmd = b.curl_command(dict(self.c, bandwidth_mbps=50, download_percent=1), 'wechat', 1024, 30)
+        cmd = b.curl_command(dict(self.c, bandwidth_mbps=50, download_percent=1), 'ovh', 1024, 30)
         self.assertEqual(cmd[cmd.index('--limit-rate')+1], '62500')
         self.assertIn('--noproxy', cmd)
         self.assertIn('0-1023', cmd)
@@ -654,7 +657,7 @@ class AccountingTests(unittest.TestCase):
 
     def test_bandwidth_share_is_configurable(self):
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=200)), 80)
-        self.assertEqual(b.effective_speed(config(bandwidth_mbps=1000)), 400)
+        self.assertEqual(b.effective_speed(config(bandwidth_mbps=1000)), 80)
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=30)), 12)
         self.assertEqual(b.effective_speed(config(bandwidth_mbps=200, download_percent=10)), 20)
         for value in (0, 101, float('nan'), True):
@@ -662,17 +665,31 @@ class AccountingTests(unittest.TestCase):
                 b.validate_config(config(download_percent=value))
 
     def test_time_limit_partial_download_is_settled_without_fallback_or_success(self):
-        with patch.object(b, 'download', return_value=(3*b.MIB, False, 0, '单轮总时长已达 300 秒')) as dl:
+        with patch.object(b, 'download', return_value=(3*b.MIB, False, 0, '本轮时长已到')) as dl:
             b.round_download(self.c, self.s, 512*b.MIB, SETTINGS, b.date_now(SETTINGS), lambda *_: None)
         dl.assert_called_once()
         self.assertEqual((self.s['used'], self.s['attempts']), (3*b.MIB, 1))
         self.assertIsNone(self.s['pending'])
         self.assertEqual(self.s['barrier']['total_rx'], self.v['total_rx']+3*b.MIB)
 
+    def test_new_round_allows_download_after_old_120_second_boundary(self):
+        clock = [1000]
+        def preflight(_c, **_):
+            clock[0] = 1150  # New 200-second round still has 50 seconds left.
+            return SimpleNamespace(received=0)
+        with patch.object(b.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(b, 'date_now', return_value=self.day), \
+             patch.object(b, 'preflight', side_effect=preflight), \
+             patch.object(b, 'download', return_value=(b.MIB, True, 0, '下载成功')) as dl:
+            b.round_download(self.c, self.s, b.MIB, SETTINGS, self.day, lambda *_: None)
+        dl.assert_called_once()
+        self.assertEqual(dl.call_args.args[5], 1200)
+        self.assertEqual((self.s['used'], self.s['attempts']), (b.MIB, 1))
+
     def test_preflight_cannot_start_new_request_after_shared_round_deadline(self):
         clock = [0]
         def preflight(_c, **_):
-            clock[0] = 301
+            clock[0] = 201
             return SimpleNamespace(received=0)
         with patch.object(b.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(b, 'preflight', side_effect=preflight), patch.object(b, 'download') as dl:
@@ -689,7 +706,7 @@ class AccountingTests(unittest.TestCase):
         with patch.object(b, 'Guard', return_value=guard), \
              patch.object(b.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(b.STOP, 'wait', side_effect=wait) as sleep:
-            with self.assertRaisesRegex(b.Error, '单轮总时长'):
+            with self.assertRaisesRegex(b.Error, '本轮时长'):
                 REAL_PREFLIGHT(self.c, deadline=300)
         sleep.assert_called_once_with(.5)
         guard.check.assert_not_called()
@@ -885,9 +902,9 @@ class UserInterfaceTests(unittest.TestCase):
             self.assertEqual(b.ask_amount('每日额度', 500, 1, 1048576), 512)
         with patch('builtins.input', side_effect=['4 MB/s', '0.5 Mbps']):
             self.assertEqual(b.ask_number('速度 Mbps', 4, .001, 10000, suffix='Mbps'), .5)
-        for text in ('20-60', '20～60', '20 60'):
+        for text in ('20-40', '20～40', '20 40'):
             with patch('builtins.input', side_effect=[text]):
-                self.assertEqual(b.ask_interval(b.DEFAULT), (20, 60))
+                self.assertEqual(b.ask_interval(b.DEFAULT), (20, 40))
         with patch('builtins.input', side_effect=['60-20', '1-10']):
             self.assertEqual(b.ask_interval(b.DEFAULT), (1, 10))
         self.assertIn('重新输入这一项', self.out.getvalue())
@@ -1013,7 +1030,7 @@ class UserInterfaceTests(unittest.TestCase):
         install.assert_not_called()
 
     def test_summary_warns_when_download_itself_can_trigger_protection(self):
-        b.config_summary(config(bandwidth_mbps=100, download_percent=90))
+        b.config_summary(config(bandwidth_mbps=70, download_percent=90))
         self.assertIn('会跳过下载', self.out.getvalue())
 
     def test_status_shows_actual_stopped_service_and_explains_ratio(self):
@@ -1137,11 +1154,13 @@ class UserInterfaceTests(unittest.TestCase):
         b.atomic_json(b.CONFIG, config())
         b.atomic_json(b.STATE, dict(b.initial_state(), mode='running'))
         with patch('builtins.input', side_effect=['2', '0']), patch.object(b, 'run', return_value='active'), \
+             patch.object(b, 'locked', lambda *args: contextlib.nullcontext()), \
              patch.object(b, 'control') as control:
             b.menu()
         control.assert_called_once_with('stopped')
         b.atomic_json(b.STATE, b.initial_state())
-        with patch('builtins.input', side_effect=['2', '0']), patch.object(b, 'control') as control:
+        with patch('builtins.input', side_effect=['2', '0']), patch.object(b, 'locked', lambda *args: contextlib.nullcontext()), \
+             patch.object(b, 'control') as control:
             b.menu()
         control.assert_called_once_with('running')
 
@@ -1362,6 +1381,12 @@ class LocalCurlTests(unittest.TestCase):
                     self.send_header('Retry-After', '3600')
                     self.end_headers()
                     return
+                if self.path == '/api':
+                    self.send_response(200)
+                    self.send_header('Content-Length', '65536')
+                    self.end_headers()
+                    self.wfile.write(b'x'*65536)
+                    return
                 self.send_response(206)
                 self.send_header('Content-Range', 'bytes 0-65535/' + ('1073741825' if self.path == '/oversized' else '65536'))
                 self.send_header('Content-Length', '65536')
@@ -1383,9 +1408,9 @@ class LocalCurlTests(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join()
 
-    def download(self, route, amount=65536, old_curl=False, guard=None, duration=10):
+    def download(self, route, amount=65536, old_curl=False, guard=None, duration=10, source='ovh'):
         b.STOP.clear()
-        cmd = b.curl_command(config(), 'wechat', amount, 10)
+        cmd = b.curl_command(config(), source, amount, 10)
         if old_curl:
             i = cmd.index('--max-filesize')
             del cmd[i:i+2]
@@ -1395,10 +1420,19 @@ class LocalCurlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as headers_dir:
             with patch.object(b, 'curl_command', return_value=cmd), patch.object(b, 'Guard', return_value=guard or SimpleNamespace(check=lambda: False)), \
                  patch.object(b, 'HEADER_DIR', headers_dir):
-                result = b.download(config(), 'wechat', amount, SETTINGS,
+                result = b.download(config(), source, amount, SETTINGS,
                                     b.date_now(SETTINGS), time.monotonic()+duration)
             self.assertEqual(list(Path(headers_dir).iterdir()), [])
             return result
+
+    def test_cloudflare_200_exact_body_is_accepted(self):
+        actual, ok, _, _ = self.download('api', source='cloudflare')
+        self.assertTrue(ok)
+        self.assertEqual(actual, 65536)
+
+    def test_cloudflare_rejects_range_206_response(self):
+        actual, ok, _, _ = self.download('ok', source='cloudflare')
+        self.assertFalse(ok)
 
     def test_success_counts_body_and_does_not_write_file(self):
         actual, ok, until, _ = self.download('ok')
@@ -1406,10 +1440,12 @@ class LocalCurlTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(until, 0)
 
-    def test_complete_small_file_succeeds_even_if_requested_budget_is_larger(self):
+    def test_shorter_range_response_is_rejected_without_faking_success(self):
         actual, ok, _, _ = self.download('ok', amount=1024*b.MIB)
-        self.assertEqual(actual, 65536)
-        self.assertTrue(ok)
+        # Rejection can stop curl before all invalid response bytes are drained.
+        self.assertGreater(actual, 0)
+        self.assertLessEqual(actual, 65536)
+        self.assertFalse(ok)
 
     def test_connection_failure_retains_partial_body(self):
         actual, ok, _, reason = self.download('partial')
@@ -1454,17 +1490,17 @@ class LocalCurlTests(unittest.TestCase):
     def test_chunked_trailers_are_metadata_not_billable_body(self):
         actual, ok, until, _ = self.download('trailers', amount=4)
         self.assertEqual(actual, 4)
-        self.assertTrue(ok)
+        self.assertFalse(ok)  # Unknown/transfer-encoded length is now refused.
         self.assertEqual(until, 0)
 
-    def test_unknown_size_body_stops_at_budget_with_old_curl_capability(self):
+    def test_unknown_size_body_is_rejected_with_old_curl_capability(self):
         # Removing max-filesize models the documented <8.4 unknown-size behavior.
         started = time.monotonic()
         actual, ok, _, reason = self.download('chunked', amount=4, old_curl=True)
         self.assertLess(time.monotonic()-started, .8)
         self.assertEqual(actual, 4)
-        self.assertTrue(ok)
-        self.assertIn('预算', reason)
+        self.assertFalse(ok)
+        self.assertIn('异常', reason)
 
     def test_bytes_already_received_beyond_budget_are_not_hidden(self):
         actual, ok, _, reason = self.download('chunked-overrun', amount=4, old_curl=True)
@@ -1478,11 +1514,10 @@ class LocalCurlTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('下载失败', reason)
 
-    def test_source_larger_than_one_gib_is_rejected_and_bytes_counted(self):
+    def test_large_remote_file_is_valid_when_requested_range_is_small(self):
         actual, ok, _, reason = self.download('oversized')
-        self.assertFalse(ok)
-        self.assertGreaterEqual(actual, 0)
-        self.assertIn('范围响应异常', reason)
+        self.assertTrue(ok)
+        self.assertEqual(actual, 65536)
 
     def test_429_honors_retry_after(self):
         actual, ok, until, reason = self.download('limited')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """独立的 Debian/Ubuntu 每日入站流量调节器。仅使用 Python 标准库。"""
 import argparse
+import hashlib
 import copy
 import contextlib
 import datetime as dt
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 
+VERSION = '1.0.2'
 MIB = 1024 ** 2
 BASE = Path('/etc/traffic-balance')
 CONFIG = BASE / 'config.json'
@@ -32,29 +34,34 @@ SCRIPT = Path('/usr/local/bin/traffic-balance')
 SHORTCUT = Path('/usr/local/bin/tb')
 UNIT = Path('/etc/systemd/system/traffic-balance.service')
 LOCK = Path('/run/traffic-balance.lock')
+UPDATE_LOCK = Path('/run/traffic-balance-management.lock')
 LOG = Path('/var/log/traffic-balance.log')
 # Only small HTTP metadata is temporary; all payload stays in a pipe. /run is
 # memory-backed on the supported systemd systems. Non-Linux path is for tests.
 HEADER_DIR = '/run' if sys.platform.startswith('linux') else tempfile.gettempdir()
 SERVICE = 'traffic-balance.service'
 SOURCE_FILES = {
-    'wechat': 'https://dldir1v6.qq.com/weixin/Universal/Windows/WeChatWin_4.2.0.exe',
-    'qwen': 'https://assets.qwenwork.cn/release/latest/qwenworkcn-setup-x64.exe',
-    'doubao': 'https://bbjhgihbvvhu.jspcdn.cn:20443/lf9-apk.ugapk.cn/package/pc/doubao_client/2034006/doubao_client_webdaoliu_ygpz_popup_guest_small_macos_v2034006_b5e0_1793603938.dmg?v=1793604091&u_disp_type=3&real_host=bGY5LWFway51Z2Fway5jbg',
-    'blender': 'https://download.blender.org/release/Blender4.5/blender-4.5.0-windows-x64.msi',
-    'gimp': 'https://mirror.freedif.org/gimp/pub/gimp/v3.0/windows/gimp-3.0.4-setup.exe',
+    'cloudflare': 'https://speed.cloudflare.com/__down?bytes={amount}',
+    'ovh': 'https://proof.ovh.net/files/1Gb.dat',
+    'hetzner': 'https://fsn1-speed.hetzner.com/1GB.bin',
 }
 SOURCES = list(SOURCE_FILES)
-MAX_SOURCE_BYTES = 1024 * MIB
+LEGACY_SOURCE_DECKS = [sorted(['wechat', 'qwen', 'doubao', 'blender', 'gimp']),
+                       sorted(['wechat', 'qwen', 'doubao', 'blender', 'gimp', 'firefox'])]
+MAX_ROUND_BYTES = 384 * MIB
+# Legacy installations may have reserved a long-running transfer. Retain its
+# conservative recovery horizon; never shorten an existing uncertainty window.
+RECOVERY_SECONDS = 900
 STOP = threading.Event()
 logger = logging.getLogger('traffic-balance')
 CPU_LIMIT = 70
 START_BANDWIDTH_PERCENT = 40
 BANDWIDTH_LIMIT_PERCENT = 80
 DOWNLOAD_CHECK_SECONDS = 3
-ROUND_SECONDS = 300
+ROUND_SECONDS = 200
+MAX_DOWNLOAD_MBPS = 80
 DEFAULT = dict(version=6, interface='', ratio=3.2,
-               daily_mib=10240, interval_min=20, interval_max=60,
+               daily_mib=10240, interval_min=20, interval_max=40,
                max_attempts=100, min_tx_mib=200,
                bandwidth_mbps=0, download_percent=40, load_per_cpu=0.8)
 
@@ -92,7 +99,7 @@ def run(*args, timeout=30, live=False):
         p = subprocess.run(args, text=True, stdout=None if live else subprocess.PIPE,
                            stderr=None if live else subprocess.PIPE, timeout=timeout, check=False,
                            env=env)
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as e:
         raise Error(f'{args[0]} 执行失败：{e}') from e
     if p.returncode:
         detail = ((p.stderr or '').strip() or (p.stdout or '').strip())[:500] or '请查看上方命令输出'
@@ -216,7 +223,7 @@ def validate_state(s):
         number(s[k], 0, 10**18, k, True)
     if (not isinstance(s['source_order'], list) or
             (s['source_order'] and (not all(isinstance(x, str) for x in s['source_order']) or
-                                    sorted(s['source_order']) != sorted(SOURCES)))):
+                                    sorted(s['source_order']) not in [sorted(SOURCES)] + LEGACY_SOURCE_DECKS))):
         raise Error('下载源轮换状态损坏；暂停补量，请检查 state.json')
     for key in ('pending', 'barrier', 'last'):
         v = s[key]
@@ -355,7 +362,7 @@ def observe(s, date, v):
 def recover(s):
     if s['pending']:
         p = s['pending']
-        s['barrier'] = dict(after=p['started'] + ROUND_SECONDS, total_rx=p['total_rx'])
+        s['barrier'] = dict(after=p['started'] + RECOVERY_SECONDS, total_rx=p['total_rx'])
         s['pending'] = None
         s['reason'] = '检测到未结算下载，预留额度已保守计入；等待统计更新'
         logger.warning(s['reason'])
@@ -382,7 +389,7 @@ def plan(c, s, v):
     gap = required_inbound(c, v['tx']) - v['rx']
     if gap <= 0:
         return 0, '入站/出站比例已达标，无需补量'
-    amount = min(gap, int(c['daily_mib'] * MIB) - s['used'])
+    amount = min(gap, int(c['daily_mib'] * MIB) - s['used'], MAX_ROUND_BYTES)
     return amount, '准备按比例缺口补量'
 
 
@@ -411,7 +418,7 @@ def counters(interface):
 
 def effective_speed(c):
     # A fixed rate for this round, never a dynamic ramp or an attempt to catch up.
-    return c['bandwidth_mbps'] * c['download_percent']/100
+    return min(MAX_DOWNLOAD_MBPS, c['bandwidth_mbps'] * c['download_percent']/100)
 
 
 def cpu_times():
@@ -500,11 +507,11 @@ def preflight(c, deadline=None):
     for _ in range(5):
         remaining = 1 if deadline is None else min(1, deadline-time.monotonic())
         if remaining <= 0:
-            raise Error('单轮总时长已达 300 秒；结束预检，不发起新的下载')
+            raise Error('本轮时长已到；结束预检，不发起新的下载')
         if STOP.wait(remaining):
             raise Error('任务已暂停或停止；尚未发起下载，不计量、不计次')
         if deadline is not None and time.monotonic() >= deadline:
-            raise Error('单轮总时长已达 300 秒；结束预检，不发起新的下载')
+            raise Error('本轮时长已到；结束预检，不发起新的下载')
         if guard.check(before_download=True):
             raise Error(guard.reason+' → 跳过本轮')
     return guard
@@ -546,13 +553,33 @@ def retry_after(headers, now):
 
 
 def curl_command(c, source, amount, seconds):
-    url = SOURCE_FILES[source]
-    return ['curl', '-q', '--silent', '--show-error', '--no-buffer', '--fail', '--noproxy', '*',
-            '--proto', '=https', '--http1.1', '--interface', c['interface'],
-            '--limit-rate', str(max(1, int(effective_speed(c) * 1000000 / 8))),
-            '--connect-timeout', '5', '--speed-limit', '1', '--speed-time', '5',
-            '--max-time', str(seconds), '--max-filesize', str(amount),
-            '--range', f'0-{amount - 1}', url]
+    url = SOURCE_FILES[source].format(amount=amount)
+    command = ['curl', '-q', '--silent', '--show-error', '--no-buffer', '--fail', '--noproxy', '*',
+               '--proto', '=https', '--http1.1', '--interface', c['interface'],
+               '--limit-rate', str(max(1, int(effective_speed(c) * 1000000 / 8))),
+               '--connect-timeout', '5', '--speed-limit', '1', '--speed-time', '5',
+               '--max-time', str(seconds), '--max-filesize', str(amount)]
+    if source != 'cloudflare':
+        command += ['--range', f'0-{amount-1}']
+    return command + [url]
+
+
+def valid_response(text, source, amount):
+    # Only inspect the final response, not a possible proxy CONNECT block.
+    blocks = re.split(r'(?=^HTTP/)', text, flags=re.M)
+    final = next((x for x in reversed(blocks) if x.startswith('HTTP/')), '')
+    code = re.match(r'HTTP/\S+\s+(\d{3})', final)
+    http = int(code[1]) if code else 0
+    lengths = re.findall(r'^Content-Length:\s*(\d+)\s*$', final, re.I | re.M)
+    if (len(lengths) != 1 or int(lengths[0]) != amount or
+            re.search(r'^Transfer-Encoding:', final, re.I | re.M)):
+        return http, False
+    if source == 'cloudflare':
+        return http, http == 200
+    ranges = re.findall(r'^Content-Range:\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$', final, re.I | re.M)
+    valid = (http == 206 and len(ranges) == 1 and
+             tuple(map(int, ranges[0][:2])) == (0, amount-1) and int(ranges[0][2]) >= amount)
+    return http, valid
 
 
 def download(c, source, amount, settings, day, deadline, guard=None):
@@ -564,6 +591,8 @@ def download(c, source, amount, settings, day, deadline, guard=None):
         raise DownloadNotStarted(f'下载尚未发起：{e}；本次不计量、不计次，请检查提示') from e
     with header_file as header:
         seconds = deadline-time.monotonic()
+        if date_now(settings) != day:
+            raise DownloadNotStarted('统计日已切换，未发起下载；退回本次预留')
         if seconds <= 0 or STOP.is_set():
             raise DownloadNotStarted('单轮时间已到或任务已暂停/停止；尚未发起下载，本次预留与计次退回')
         cmd = curl_command(c, source, amount, seconds)
@@ -575,7 +604,6 @@ def download(c, source, amount, settings, day, deadline, guard=None):
         except OSError as e:
             raise DownloadNotStarted(f'无法启动 curl：{e}；本次不计量、不计次，请检查安装和权限') from e
         actual, errors, reason = 0, bytearray(), ''
-        expected_actual = amount
         headers_checked = False
         tick = time.monotonic() + DOWNLOAD_CHECK_SECONDS
         kill_at = None
@@ -593,15 +621,9 @@ def download(c, source, amount, settings, day, deadline, guard=None):
                             if not headers_checked:
                                 headers_checked = True
                                 raw_headers = os.pread(header.fileno(), 65537, 0).decode('iso-8859-1')
-                                ranges = re.findall(r'^Content-Range:\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$', raw_headers, re.I | re.M)
-                                codes_so_far = re.findall(r'^HTTP/\S+\s+(\d{3})', raw_headers, re.M)
-                                if ranges:
-                                    start, end, total = map(int, ranges[-1])
-                                    expected_actual = min(amount, total)
-                                if (not codes_so_far or codes_so_far[-1] != '206' or not ranges or
-                                        start != 0 or total <= 0 or total > MAX_SOURCE_BYTES or
-                                        end+1 != expected_actual):
-                                    reason = '下载失败：来源文件大小或范围响应异常，已终止并记录实际消耗'
+                                _, valid = valid_response(raw_headers, source, amount)
+                                if not valid:
+                                    reason = '下载失败：来源长度或范围响应异常，已终止并记录实际消耗'
                             actual += len(chunk)
                         else:
                             if len(errors) + len(chunk) > 65536:
@@ -618,7 +640,7 @@ def download(c, source, amount, settings, day, deadline, guard=None):
                         if STOP.is_set():
                             reason = '任务收到暂停或停止信号'
                         elif now >= deadline:
-                            reason = '单轮总时长已达 300 秒'
+                            reason = f'单轮总时长已达 {ROUND_SECONDS} 秒'
                         elif date_now(settings) != day:
                             reason = '统计日已切换，终止本轮，不跨午夜追量'
                         elif actual == amount and proc.poll() is None:
@@ -662,7 +684,8 @@ def download(c, source, amount, settings, day, deadline, guard=None):
         reason, budget_stop = '服务限流；已结束本轮并保存等待时间，不切源绕过', False
     # A deliberate stop after receiving exactly our payload budget is complete;
     # an interrupted/failed transfer or an overrun is never reported as success.
-    ok = (http == 206 and headers_checked and actual == expected_actual and
+    _, response_valid = valid_response(text, source, amount)
+    ok = (response_valid and headers_checked and actual == amount and
           ((code == 0 and not reason) or (budget_stop and code in (0, -signal.SIGTERM))))
     reason = ('已完成本轮补量预算' if budget_stop and ok else reason) or (
         '下载成功' if ok else f'下载失败 curl={code} HTTP={http} {bytes(errors[:300]).decode("utf-8", errors="replace").strip()}，已记录实际消耗，下次检查再试')
@@ -671,7 +694,8 @@ def download(c, source, amount, settings, day, deadline, guard=None):
 
 
 def source_candidates(s):
-    if not s['source_order'] or s['source_index'] >= len(SOURCES):
+    # Refresh the known previous source deck without changing quota accounting.
+    if len(s['source_order']) != len(SOURCES) or s['source_index'] >= len(SOURCES):
         s['source_order'] = random.sample(SOURCES, len(SOURCES))
         s['source_index'] = 0
     order = s['source_order']
@@ -682,64 +706,52 @@ def source_candidates(s):
 
 def round_download(c, s, amount, settings, day, save=atomic_json):
     deadline = time.monotonic() + ROUND_SECONDS
-    remaining = amount
-    observed_rx = s['last']['rx']
-    observed_tx = s['last']['tx']
+    remaining = min(amount, MAX_ROUND_BYTES, int(c['daily_mib']*MIB)-s['used'])
+    observed_rx, observed_tx = s['last']['rx'], s['last']['tx']
     for source in source_candidates(s):
-        if STOP.is_set() or remaining <= 0 or s['attempts'] >= c['max_attempts'] or time.monotonic() >= deadline:
-            break
-        if date_now(settings, time.time() + 315) != day:
-            s['reason'] = '临近统计日边界，不发起可能跨日的下载，等待下一轮'
-            break
-        # 前置保护检查失败不计次；预留后仅确定未启动时退款，不确定消耗保留预留。
-        guard = preflight(c, deadline=deadline)
-        observed_rx += guard.received
-        if target_reached(c, observed_rx, observed_tx):
-            s['reason'] = '预检入站使保守比例达标；不再补下载'
-            break
-        # Only reduce the original plan. Extra outgoing business traffic must
-        # never increase a round or bypass its already checked outbound floor.
-        remaining -= guard.received
-        if remaining <= 0:
-            s['reason'] = '预检入站已覆盖本轮补量；本轮不再下载'
-            break
-        if STOP.is_set():
-            s['reason'] = '预检后任务收到暂停或停止信号；尚未发起下载'
+        if STOP.is_set() or remaining <= 0 or s['attempts'] >= c['max_attempts']:
             break
         if time.monotonic() >= deadline:
-            s['reason'] = '单轮总时长已达 300 秒；尚未发起新的下载'
+            s['reason'] = f'单轮总时长已达 {ROUND_SECONDS} 秒'
             break
-        if date_now(settings, time.time() + 315) != day:
-            s['reason'] = '临近统计日边界，不发起可能跨日的下载，等待下一轮'
+        if date_now(settings, time.time()+ROUND_SECONDS+15) != day:
+            s['reason'] = '临近统计日边界，等待下一轮'
             break
-        # No independent per-round quantity cap: one file is at most 1 GiB.
-        # The reservation may exceed a smaller file and is settled to actual bytes.
-        request_amount = min(remaining, MAX_SOURCE_BYTES)
-        reserve(s, request_amount, s['last'])
+        guard = preflight(c, deadline=deadline)
+        observed_rx += guard.received
+        remaining -= guard.received
+        if remaining <= 0 or target_reached(c, observed_rx, observed_tx):
+            s['reason'] = '预检入站已覆盖本轮预算或比例达标'
+            break
+        if STOP.is_set() or time.monotonic() >= deadline:
+            s['reason'] = '预检后取消或本轮时长已到；未发起新下载'
+            break
+        if date_now(settings, time.time()+ROUND_SECONDS+15) != day:
+            s['reason'] = '临近统计日边界，等待下一轮'
+            break
+        reserve(s, remaining, s['last'])
         save(STATE, s)
         try:
-            actual, ok, until, reason = download(c, source, request_amount, settings, day, deadline, guard=guard)
+            actual, ok, until, reason = download(c, source, remaining, settings, day, deadline, guard=guard)
         except DownloadNotStarted as e:
-            # Only a positively known pre-process failure can refund a reservation.
-            # A crash or any uncertain post-start failure keeps it conservatively.
             s['used'] -= s['pending']['amount']
             s['attempts'] -= 1
             s['pending'] = None
             s['reason'] = str(e)
             save(STATE, s)
-            logger.warning(s['reason'])
             break
         settle(s, actual)
         s['cooldown'] = max(s['cooldown'], until)
         s['reason'] = reason
         observed_rx += actual
-        reached = target_reached(c, observed_rx, observed_tx)
-        if reached and not ok:
-            s['reason'] += '；已收到流量使保守比例达标，不再切换备用源'
-        save(STATE, s)
         remaining -= actual
-        if reached or ok or until or '失败' not in reason:
+        save(STATE, s)
+        if ok or until or remaining <= 0 or '失败' not in reason:
             break
+        if target_reached(c, observed_rx, observed_tx):
+            s['reason'] += '；比例达标，不再切源'
+            break
+    save(STATE, s)
 
 
 def schedule(c, s, reason=None):
@@ -856,6 +868,177 @@ def install():
             atomic_json(STATE, initial_state())
         validate_state(load_json(STATE))
     run('systemctl', 'daemon-reload')
+
+
+def check_update():
+    # Validate without changing an active daemon or its accounting.
+    validate_config(load_json(CONFIG))
+    validate_state(load_json(STATE))
+    if not SCRIPT.is_file() or SCRIPT.is_symlink() or not UNIT.is_file() or UNIT.is_symlink():
+        raise Error('安装文件缺失或异常；未更新，请检查安装')
+
+
+def wait_updated_service():
+    deadline = time.monotonic()+45
+    while time.monotonic() < deadline:
+        if run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() != 'active':
+            raise Error('更新后的后台任务未保持运行')
+        state = validate_state(load_json(STATE))
+        if state['mode'] == 'running' and state['next_check'] > 0:
+            return
+        time.sleep(.2)
+    raise Error('更新后的后台任务未在 45 秒内完成启动检查')
+
+
+def run_update_candidate(candidate):
+    # subprocess.run kills its child on KeyboardInterrupt, possibly during
+    # rollback. Forward signals instead and wait for the transaction to finish.
+    proc = subprocess.Popen([sys.executable, str(candidate), '--apply-update'], start_new_session=True)
+    old = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    def forward(signum, frame):
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+    try:
+        for sig in old:
+            signal.signal(sig, forward)
+        code = proc.wait()
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if code:
+        raise Error(f'更新未完成（退出码 {code}）；请查看上方错误，配置与额度未清零')
+
+
+@contextlib.contextmanager
+def update_signals():
+    def interrupted(signum, frame):
+        raise Error('更新被中断')
+    old = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in old:
+            signal.signal(sig, interrupted)
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
+def apply_update():
+    """Called by the verified new payload. Never restore an old accounting snapshot."""
+    with locked(UPDATE_LOCK), update_signals():
+        check_update()
+        payload = Path(__file__).read_text()
+        compile(payload, str(SCRIPT), 'exec')
+        old_script, old_unit = SCRIPT.read_text(), UNIT.read_text()
+        old_config = CONFIG.read_text()
+        was_active = run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() == 'active'
+        resume = False
+        try:
+            run('systemctl', 'stop', SERVICE)
+            if run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() not in ('inactive', 'failed'):
+                raise Error('无法确认下载服务已停止；未替换程序，请检查服务')
+            with locked():
+                check_update()
+                state = validate_state(load_json(STATE))
+                recover(state)
+                resume = state['mode'] == 'running' and was_active
+                if state['mode'] == 'running' and not was_active:
+                    state['mode'] = 'stopped'
+                updated_config = validate_config(load_json(CONFIG))
+                updated_config.update(interval_min=20, interval_max=40)
+                atomic_json(CONFIG, updated_config)
+                if state['source_order'] and sorted(state['source_order']) != sorted(SOURCES):
+                    state['source_order'], state['source_index'] = [], 0
+                state['next_check'] = 0
+                state['reason'] = '在线更新完成，等待启动检查' if resume else '在线更新完成，保持暂停或停止'
+                atomic_json(STATE, state)
+                atomic_write(SCRIPT, payload, 0o755)
+                atomic_write(UNIT, service_content(), 0o644)
+            run('systemctl', 'daemon-reload')
+            if resume:
+                run('systemctl', 'start', SERVICE)
+                wait_updated_service()
+            elif state['mode'] == 'stopped':
+                run('systemctl', 'disable', SERVICE)
+        except (Error, OSError, KeyboardInterrupt) as e:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, signal.SIG_IGN)
+            # Stop even a partially started new version before restoring its code.
+            try:
+                run('systemctl', 'stop', SERVICE)
+                if run('systemctl', 'show', SERVICE, '-p', 'ActiveState', '--value').strip() not in ('inactive', 'failed'):
+                    raise Error('无法确认服务停止，拒绝回退写入')
+                with locked():
+                    atomic_write(SCRIPT, old_script, 0o755)
+                    atomic_write(UNIT, old_unit, 0o644)
+                    atomic_write(CONFIG, old_config, 0o600)
+                    stopped = validate_state(load_json(STATE))
+                    recover(stopped)
+                    # Empty decks are accepted by both versions. Never restore
+                    # an older ledger snapshot after a newly started process.
+                    stopped['source_order'], stopped['source_index'] = [], 0
+                    stopped.update(mode='stopped', next_check=0, reason='更新失败，已停止；请检查后手动启动')
+                    atomic_json(STATE, stopped)
+                run('systemctl', 'disable', SERVICE)
+                run('systemctl', 'daemon-reload')
+            except (Error, OSError) as rollback:
+                raise Error(f'更新失败：{e}；回退也失败：{rollback}；请保持停止并修复') from rollback
+            # Preserve stopped state after failure: no unattended retry loop.
+            raise Error(f'更新失败：{e}；已恢复旧程序，服务保持停止，配置与额度保留，请检查后手动启动') from e
+    print(f'已更新至 {VERSION}；'+('任务已恢复，先随机等待。' if resume else '任务保持暂停或停止。'))
+
+
+def online_update():
+    # Discover version + digest only from official HTTPS endpoints; never execute
+    # a downloaded shell launcher. Mirrors may serve only the pinned payload.
+    manifest_urls = [
+        'https://raw.githubusercontent.com/white-u/vps_script/main/tb.sh',
+        'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=main',
+    ]
+    with tempfile.TemporaryDirectory(prefix='tb-update-') as tmp:
+        root = Path(tmp)
+        def fetch(url, path):
+            run('curl', '-q', '--fail', '--silent', '--show-error', '--location',
+                '--proto', '=https', '--proto-redir', '=https', '--connect-timeout', '5',
+                '--max-time', '20', '--max-filesize', '1048576',
+                '--header', 'Accept: application/vnd.github.raw+json',
+                '--output', str(path), url, timeout=25)
+        manifest = root/'tb.sh'
+        ref = digest = None
+        for url in manifest_urls:
+            try:
+                fetch(url, manifest)
+                content = manifest.read_text()
+                refs = re.findall(r"^SOURCE_REF='([A-Za-z0-9._-]+)'$", content, re.M)
+                hashes = re.findall(r"^SOURCE_SHA256='([0-9a-f]{64})'$", content, re.M)
+                if len(refs) != 1 or len(hashes) != 1:
+                    raise Error('更新入口格式异常')
+                ref, digest = refs[0], hashes[0]
+                break
+            except (Error, OSError, UnicodeError) as e:
+                print(f'更新通道不可用：{e}')
+        if not ref:
+            raise Error('无法取得官方更新信息；原任务未停止，请稍后重试')
+        urls = [f'https://raw.githubusercontent.com/white-u/vps_script/{ref}/traffic_balance.py',
+                f'https://api.github.com/repos/white-u/vps_script/contents/traffic_balance.py?ref={ref}',
+                f'https://cdn.jsdelivr.net/gh/white-u/vps_script@{ref}/traffic_balance.py']
+        candidate = root/'traffic_balance.py'
+        for url in urls:
+            try:
+                fetch(url, candidate)
+                payload = candidate.read_bytes()
+                if hashlib.sha256(payload).hexdigest() != digest:
+                    raise Error('更新文件摘要不匹配')
+                compile(payload, str(candidate), 'exec')
+                break
+            except (Error, OSError, SyntaxError) as e:
+                print(f'更新通道校验未通过：{e}')
+        else:
+            raise Error('更新下载或校验失败；原任务未停止')
+        # Compatibility is checked by the new version before stopping anything.
+        run(sys.executable, str(candidate), '--check-update', timeout=30)
+        print('校验通过，正在停止下载并更新；配置和当天额度保留。', flush=True)
+        run_update_candidate(candidate)
 
 
 def owns_shortcut():
@@ -1012,8 +1195,8 @@ def config_summary(c, start_after=False):
     print('\n当前配置：')
     print(f"目标比例：入站:出站 {c['ratio']:g}:1")
     print(f"服务器带宽：{c['bandwidth_mbps']:g} Mbps")
-    print(f"补下载占比：{c['download_percent']:g}%（限速 {effective_speed(c):g} Mbps）")
-    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；单次文件不超过 1 GiB")
+    print(f"补下载占比：{c['download_percent']:g}%（限速 {effective_speed(c):g} Mbps，最高 80 Mbps）")
+    print(f"每日上限：{format_amount(c['daily_mib']*MIB)}；每轮最多 {MAX_ROUND_BYTES//MIB} MiB / {ROUND_SECONDS} 秒")
     print(f"检查间隔：{c['interval_min']}～{c['interval_max']} 分钟")
     if effective_speed(c) > c['bandwidth_mbps']*BANDWIDTH_LIMIT_PERCENT/100:
         print('提示：下载速度超过 80% 带宽保护线，本设置会跳过下载；请调低补下载占比。')
@@ -1229,7 +1412,7 @@ def diagnostics(include_logs=True):
         c = validate_config(load_json(CONFIG))
         print(f"网卡 {c['interface']}；目标入站:出站 {c['ratio']:g}:1；实际限速 {effective_speed(c):g} Mbps")
         print(f"固定保护：CPU {CPU_LIMIT}%，启动占用低于 {START_BANDWIDTH_PERCENT}%，带宽 {BANDWIDTH_LIMIT_PERCENT}%；每核负载 {c['load_per_cpu']:g}")
-        print('预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，单轮最多 5 分钟。')
+        print(f'预检 5 秒、每秒检查；下载中每 3 秒检查；连接/无进展各 5 秒，每轮最多 {MAX_ROUND_BYTES//MIB} MiB、{ROUND_SECONDS} 秒；按缺口下载后直接丢弃。')
     except Error as e:
         print(f'配置无法读取：{e}')
     try:
@@ -1349,7 +1532,7 @@ def uninstall():
 
 
 def menu():
-    print('每日流量调节')
+    print(f'每日流量调节 {VERSION}')
     while True:
         try:
             mode = None
@@ -1366,14 +1549,17 @@ def menu():
                     label = '记录需要检查'
                     print(f'任务记录异常：{e}；请选择 2 停止或 3 查看检查。')
             action = '停止' if mode == 'running' or label == '记录需要检查' else '启动'
-            choice = ask(f'\n状态：{label}\n1 配置  2 {action}  3 日志  0 退出\n选择')
+            choice = ask(f'\n状态：{label}\n1 配置  2 {action}  3 日志  4 更新  0 退出\n选择')
             if choice == '1':
-                configure()
+                with locked(UPDATE_LOCK):
+                    configure()
             elif choice == '2':
                 if mode == 'running' or label == '记录需要检查':
-                    control('stopped')
+                    with locked(UPDATE_LOCK):
+                        control('stopped')
                 else:
-                    start_task()
+                    with locked(UPDATE_LOCK):
+                        start_task()
             elif choice == '3':
                 recent_logs(10)
                 detail = ask('1 详细检查  0 返回')
@@ -1382,11 +1568,14 @@ def menu():
                     ask('回车返回')
                 elif detail not in ('', '0'):
                     print('无效选项，已返回菜单。')
+            elif choice == '4':
+                online_update()
+                return  # Do not keep an old menu in memory after replacement.
             elif choice in ('0', '7'):
                 print('已退出菜单，后台任务保持原状态。')
                 return
             else:
-                print('无效选项，请输入 0～3；未修改任务。')
+                print('无效选项，请输入 0～4；未修改任务。')
         except Cancelled:
             print('已取消当前操作，尚未保存设置；原任务保持不变。')
         except (Error, ValueError, OSError) as e:
@@ -1398,11 +1587,21 @@ def main():
     parser.add_argument('--daemon', action='store_true', help='systemd 后台入口，不安装依赖')
     parser.add_argument('--status', action='store_true', help='显示中文状态概况和最近记录')
     parser.add_argument('--diagnose', action='store_true', help='显示服务诊断和详细日志')
+    parser.add_argument('--version', action='version', version=VERSION)
+    parser.add_argument('--update', action='store_true', help='在线更新，保留配置和额度')
+    parser.add_argument('--check-update', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--apply-update', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         platform_check()
         os.umask(0o077)
-        if args.daemon:
+        if args.check_update:
+            check_update()
+        elif args.apply_update:
+            apply_update()
+        elif args.update:
+            online_update()
+        elif args.daemon:
             handler = RotatingFileHandler(LOG, maxBytes=MIB, backupCount=2)
             handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
             logger.addHandler(handler)
