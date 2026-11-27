@@ -1,177 +1,60 @@
-# VPS Toolbox (vps_script)
+# VPS Toolbox
 
-一个轻量、模块化的 Linux VPS 管理脚本集。专注于代理服务管理、流量监控与端口转发。
+面向 Linux VPS 的管理脚本集，涵盖代理服务、端口转发、流量配额、系统初始化和网络检测。
 
-核心理念：**最小依赖、配置安全、功能单一**。拒绝臃肿的面板，回归 Shell 的简洁。
+## 快速开始
 
-文档导航：**[完整索引](INDEX.md)** · [项目与代码导览](PROJECT.md) · [开发与验证](DEVELOPMENT.md)。
-
----
-
-## 🚀 快速开始
-
-推荐使用 **VPS Toolbox (`vt`)** 总控脚本，它可以自动下载并管理 Snell、sing-box、PM 与 FW 组件。
+在 VPS 上以 root 打开 Bash。Debian/Ubuntu 如缺少 `curl`，先运行 `apt-get update && apt-get install -y curl ca-certificates`。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/vt.sh)
 ```
 
-运行后，输入 `vt` 即可唤出主菜单。
+运行 `vt`，按需选择 Snell、sing-box、PM 或 FW。首次进入组件会安装缺少的核心或依赖。
 
-每日流量调节器独立安装，使用 root 执行：
+## 功能与文档
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/tb.sh)
-```
+| 功能 | 入口 | 说明 |
+| --- | --- | --- |
+| 工具箱 | [vt.sh](vt.sh) · `vt` | 安装和启动组件、查看运行状态、统一卸载。 |
+| Snell | [snell.sh](snell.sh) · `snell` | 基于 systemd 管理多个 Snell 实例。[使用手册](SNELL_DOC.md) |
+| sing-box | [sb.sh](sb.sh) · `sb` | 管理 Reality 和 Shadowsocks-2022 节点，支持核心更新和回滚。[使用手册](SB_DOC.md) |
+| 端口流量管理 | [pm.sh](pm.sh) · `pm` | 端口流量统计、共享配额、封禁、突发限速、IP 告警和用户到期提醒。[使用手册](PM_DOC.md) |
+| TCP/UDP 转发 | [fw.sh](fw.sh) · `fw` | 使用 Realm 管理转发规则，提供连通性检测。[使用手册](FW_DOC.md) |
+| Xray | [x-sb.sh](x-sb.sh) · `x-sb` | 管理 Reality、Shadowsocks-2022 和链式代理。[使用手册](X-SB_DOC.md) |
+| 每日流量调节 | [tb.sh](tb.sh) · `tb` | 根据 vnStat 当天统计按比例限额补充入站下载。[安装与配置](TRAFFIC_BALANCE_DOC.md) |
+| 系统初始化 | [init.sh](init.sh) | 安装基础工具，配置校时、时区、地址优先级、BBR 和 SSH。[系统初始化](#系统初始化) |
+| 网络检测 | [network_audit.sh](network_audit.sh) | 测量延迟、丢包和双向吞吐，分析去程并生成回程检测命令。[网络检测](#网络检测) |
+| 云端中控 | [worker.js](worker.js) | 接收多台 VPS 的 PM 上报，通过 Telegram Bot 按授权查询。[Cloudflare 部署指南](部署教程.md) |
 
-如果无法连接 GitHub Raw，可用备用入口：
+Snell、sing-box、PM 和 FW 也可直接安装和运行。Xray、每日流量调节、系统初始化、网络检测及云端中控各有独立入口。
 
-```bash
-bash <(curl -fsSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/white-u/vps_script/contents/tb.sh?ref=traffic-balance-v1.0.2-20261110')
-```
+## 系统初始化
 
-选 **1 配置**，填写服务器带宽并确认启动。保存配置后使用短命令 **`tb`** 调起菜单，也保留 `traffic-balance`。不接入 `vt`；安装、参数及验证边界见 [流量调节手册](TRAFFIC_BALANCE_DOC.md)。精简系统缺少 curl 时先运行 `apt-get update && apt-get install -y curl ca-certificates`。
-
-首次选择 Snell、sing-box 或 FW 时，会下载缺少的管理脚本，并在进入模块菜单前自动安装缺少的核心，无需再次选择安装；已有核心时直接进入菜单，不自动更新。核心安装失败会停止本次进入并显示错误，可再次选择模块重试。PM 没有独立核心，启动时自动安装依赖并初始化。直接运行 `snell`、`sb`、`fw` 也采用相同的首次安装流程。
-
-首版基线：`vt v1.0.0`；配套 Snell `v1.0.0`、sing-box 管理脚本 `v1.0.0`、PM `v1.0.0`、FW `v1.0.0`。自有管理脚本与 Worker 统一从 `v1.0.0` 起算，辅助脚本 `init.sh`、`network_audit.sh` 也使用该版本标识；第三方核心版本沿用各组件的版本策略。
-
-云端配套为 Worker `v1.0.0`；独立 Xray 管理脚本为 `x-sb v1.0.0`，不在 `vt` 的调度与统一卸载范围内。
-
-本次重新编号按卸载重装部署，不提供旧版管理脚本到 `v1.0.0` 的直接更新过渡。卸载会删除对应组件的配置和数据，请先备份仍需保留的节点、密钥及流量记录，再安装并重新配置。现有防降级校验继续保留，手动更新用于此后的版本迭代。
-
-PM 新安装直接生成当前完整配置，不再执行历史配置或端口状态迁移；内部格式编号保留配置 `6`、状态 `2`，当前格式的数据继续使用。旧格式会保留原文件并报错，处理方式见 [首版数据格式](PM_DOC.md#43-首版数据格式)。手动更新、校验、回滚和运行恢复继续保留。
-
-此次历史迁移清理针对 PM 数据格式。SB 仍有旧跨机出口配置清理与安全路由补全，Snell 保留缺少版本元数据时的稳定核心识别和权限保护，Xray 保留核心输出格式兼容；各模块说明以对应文档和实现为准。
-
-正式发行以 Git 标签记录对应提交；上方安装命令、`vt` 组件下载与手动更新仍跟随 `main`，不会自动锁定在首版。需要固定首版源码时，应保存对应发行标签下的整套文件；核心版本仍按各组件的版本策略选择。
-
-管理脚本首次安装、更新及核心下载统一使用条形进度，sing-box 的备用下载地址也采用相同显示；校验、解压和服务配置阶段显示文字提示。下载或校验失败不会覆盖已有脚本。组件启动或统一卸载失败时，错误结果会保留到按回车返回；输入结束后工具箱正常退出。
-
-管理菜单会提示无效选项，交互输入结束时正常退出。版本号或运行时间读取失败显示 `?`；Snell 状态只显示版本行，不显示版本文件中的校验值。PM 无法查询或解析封禁集合时显示“封禁状态未知”并记录错误。
-
----
-
-## 🛠️ 组件列表
-
-所有脚本均可单独使用，互不依赖。
-
-| 脚本 | 功能 | 快捷命令 | 说明 |
-| :--- | :--- | :--- | :--- |
-| **[vt.sh](vt.sh)** | **总控工具箱** | `vt` | 统一管理入口，查看组件状态，一键清理环境。 |
-| **[traffic_balance.py](TRAFFIC_BALANCE_DOC.md)** | **每日流量调节** | `tb` / `traffic-balance` | 通过 [tb.sh](tb.sh) 下载进入；独立脚本，按 vnStat 当天比例限额补下载，Debian/Ubuntu + systemd，不由 `vt` 管理。 |
-| **[pm.sh](PM_DOC.md)** | **流量监控** | `pm` | 端口级流量统计、配额封禁、**固定突发限速**、分级 IP 接入告警、用户到期提醒、Telegram 通知。 |
-| **[snell.sh](SNELL_DOC.md)** | **Snell 管理** | `snell` | 专为 Snell 协议设计，支持 **Systemd 模板化多实例**。 |
-| **[x-sb.sh](X-SB_DOC.md)** | **Xray 管理** | `x-sb` | 独立脚本，不再由 `vt` 调度或统一卸载。 |
-| **[sb.sh](SB_DOC.md)** | **Sing-Box 管理** | `sb` | 支持 Reality、SS2022 节点及核心更新回滚。 |
-| **[fw.sh](FW_DOC.md)** | **端口转发** | `fw` | 基于 **Realm** 的轻量端口转发，支持 TCP/UDP，不自动修改防火墙。 |
-| **[init.sh](init.sh)** | **系统初始化** | — | Debian/Ubuntu 系统更新、网络自动校时、主机名、常用工具、BBR 和 SSH 配置。 |
-
-`init.sh` 需要 root、Bash 4+ 和 systemd。当前整流程及重启实机验收基于 Debian 13；此前也在 Debian 12 验证了 SSH 登录、回滚等关键路径。Ubuntu 尚未完成整流程实机验收，SSH socket 激活模式暂不支持修改端口。
-
-首次运行 `init.sh` 时，请以 root 身份执行以下命令。先安装 `curl` 和 HTTPS 证书，避免精简系统在下载脚本时提示 `curl: command not found`；脚本内部第一步也会安装 `curl`，但无法处理脚本尚未下载的情况。
+在使用 systemd 的 Debian/Ubuntu VPS 上，以 root 在 Bash 4+ 中运行。精简系统如缺少 `curl`，先按[快速开始](#快速开始)安装。
 
 ```bash
-apt update && apt install -y curl ca-certificates && (
-    init_script=$(mktemp) || exit 1
-    trap 'rm -f "$init_script"' EXIT
-    curl -q -fsSL --proto '=https' --proto-redir '=https' \
-        -o "$init_script" https://raw.githubusercontent.com/white-u/vps_script/main/init.sh &&
-        test -s "$init_script" && bash -n "$init_script" && bash "$init_script"
-)
+bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/init.sh)
 ```
 
-`init.sh` 优先复用已有的 chrony/NTP 校时服务；未检测到时安装 `systemd-timesyncd`，启用服务并设为开机启动。最多等待 30 秒检查同步结果，尚未同步会显示警告及排查方法。脚本第一步的系统更新仍要求 APT 源可用；失败时先修复软件源再继续初始化。
+- 优先复用现有 chrony/NTP 服务，缺少时安装 `systemd-timesyncd`。时区按出口公网 IP 推断，查询失败则保留原时区。
+- 地址优先级可选 IPv4 或 IPv6，默认 IPv4。脚本仅调整 glibc 地址排序，修改前备份 `/etc/gai.conf`。
+- BBR 设置写入 `/etc/sysctl.d/99-vps-init-bbr.conf`，脚本会检查内核实际运行参数。
+- SSH 可修改端口、导入 root 公钥并选择禁用密码。禁用密码需要有效公钥，SSH socket 激活模式暂不支持修改端口。脚本检查 SSH 生效配置及监听状态，备份位于 `/etc/ssh/init-backup.*`。修改后请先保留当前会话，再从另一终端确认新连接。
 
-网络与时间配置前会安装 `curl`、HTTPS 证书、`tzdata` 和 Python 3。时区根据服务器出口公网 IP 推断：先查询 `ipwho.is`，失败或返回无效时区时查询 `ipinfo.io`，每个来源最多等待 10 秒；返回值必须是系统支持的时区。显示当前时区及推断结果后自动应用，不再要求手动输入。两个来源均失败时保留原时区并显示原因。IP 定位可能不准确，查询服务会收到服务器的出口公网 IP；时区与 NTP 校时分别设置。
+## 网络检测
 
-基础依赖与常用工具集中在第一步安装一次；初始化不再自动运行 `apt autoremove` 或 `apt clean`，避免卸载已有依赖或清空软件包缓存。后续按需安装校时服务及 NextTrace。
-
-基础工具安装时，首次安装或重新安装 `iperf3` 默认不启动后台服务、不设置开机启动，也不弹出相关安装提问；已经安装的 `iperf3` 保留管理员原有服务设置。
-
-网络地址优先级输入 `1` 选择 IPv4、`2` 选择 IPv6，回车默认 IPv4；兼容原输入 `4`、`6` 和 `keep`（保留）。通过 `/etc/gai.conf` 的完整 `precedence` 表设置优先级，替换原有启用的 `precedence` 行，保留其他配置；修改前备份到 `/etc/gai.conf.bak.*`。设置影响采用 glibc 地址排序的新进程，不禁用另一协议、不增加 IPv6 连通性；已有进程可能需要重启，应用自己的解析或连接策略可能忽略这一排序。参见 [gai.conf 说明](https://man7.org/linux/man-pages/man5/gai.conf.5.html)。
-
-NextTrace 安装强制使用 HTTPS，完整下载并通过语法检查后才执行。`network_audit.sh` 同样通过 HTTPS 获取公网 IP，校验自动获取和手动输入的 IPv4/IPv6 后再生成回程命令；回程命令也会先下载、检查安装脚本，下载失败不会继续执行。
-
-BBR 开启状态以实际内核运行参数及应用后复查为准，不按配置文件中的文字判断；持久化写入 `/etc/sysctl.d/99-vps-init-bbr.conf`，兼容 Debian 13 不自动读取 `/etc/sysctl.conf` 的开机加载流程，写入失败会报错。原有 `/etc/sysctl.conf` 保留。网络检测的单包预检按平台使用约 3 秒超时；大包测量失败时显示无法评估 QoS，不使用小包延迟代替。正常的延迟比例也不代表已经排除丢包或 QoS。
-
-SSH 配置保留允许 root 登录。收集完端口与认证选择后一次原子写入，兼容空白和等号写法（如 `Port=22`、`Match=User root`），全局设置优先于前置 Include。重载前确认最终端口列表只有所选端口，并验证全局及当前 root 连接条件下的 root 登录和公钥认证；选择禁用密码时还会验证密码及交互式认证均已禁用。已有 Match 规则会保留，与当前所选设置冲突或 Include 带入其他监听端口时回滚并停止，不会误报加固成功；其他来源地址、用户等条件下的 Match 策略不在当前连接验证范围内。
-
-公钥导入支持普通 OpenSSH 格式的 Ed25519、RSA、ECDSA 及安全密钥，拒绝无效、多行或私钥输入；写入前验证，原子替换并检查失败，不破坏已有文件末尾缺少换行的密钥。SSH 配置及原公钥备份到 `/etc/ssh/init-backup.*`。写入失败、输入结束、INT/TERM/HUP 信号、重载失败或新端口监听检查失败都会尝试恢复原配置和公钥；已重载时还会重载恢复的配置。恢复失败会明确给出备份位置。SIGKILL、断电等无法捕获的中断仍需通过备份手动恢复。
-
-禁用密码前必须检测到有效公钥，并由用户选择禁用密码；不再要求另一终端登录确认。重载后确认端口由 sshd 监听，通过后完成配置。校验会检查当前 root 客户端对应的用户/组访问规则、认证组合、公钥文件路径、算法和基本权限。带限制选项的旧密钥不作为已确认可用的普通密钥；ForceCommand、ChrootDirectory 或无法可靠判断的规则会停止修改，保留管理员策略。SSH socket 激活模式暂不支持改端口，会明确停止。自动校验不代表已验证外部登录，也无法验证云安全组或未由 UFW/firewalld 管理的防火墙规则；建议保留当前会话，完成后自行验证新连接。
-
-完成摘要按当前 root 连接条件下的实际配置分别显示公钥、密码和交互式认证是否启用；选择保留原设置不会被直接显示为已启用密码登录。
-
-Xray 配置先通过语法和核心检查，再备份并原子替换；重启命令失败或服务未运行时回滚并返回失败。恢复配置或重新启动失败时保留备份路径供排查，进阶配置失败提示会等待确认后再返回菜单。
-
-启用 `UseDNS yes` 时，额外通过系统解析器获取客户端域名，确认正反向解析一致，再检查域名匹配的 Match 配置，同时保留 IP 匹配检查。该验证需要 Python 3、GNU `timeout` 和当前连接的 `SSH_CONNECTION`；解析子进程由外部计时，超过 10 秒会被强制终止并回收，随后回滚并停止，底层 NSS 调用阻塞也不能继续拖住验证。缺少依赖或解析无法验证时同样停止。`UseDNS no` 不进行此 DNS 查询，脚本不会更改原有 UseDNS 策略；Python 3 仍用于时区查询解析及 SSH 登录条件检查。
-
-## 统一卸载保护
-
-`vt` 的“全部卸载”需要输入 `yes` 确认。某个组件清理失败时，其他组件继续清理，工具箱自身保留供排查和重试。
-
-- Snell 先确认所有实例停止，再清理开机启动和防火墙；这些阶段失败或被中断时保留文件，并尝试恢复原来的运行状态。恢复失败会明确提示，重复中断不会打断恢复。只有带归属标记的系统账户和用户组会被删除；文件或账户删除失败时保留配置供重试。
-- PM 等待正在执行的后台任务结束后，完整读取并清理自己的 Cron 行，保留其他任务。读取、写入或写后校验失败时停止清理；nftables、TC 查询或删除失败时保留配置、日志和归属记录。TC 按登记的网卡清理，不受默认路由变化影响，也不会删除没有归属记录的队列。内核规则清理失败后监控 Cron 已停止，排查后重新执行卸载即可。
-- sing-box 和 FW 保持停服失败时保留文件的行为；取消开机启动或文件删除失败会明确报错，服务文件残留不会报告全部清除。FW 不自动删除防火墙规则。
-
-独立 sing-box 和 Xray 卸载同样检查防火墙、服务定义和文件清理结果，失败时保留管理命令供重试，不显示卸载完成；Xray 停服失败时保留配置和规则。
-
-通过 `vt` 统一卸载 PM 后保留空的 `/var/run/pm_cron.lock`，避免已启动的后台任务与重新安装的进程使用不同的锁。它不含配置或业务数据。
-
-## 回归测试
-
-需要 Python 3、Bash 4+、`jq`、`curl` 和 Node.js（Worker 报告测试）。在仓库根目录执行：
+在中转机的 Bash 中运行，然后输入落地机 IP 或域名。路由检测需要 NextTrace 或 `traceroute`。
 
 ```bash
-python3 -m unittest discover -s tests -v
+bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/network_audit.sh)
 ```
 
-可用 `BASH_BIN` 指定 Bash 路径。测试使用临时目录、模拟服务和本地 HTTP，不改动宿主机的服务、防火墙、账户或 Cron；覆盖 FW 回滚和中断恢复、VT 输入结束、Snell/PM 卸载故障与重试，以及下载进度、校验和更新失败保护；另覆盖 PM 首次初始化、当前数据保留、旧格式拒绝、规则恢复入口与 Worker 突发限速展示。这些测试使用模拟系统命令，不能替代真实 systemd、Cron、nftables、TC 和后台锁在 Debian/Ubuntu 上的集成验证。
+脚本显示延迟、丢包和去程路由，并输出回程检测命令。测吞吐时，中转机需安装 `iperf3`，落地机需运行 `iperf3 -s`。
 
-初始化与网络检测的安全回归还覆盖 HTTPS 限制、下载不完整时禁止执行、恶意 IP 输入和 SSH 配置回滚。SSH 用例需要 `sshd` 和 `ssh-keygen`，使用临时主机密钥和真实 `sshd -T` 解析器；缺少工具时会跳过，不启动或重载宿主机 SSH 服务。
+## 平台与卸载
 
-DNS 验证用例还需要 GNU `timeout`；原生解析阻塞回归需要 C 编译器，验证外部超时能终止并回收卡住的解析进程，同时恢复原配置。缺少这些工具时对应测试会明确跳过。C 编译器仅用于构造测试场景，不是运行 `init.sh` 的依赖，也不会被初始化脚本安装。
-
-提示和错误处理回归位于 `tests/test_prompt_errors.py`，覆盖配置保存、重启及恢复失败、卸载残留、输入结束、状态未知、BBR 运行验证和不完整网络测量。这些用例通过临时文件及故障注入验证失败路径，不会操作宿主机真实服务或内核参数。
-
-`tests/test_user_flows.py` 从用户输入验证 PM 新增、分组修改、删除与取消，以及 sing-box/Xray 节点新增、删除和失败提示；检查保存结果、其他节点和已有流量是否保持正确。`tests/test_worker_flows.py` 调用 Worker 的真实请求入口，使用内存数据库和模拟 Telegram 请求验证签名上报、查询权限隔离、管理员授权与重复事件处理，不向真实用户发送消息。
-
-PM 的实际 Linux 集成验证需在有 systemd、Cron、nftables、TC 和网络命名空间支持的测试 VPS 上以 root 单独执行：
-
-```bash
-python3 tests/integration_pm.py
-```
-
-它使用临时目录、独立网络空间、临时 systemd 单元和 `/etc/cron.d/pm-baseline-*` 条目，不编辑 root 的任务表；验证真实 TCP 计数、50 Mbps TC 分类与映射、规则恢复、文件锁、混合状态保护及 Cron 调度，结束或正常中断后清理本次资源。Cron 验证最多等待 75 秒。它不测试公网限速吞吐，也不向真实 Telegram 或 Cloudflare 发送消息。
-
-FW 的实际用户流程验证可在 Linux/systemd 测试机以 root 单独执行：
-
-```bash
-python3 tests/integration_fw.py
-```
-
-它通过当前安装函数下载并校验固定版本 Realm，使用 `/opt` 下独立临时目录和唯一命名的 systemd 服务；仅在回环地址监听，不修改防火墙。验证新增规则的输入纠错、真实 TCP/UDP 转发、重复端口拒绝、取消删除/重装/卸载、删除最后一条规则后停服及确认卸载。测试结束或可捕获中断后清理自身资源；若停服或清理失败，会报错并保留恢复文件及路径。需要访问官方核心下载地址，不验证公网防火墙与连通性。
-
----
-
-## ☁️ 云端中控 (Cloudflare)
-
-本工具箱支持将多台 VPS 的流量数据推送到 Cloudflare Worker，实现集中监控和多租户权限管理。
-
-*   👉 **[点击查看 Cloudflare 部署指南](部署教程.md)**
-
-PM 支持为每个监控端口设置用户到期日期，到期前 3 天通过本机 Telegram 通知提醒一次；Cloudflare 中控继续展示到期状态。
-
----
-
-## 📦 兼容性
-
-*   **架构:** amd64 (x86_64), arm64 (aarch64)
-*   **系统:** Debian 10+、Ubuntu 20.04+（推荐）
-    *   `sb.sh` 支持 Alpine Linux 3.21（OpenRC）；Alpine 最小系统首次运行前需安装 `bash` 与 `curl`。
-    *   CentOS 及 Alpine 上的其他模块仍属于部分支持范围。
-
-## ⚠️ 免责声明
-
-本项目仅供学习与技术研究使用。请遵守当地法律法规，切勿用于非法用途。
+- 常用平台为 Debian 10+ 和 Ubuntu 20.04+，架构为 amd64 和 arm64。各组件的系统、服务管理器及核心版本要求见对应手册。
+- sing-box 支持 Alpine 3.21 和 OpenRC。精简 Alpine 系统需先安装 Bash 和 curl。
+- `vt` 的“全部卸载”只处理 Snell、sing-box、PM、FW 和工具箱自身，需要输入 `yes` 确认。某个组件清理失败时会继续处理其他组件，并保留工具箱供重试。
+- 卸载前请备份需要保留的配置、节点密钥和流量记录。

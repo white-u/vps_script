@@ -1,159 +1,23 @@
-# sing-box 多协议管理脚本（sb.sh）
+# sing-box 多协议管理
 
-**脚本版本**：v1.0.0　|　**快捷命令**：`sb`　|　**安装路径**：`/usr/local/bin/sb`
+`sb` 管理 VLESS Vision REALITY（TCP）和 Shadowsocks 2022（TCP/UDP），支持节点分享、核心更新、状态及日志查看。
 
-本文档及脚本生成的配置已按 sing-box **1.14.0** 官方配置结构核对（2026-08-31）。脚本只使用稳定版发布，不自动安装预发布版本。
+## 安装
 
-## 1. 当前支持范围
-
-脚本管理以下入站协议：
-
-- **VLESS Vision REALITY（TCP）**
-  - `flow` 使用官方支持的 `xtls-rprx-vision`。
-  - Reality 密钥由 `sing-box generate reality-keypair` 生成。
-  - `short_id` 为 8 位十六进制字符串，符合官方 0–8 位要求。
-- **Shadowsocks 2022（TCP/UDP）**
-  - 方法为 `2022-blake3-aes-128-gcm`。
-  - 密钥由 `sing-box generate rand --base64 16` 生成。
-  - 不设置 `network`，按官方定义同时启用 TCP 和 UDP。
-
-Reality 只开放 TCP 防火墙端口；Shadowsocks 2022 同时开放 TCP 和 UDP。
-
-Reality 创建时先直接列出候选域名，不预先探测；选定候选或手动输入后，只从本机直连验证最终选中的域名。验证强制 TLS 1.3 并确认实际使用 HTTP/2，校验证书，拒绝跳转到其他域名、非 HTTPS 或非 443 端口的目标。同域名 HTTPS 路径跳转最多继续验证 3 次，每一步都需通过相同检查。候选域名和手动输入使用相同验证；失败不会创建节点，也不会跟随跨域跳转或降级协议。探测忽略 curl 配置文件及环境代理，连接超时 3 秒、所选目标（含跳转）共用 8 秒总时限。
-
-验证需要 curl 支持 TLS 1.3 和 HTTP/2；缺少能力时会保留 curl 的报错并拒绝该目标。通过检查代表当前 VPS 的探测结果，不保证其他网络或后续时间一直可用，也不能代替真实客户端的 Reality 握手测试。
-
-## 2. 安装与菜单
-
-Debian、Ubuntu 等已带 Bash 的系统：
+支持 Debian/Ubuntu 等 systemd 系统，以及 Alpine 3.21（OpenRC）。Alpine 如缺少 Bash 和 curl，以 root 运行 `apk add --no-cache bash curl`。安装时以 root 打开 Bash，或从 `vt` 进入 sing-box。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/sb.sh)
 ```
 
-Alpine Linux 3.21 的最小系统通常未预装 Bash，首次运行使用：
+首次进入会自动安装缺少的核心。
 
-```bash
-apk add --no-cache bash curl
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/white-u/vps_script/main/sb.sh)"
-```
+## 使用
 
-脚本在 Alpine 上自动安装其余依赖并使用 OpenRC 管理服务；在 systemd 系统上保持原有管理方式。
+运行 `sb` 打开交互菜单。
 
-首次交互运行时（包括从 `vt` 进入），若核心尚未安装，会先自动安装，再显示菜单；已有核心不自动更新，仍可通过菜单 1 检查更新。安装失败会停止本次进入，修复原因后重新运行即可重试。
+1. 选择 **2. 添加 Reality 节点**或 **3. 添加 SS2022 节点**，按提示填写端口。添加 Reality 节点时，从列表选取目标域名或手动输入支持 TLS 1.3 和 HTTP/2 的 HTTPS 域名。
+2. 选择 **4. 查看节点详情与分享**，复制配置或分享链接到客户端。
+3. 需要删除节点时选 **5**。查看服务状态、配置检查和日志时选 **8**。如使用云安全组，Reality 放行 TCP，SS2022 放行 TCP 和 UDP。
 
-安装后运行：
-
-```bash
-sb
-```
-
-当前脚本只提供交互式菜单，不支持 `sb add`、`sb list` 等命令行子命令。
-
-```text
-1. 安装、检查或更新 sing-box
-2. 添加 Reality 节点
-3. 添加 SS2022 节点
-4. 查看节点详情与分享
-5. 删除节点
-6. 更新 SB 脚本
-7. 卸载全部
-8. 查看状态、检查配置与日志
-0. 退出
-```
-
-主页面会直接显示 sing-box 的安装/运行状态、核心版本、节点数量和节点概览；密钥、分享链接及内部文件路径只在对应功能中显示。
-
-添加节点时，端口无效或已占用会提示重新输入，输入 `0` 可取消并返回主菜单。Reality 目标验证失败后保留已选端口，可重新选择目标或修改手动域名；重试时保留上次选择和手动域名作为默认值，仍只验证最终选中的域名。手动域名输入处的 `0` 返回目标选择，目标列表中的 `0` 取消添加。
-
-菜单 8 显示服务状态、执行配置检查并读取最近 30 行服务日志，不更新核心或重启服务；检查通过不代表客户端一定可连通。操作结果显示后按回车返回主菜单，查看节点时输错 ID 可原地重试。
-
-## 3. 文件位置
-
-| 内容 | 路径 |
-|---|---|
-| sing-box 核心 | `/usr/local/bin/sing-box` |
-| 管理脚本 | `/usr/local/bin/sb` |
-| 主配置 | `/usr/local/etc/sing-box/config.json` |
-| 节点元数据 | `/usr/local/etc/sing-box/nodes_meta.json` |
-| systemd 服务 | `/etc/systemd/system/sing-box.service` |
-| Alpine OpenRC 服务 | `/etc/init.d/sing-box` |
-| Alpine OpenRC 日志 | `/var/log/sing-box.log` |
-| 工作目录 | `/var/lib/sing-box` |
-
-Reality 服务端配置只需要保存私钥；导出 `vless://` 分享链接还需要公钥。因此脚本把公钥按节点标签保存在权限为 `600` 的 `nodes_meta.json` 中，不把非 sing-box 配置字段混入主配置。
-
-## 4. 核心更新保护
-
-菜单 1 默认获取 GitHub `releases/latest` 指向的稳定版；如果脚本中的 `PINNED_SB_VERSION` 非空，则使用指定的 `x.y.z` 版本。配置与服务校验仍会执行，不兼容的候选核心会被拒绝。核心更新按以下顺序进行：
-
-核心下载设置连接超时和总超时；手动更新管理脚本时也显示下载进度，失败时保留现有脚本。
-
-1. 下载候选核心，显示百分比、下载量、速度和预计剩余时间；下载完成后提示进入安装包校验。
-2. 如果 GitHub 提供发布摘要，校验下载文件的 SHA-256。
-3. 验证候选核心报告的版本与目标版本一致。
-4. 使用候选核心对现有配置执行 `sing-box check`。
-5. 备份旧核心并原子替换二进制。
-6. 根据系统重写 systemd 或 OpenRC 服务，设置开机自启，重启后检查运行状态。
-7. 升级完成前若失败或收到 Ctrl+C、TERM、HUP，恢复原核心、配置、服务定义和原运行状态。
-
-配置不兼容时旧核心不会被覆盖；启动失败会打印服务日志并返回失败，不会显示为更新成功。
-未设置固定版本时，脚本也会拒绝把已经安装的更高稳定版本降级。
-
-## 5. 安全路由补全与历史出口清理
-
-当前版本不提供 SS2022 跨机出口中继、节点链式出站和 SOCKS5 上游配置入口。普通 Shadowsocks-2022 节点的创建、查看、分享和删除功能不受影响。
-
-SB 的这项检查仍保留，不属于此次取消的 PM 配置版本迁移链。进入菜单或完成核心安装、检查时，脚本会检查域名解析和私网拒绝规则，缺少时补全；如果检测到旧模块配置，还会删除：
-
-- 标签以 `relay_` 开头的专用中继入站。
-- 标签为 `chain_proxy` 的 SS2022 或 SOCKS5 出站。
-- 所有指向 `chain_proxy` 的节点路由规则。
-
-普通 `reality_*` 和 `ss_*` 节点会保留并恢复使用本机直连出口。改动前会生成候选配置并执行 `sing-box check`；服务运行时应用失败会恢复原配置，服务停止时只更新配置文件而不会自动启动服务。安全路由与历史出口均符合当前要求时，不改写配置。
-旧中继端口从未由该模块修改防火墙，迁移清理也不会打开或关闭任何防火墙规则。
-
-## 6. 配置安全
-
-- 每次变更先执行 JSON 校验和 `sing-box check`。
-- 主配置通过同目录临时文件原子替换。
-- 应用配置到服务重启确认期间，失败或收到 Ctrl+C、TERM、HUP 会恢复原配置和运行状态。应用成功后的分享信息及防火墙操作仍按原有流程执行。
-- 中断会在恢复结束后退出。恢复不完整时会显示保留的备份目录，其中 `paths.tsv` 记录备份编号对应的原文件路径。
-- 默认拒绝客户端直接访问私网 IP，也拒绝解析后落入私网的域名。
-- SS2022 密钥和 Reality 公私钥不会写入日志；`config.json` 权限为 `640`，元数据文件权限为 `600`。
-- VLESS 分享链接使用 Reality 常用参数；Shadowsocks 2022 分享链接遵循 SIP002 对 AEAD-2022 明文、百分号编码 `userinfo` 的要求。
-
-## 7. 卸载
-
-菜单 7 会通过 systemd 或 OpenRC 停止并禁用服务，按节点协议清理防火墙端口，并删除核心、配置、工作目录、OpenRC 日志和管理脚本。该操作需要输入 `yes` 确认。
-
-OpenRC 下已取消开机启动时仍可正常卸载；若清理文件失败，处理原因后可再次卸载。停止服务或取消现有自启失败时保留文件并报错，不会显示卸载完成。工具箱统一卸载遵循相同规则。
-
-## 8. Alpine 3.21 支持范围
-
-- 支持 `x86_64` 与 `aarch64`；Alpine 自动选择 sing-box 官方 `-musl` 发布文件，避免通用 glibc 构建无法启动。
-- 使用 `apk` 安装 Bash、curl、tar、jq、OpenSSL、qrencode、iproute2 与 OpenRC。
-- OpenRC 服务使用 `supervise-daemon` 保持前台核心运行，异常退出后自动重启，并加入 `default` runlevel。
-- 安装、配置更新、运行状态检查、核心回滚和卸载均通过统一服务接口执行。
-- 菜单运行状态同时检查 OpenRC 和实际核心子进程，避免将“等待重启”误报为运行中；启动失败会打印日志并回滚。检查仅在菜单操作时执行，不新增后台轮询。
-- 临时文件兼容 Alpine 自带 BusyBox，无需额外安装 GNU coreutils。卸载会先停止服务（包括等待重启状态），停止失败则保留文件。
-- 如果系统没有启用 UFW、firewalld 或 iptables，脚本不会自行创建一套新防火墙；云厂商安全组仍需用户自行放行。
-
-OpenRC 环境查看状态与日志：
-
-```bash
-rc-service sing-box status
-tail -n 30 /var/log/sing-box.log
-```
-
-## 9. 官方参考
-
-- [VLESS 入站](https://sing-box.sagernet.org/configuration/inbound/vless/)
-- [TLS / Reality](https://sing-box.sagernet.org/configuration/shared/tls/#reality-fields)
-- [REALITY 上游目标网站要求](https://github.com/XTLS/REALITY#readme)
-- [Shadowsocks 入站](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/)
-- [路由规则动作](https://sing-box.sagernet.org/configuration/route/rule_action/)
-- [1.14.0 迁移说明](https://sing-box.sagernet.org/migration/#1140)
-- [SIP002 URI Scheme](https://github.com/shadowsocks/shadowsocks-org/wiki/SIP002-URI-Scheme)
-- [Alpine OpenRC](https://wiki.alpinelinux.org/wiki/OpenRC)
-- [OpenRC 服务脚本指南](https://github.com/OpenRC/openrc/blob/master/service-script-guide.md)
+菜单 **1** 安装或更新 sing-box 核心，**6** 更新管理脚本，**7** 输入 `yes` 后卸载。备份节点时，请一并保存 `/usr/local/etc/sing-box/config.json` 和 `/usr/local/etc/sing-box/nodes_meta.json`，后者用于导出分享配置。
